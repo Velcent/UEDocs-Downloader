@@ -1,6 +1,7 @@
 param(
     [string]$Root = $PSScriptRoot,
-    [switch]$NoBrowser
+    [switch]$NoBrowser,
+    [int]$BrowserPollSeconds = 2
 )
 
 $ErrorActionPreference = 'Stop'
@@ -15,6 +16,7 @@ New-Item -ItemType Directory -Force -Path $HtmlDir, $MpdDir, $Mp4Dir | Out-Null
 
 $script:BrowserPort = $null
 $script:BrowserProfileDir = Join-Path $HtmlDir '.browser-profile'
+$script:OpenEmbedTabs = @()
 
 function Convert-QuotedPrintableText {
     param([string]$Text)
@@ -243,6 +245,47 @@ function Get-DevToolsPage {
     return $page
 }
 
+function Close-DevToolsPage {
+    param(
+        [int]$Port,
+        [string]$TargetId
+    )
+
+    if ([string]::IsNullOrWhiteSpace($TargetId)) {
+        return
+    }
+
+    try {
+        Invoke-RestMethod -Uri "http://127.0.0.1:$Port/json/close/$TargetId" -ErrorAction SilentlyContinue | Out-Null
+    }
+    catch {
+    }
+}
+
+function Add-OpenEmbedTab {
+    param(
+        [int]$Port,
+        [string]$TargetId
+    )
+
+    if ([string]::IsNullOrWhiteSpace($TargetId)) {
+        return
+    }
+
+    $script:OpenEmbedTabs += [pscustomobject]@{
+        Port = $Port
+        TargetId = $TargetId
+    }
+}
+
+function Close-OpenEmbedTabs {
+    foreach ($tab in $script:OpenEmbedTabs) {
+        Close-DevToolsPage -Port $tab.Port -TargetId $tab.TargetId
+    }
+
+    $script:OpenEmbedTabs = @()
+}
+
 function Open-DevToolsUrl {
     param(
         [int]$Port,
@@ -258,6 +301,16 @@ function Open-DevToolsUrl {
     catch {
         Invoke-RestMethod -Uri $devToolsUrl -ErrorAction SilentlyContinue | Out-Null
     }
+}
+
+function Test-ForbiddenOrChallengeHtml {
+    param([string]$Html)
+
+    if ([string]::IsNullOrWhiteSpace($Html)) {
+        return $true
+    }
+
+    return $Html -match '(?i)(403 Forbidden|Enable JavaScript and cookies to continue|cf_challenge|cf-challenge|Just a moment|security check to continue)'
 }
 
 function Receive-WebSocketText {
@@ -303,6 +356,29 @@ function Invoke-CdpCommand {
     return $response
 }
 
+function Get-PageHtml {
+    param($Page)
+
+    if (-not $Page -or -not $Page.webSocketDebuggerUrl) {
+        throw 'Cannot find the opened embed page in browser DevTools.'
+    }
+
+    $socket = [System.Net.WebSockets.ClientWebSocket]::new()
+    try {
+        $socket.ConnectAsync([Uri]$Page.webSocketDebuggerUrl, [Threading.CancellationToken]::None).GetAwaiter().GetResult()
+
+        $response = Invoke-CdpCommand -Socket $socket -Id 1 -Method 'Runtime.evaluate' -Params @{
+            expression = 'document.documentElement.outerHTML'
+            returnByValue = $true
+        }
+
+        return [string]$response.result.result.value
+    }
+    finally {
+        $socket.Dispose()
+    }
+}
+
 function Save-EmbedHtmlFromBrowser {
     param(
         [string]$Url,
@@ -335,38 +411,37 @@ function Save-EmbedHtmlFromBrowser {
     }
 
     Write-Host "Opening browser for: $Url"
-    Write-Host 'Complete the page in the browser, then return here and press Enter.'
-    [void](Read-Host 'Press Enter after the embed page has loaded')
+    Write-Host "Waiting for the embed page. Checking every $BrowserPollSeconds seconds..."
 
-    try {
-        $page = Get-DevToolsPage -Port $script:BrowserPort -Url $Url
-        if (-not $page -or -not $page.webSocketDebuggerUrl) {
-            throw 'Cannot find the opened embed page in browser DevTools.'
+    $page = $null
+    $attempt = 0
+
+    while ($true) {
+        $attempt++
+        Start-Sleep -Seconds $BrowserPollSeconds
+
+        try {
+            $page = Get-DevToolsPage -Port $script:BrowserPort -Url $Url
+            $html = Get-PageHtml $page
+        }
+        catch {
+            Write-Warning "Cannot read browser tab yet. $($_.Exception.Message)"
+            continue
         }
 
-        $socket = [System.Net.WebSockets.ClientWebSocket]::new()
-        $socket.ConnectAsync([Uri]$page.webSocketDebuggerUrl, [Threading.CancellationToken]::None).GetAwaiter().GetResult()
-
-        $expression = 'document.documentElement.outerHTML'
-        $response = Invoke-CdpCommand -Socket $socket -Id 1 -Method 'Runtime.evaluate' -Params @{
-            expression = $expression
-            returnByValue = $true
+        if (Get-QsepUrl @($html)) {
+            [System.IO.File]::WriteAllText($HtmlPath, $html, [System.Text.UTF8Encoding]::new($false))
+            Write-Host "Saved embed HTML: $(Split-Path -Leaf $HtmlPath)"
+            Add-OpenEmbedTab -Port $script:BrowserPort -TargetId $page.id
+            return $html
         }
 
-        $socket.Dispose()
-
-        $html = [string]$response.result.result.value
-        if ([string]::IsNullOrWhiteSpace($html)) {
-            throw 'Browser returned empty HTML.'
+        if (Test-ForbiddenOrChallengeHtml $html) {
+            Write-Host "Still blocked/challenge for $(Split-Path -Leaf $HtmlPath). Waiting... attempt $attempt"
+            continue
         }
 
-        [System.IO.File]::WriteAllText($HtmlPath, $html, [System.Text.UTF8Encoding]::new($false))
-        Write-Host "Saved embed HTML: $(Split-Path -Leaf $HtmlPath)"
-        return $html
-    }
-    catch {
-        Write-Warning "Cannot save embed HTML from browser. $($_.Exception.Message)"
-        return $null
+        Write-Host "Embed page loaded but qsep videoUrl is not visible yet. Waiting... attempt $attempt"
     }
 }
 
@@ -582,6 +657,8 @@ foreach ($mhtmlFile in $mhtmlFiles) {
         else {
             Write-Warning "MP4 skipped because $outputId.mpd does not exist."
         }
+
+        Close-OpenEmbedTabs
     }
 }
 
