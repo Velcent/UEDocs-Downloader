@@ -11,6 +11,7 @@ $Root = (Resolve-Path -LiteralPath $Root).Path
 $HtmlDir = Join-Path $Root 'html'
 $MpdDir = Join-Path $Root 'mpd'
 $Mp4Dir = Join-Path $Root 'mp4'
+$ListPath = Join-Path $Root 'mpd-list.txt'
 
 New-Item -ItemType Directory -Force -Path $HtmlDir, $MpdDir, $Mp4Dir | Out-Null
 
@@ -535,6 +536,52 @@ function Get-FileUrl {
     return ([System.Uri](Resolve-Path -LiteralPath $Path).Path).AbsoluteUri
 }
 
+function Format-FileSize {
+    param([Nullable[long]]$Bytes)
+
+    if ($null -eq $Bytes) {
+        return 'not downloaded'
+    }
+
+    if ($Bytes -ge 1GB) {
+        return '{0:N2} GB' -f ($Bytes / 1GB)
+    }
+
+    if ($Bytes -ge 1MB) {
+        return '{0:N2} MB' -f ($Bytes / 1MB)
+    }
+
+    if ($Bytes -ge 1KB) {
+        return '{0:N2} KB' -f ($Bytes / 1KB)
+    }
+
+    return "$Bytes bytes"
+}
+
+function Get-VideoSizeText {
+    param([string]$Mp4Path)
+
+    if (-not (Test-Path -LiteralPath $Mp4Path)) {
+        return 'not downloaded'
+    }
+
+    $file = Get-Item -LiteralPath $Mp4Path
+    return Format-FileSize $file.Length
+}
+
+function Add-MpdListEntry {
+    param(
+        [string]$MhtmlPath,
+        [string]$EmbedUrl,
+        [string]$Mp4Path
+    )
+
+    $mhtmlLink = Get-FileUrl $MhtmlPath
+    $sizeText = Get-VideoSizeText $Mp4Path
+    $line = "$mhtmlLink`t$EmbedUrl`t$sizeText"
+    Add-Content -LiteralPath $ListPath -Value $line -Encoding UTF8
+}
+
 function Download-Mp4 {
     param(
         [string]$MpdPath,
@@ -555,9 +602,12 @@ function Download-Mp4 {
     $outputTemplate = Join-Path (Split-Path -Parent $Mp4Path) "$([System.IO.Path]::GetFileNameWithoutExtension($Mp4Path)).%(ext)s"
     $mpdUrl = Get-FileUrl $MpdPath
 
-    Write-Host "Downloading MP4: $(Split-Path -Leaf $Mp4Path)"
-    & $ytDlp.Source --enable-file-urls $mpdUrl -f 'bestvideo+bestaudio/best' --merge-output-format mp4 -o $outputTemplate
+    Write-Host "Downloading MP4 max 720p: $(Split-Path -Leaf $Mp4Path)"
+    & $ytDlp.Source --enable-file-urls $mpdUrl -f 'bestvideo[height<=720]+bestaudio/best[height<=720]' --merge-output-format mp4 -o $outputTemplate
 }
+
+$listHeader = "mhtml_file`tembed_html`tvideo_size"
+Set-Content -LiteralPath $ListPath -Value $listHeader -Encoding UTF8
 
 $excludedScanDirs = @($HtmlDir, $MpdDir, $Mp4Dir) | ForEach-Object {
     (Resolve-Path -LiteralPath $_).Path.TrimEnd('\') + '\'
@@ -629,6 +679,8 @@ foreach ($mhtmlFile in $mhtmlFiles) {
         else {
             Write-Warning "MP4 skipped because $videoId.mpd does not exist."
         }
+
+        Add-MpdListEntry -MhtmlPath $mhtmlFile.FullName -EmbedUrl $embedUrl -Mp4Path $mp4Path
 
         Close-OpenEmbedTabs
     }

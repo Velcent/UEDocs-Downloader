@@ -17,7 +17,7 @@ for %%F in ("%MPD_DIR%\*.mpd") do (
         echo Downloading %%~nxF to %%~nF.mp4
         yt-dlp --enable-file-urls ^
             "!MPD_URL!" ^
-            -f bestvideo+bestaudio ^
+            -f "bestvideo[height<=720]+bestaudio/best[height<=720]" ^
             --merge-output-format mp4 ^
             -o "%MP4_DIR%\%%~nF.%%(ext)s"
     )
