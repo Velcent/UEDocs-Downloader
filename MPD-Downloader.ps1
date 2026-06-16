@@ -507,7 +507,14 @@ function Download-Mp4 {
     & $ytDlp.Source --enable-file-urls $mpdUrl -f 'bestvideo+bestaudio/best' --merge-output-format mp4 -o $outputTemplate
 }
 
-$mhtmlFiles = Get-ChildItem -LiteralPath $Root -Filter '*.mhtml' -File
+$excludedScanDirs = @($HtmlDir, $MpdDir, $Mp4Dir) | ForEach-Object {
+    (Resolve-Path -LiteralPath $_).Path.TrimEnd('\') + '\'
+}
+
+$mhtmlFiles = Get-ChildItem -LiteralPath $Root -Filter '*.mhtml' -File -Recurse | Where-Object {
+    $fullName = $_.FullName
+    -not ($excludedScanDirs | Where-Object { $fullName.StartsWith($_, [System.StringComparison]::OrdinalIgnoreCase) })
+}
 if (-not $mhtmlFiles) {
     Write-Host "No .mhtml files found in $Root"
     exit 0
