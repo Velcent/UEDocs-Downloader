@@ -503,20 +503,88 @@ function Get-QueryMap {
     return $map
 }
 
+function ConvertTo-QueryString {
+    param(
+        [hashtable]$QueryMap,
+        [string[]]$ExcludeKeys = @(),
+        [hashtable]$Override = $null
+    )
+
+    $excluded = @{}
+    foreach ($key in $ExcludeKeys) {
+        if (-not [string]::IsNullOrWhiteSpace($key)) {
+            $excluded[$key.ToLowerInvariant()] = $true
+        }
+    }
+
+    $combined = @{}
+    foreach ($key in $QueryMap.Keys) {
+        if ($excluded.ContainsKey(([string]$key).ToLowerInvariant())) {
+            continue
+        }
+
+        $combined[$key] = $QueryMap[$key]
+    }
+
+    if ($Override) {
+        foreach ($key in $Override.Keys) {
+            $combined[$key] = $Override[$key]
+        }
+    }
+
+    $queryKeys = @($combined.Keys | Sort-Object)
+    if ($queryKeys.Count -eq 0) {
+        return ''
+    }
+
+    $parts = foreach ($key in $queryKeys) {
+        "$([System.Uri]::EscapeDataString([string]$key))=$([System.Uri]::EscapeDataString([string]$combined[$key]))"
+    }
+
+    return '?' + ($parts -join '&')
+}
+
+function Test-QueryKeyExists {
+    param(
+        [hashtable]$QueryMap,
+        [string]$Name
+    )
+
+    foreach ($key in $QueryMap.Keys) {
+        if (([string]$key).ToLowerInvariant() -eq $Name.ToLowerInvariant()) {
+            return $true
+        }
+    }
+
+    return $false
+}
+
+function Get-PreferredPageUrl {
+    param([string]$PageUrl)
+
+    try {
+        $uri = [Uri]$PageUrl
+        $queryMap = Get-QueryMap $uri.Query
+        if (-not (Test-QueryKeyExists -QueryMap $queryMap -Name 'lang')) {
+            return $PageUrl
+        }
+
+        $builder = [UriBuilder]$uri
+        $query = ConvertTo-QueryString -QueryMap $queryMap -ExcludeKeys @('lang') -Override @{ lang = 'en-US' }
+        $builder.Query = $query.TrimStart('?')
+        return $builder.Uri.AbsoluteUri
+    }
+    catch {
+        return $PageUrl
+    }
+}
+
 function Get-PageCanonicalKey {
     param([string]$PageUrl)
 
     $uri = [Uri]$PageUrl
     $queryMap = Get-QueryMap $uri.Query
-    $queryKeys = @($queryMap.Keys | Where-Object { $_ -ne 'application_version' } | Sort-Object)
-    $query = ''
-
-    if ($queryKeys.Count -gt 0) {
-        $parts = foreach ($key in $queryKeys) {
-            "$([System.Uri]::EscapeDataString($key))=$([System.Uri]::EscapeDataString([string]$queryMap[$key]))"
-        }
-        $query = '?' + ($parts -join '&')
-    }
+    $query = ConvertTo-QueryString -QueryMap $queryMap -ExcludeKeys @('application_version', 'lang')
 
     return "$($uri.Scheme.ToLowerInvariant())://$($uri.Host.ToLowerInvariant())$($uri.AbsolutePath.TrimEnd('/'))$query"
 }
@@ -1034,6 +1102,7 @@ function Add-PageTask {
         [string]$OriginalUrl
     )
 
+    $TaskUrl = Get-PreferredPageUrl $TaskUrl
     $canonicalKey = Get-PageCanonicalKey $TaskUrl
     $version = Get-ApplicationVersion $TaskUrl
 
@@ -1073,8 +1142,9 @@ function Add-PageTask {
     return $true
 }
 
-[void](Add-PageTask -Queue $pageQueue -BestVersions $bestPageVersions -DownloadedCanonicals $downloadedPageCanonicals -TaskUrl ([Uri]$Url).AbsoluteUri -Kind 'page' -OriginalUrl ([Uri]$Url).AbsoluteUri)
-Mark-PageSeen -Seen $seenPages -Urls @(([Uri]$Url).AbsoluteUri)
+$initialUrl = Get-PreferredPageUrl ([Uri]$Url).AbsoluteUri
+[void](Add-PageTask -Queue $pageQueue -BestVersions $bestPageVersions -DownloadedCanonicals $downloadedPageCanonicals -TaskUrl $initialUrl -Kind 'page' -OriginalUrl ([Uri]$Url).AbsoluteUri)
+Mark-PageSeen -Seen $seenPages -Urls @(([Uri]$Url).AbsoluteUri, $initialUrl)
 
 $downloadedPages = 0
 
@@ -1109,13 +1179,15 @@ while ($pageQueue.Count -gt 0) {
 
             if ($item.Type -eq 'iframe') {
                 if (Test-IframeAllowed $item.Url) {
-                    $iframeLocalPath = Get-LocalPathForUrl -ItemUrl $item.Url -Kind 'page'
+                    $iframeUrl = Get-PreferredPageUrl $item.Url
+                    $iframeLocalPath = Get-LocalPathForUrl -ItemUrl $iframeUrl -Kind 'page'
                     $relativeIframePath = ConvertTo-RelativeWebPath -FromFile $localPath -ToFile $iframeLocalPath
                     Add-RewriteMapEntry -Map $rewriteMap -From $item.Original -To $relativeIframePath
                     Add-RewriteMapEntry -Map $rewriteMap -From $item.Url -To $relativeIframePath
+                    Add-RewriteMapEntry -Map $rewriteMap -From $iframeUrl -To $relativeIframePath
 
-                    [void](Add-PageTask -Queue $pageQueue -BestVersions $bestPageVersions -DownloadedCanonicals $downloadedPageCanonicals -TaskUrl $item.Url -Kind 'iframe' -OriginalUrl $item.Url)
-                    Mark-PageSeen -Seen $seenPages -Urls @($item.Url)
+                    [void](Add-PageTask -Queue $pageQueue -BestVersions $bestPageVersions -DownloadedCanonicals $downloadedPageCanonicals -TaskUrl $iframeUrl -Kind 'iframe' -OriginalUrl $item.Url)
+                    Mark-PageSeen -Seen $seenPages -Urls @($item.Url, $iframeUrl)
                 }
                 continue
             }
@@ -1135,15 +1207,18 @@ while ($pageQueue.Count -gt 0) {
                 $resolvedUrl = Resolve-RedirectUrl $candidateUrl
             }
 
-            if (Test-UrlInScope $resolvedUrl) {
-                $targetLocalPath = Get-LocalPathForUrl -ItemUrl $resolvedUrl -Kind 'page'
+            $preferredResolvedUrl = Get-PreferredPageUrl $resolvedUrl
+
+            if (Test-UrlInScope $preferredResolvedUrl) {
+                $targetLocalPath = Get-LocalPathForUrl -ItemUrl $preferredResolvedUrl -Kind 'page'
                 $relativePagePath = ConvertTo-RelativeWebPath -FromFile $localPath -ToFile $targetLocalPath
                 Add-RewriteMapEntry -Map $rewriteMap -From $item.Original -To $relativePagePath
                 Add-RewriteMapEntry -Map $rewriteMap -From $candidateUrl -To $relativePagePath
                 Add-RewriteMapEntry -Map $rewriteMap -From $resolvedUrl -To $relativePagePath
+                Add-RewriteMapEntry -Map $rewriteMap -From $preferredResolvedUrl -To $relativePagePath
 
-                [void](Add-PageTask -Queue $pageQueue -BestVersions $bestPageVersions -DownloadedCanonicals $downloadedPageCanonicals -TaskUrl $resolvedUrl -Kind 'page' -OriginalUrl $candidateUrl)
-                Mark-PageSeen -Seen $seenPages -Urls @($candidateUrl, $resolvedUrl)
+                [void](Add-PageTask -Queue $pageQueue -BestVersions $bestPageVersions -DownloadedCanonicals $downloadedPageCanonicals -TaskUrl $preferredResolvedUrl -Kind 'page' -OriginalUrl $candidateUrl)
+                Mark-PageSeen -Seen $seenPages -Urls @($candidateUrl, $resolvedUrl, $preferredResolvedUrl)
             }
         }
 
