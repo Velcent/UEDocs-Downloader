@@ -2,9 +2,12 @@ param(
     [string]$Url = 'https://dev.epicgames.com/documentation/metahuman',
     [string]$ScopeUrl = 'https://dev.epicgames.com/documentation/metahuman',
     [string]$Root = $PSScriptRoot,
-    [int]$BrowserPollSeconds = 2,
+    [int]$BrowserPollSeconds = .5,
     [int]$ParallelDownloads = 10,
-    [int]$MaxPages = 0
+    [int]$MaxPages = 0,
+    [int]$MinPageWaitSeconds = 0,
+    [int]$PageIdleSeconds = 2,
+    [int]$PageLoadTimeoutSeconds = 120
 )
 
 $ErrorActionPreference = 'Stop'
@@ -17,6 +20,9 @@ if ([string]::IsNullOrWhiteSpace($ScopeUrl)) {
 
 $ParallelDownloads = [Math]::Max(1, $ParallelDownloads)
 $BrowserPollSeconds = [Math]::Max(1, $BrowserPollSeconds)
+$MinPageWaitSeconds = [Math]::Max(0, $MinPageWaitSeconds)
+$PageIdleSeconds = [Math]::Max(0, $PageIdleSeconds)
+$PageLoadTimeoutSeconds = [Math]::Max(1, $PageLoadTimeoutSeconds)
 
 $WebDir = Join-Path $Root 'web'
 $PagesDir = Join-Path $WebDir 'pages'
@@ -89,19 +95,35 @@ function Ensure-Browser {
         throw 'Cannot find Microsoft Edge or Google Chrome.'
     }
 
-    $script:BrowserPort = Get-FreeTcpPort
-    New-Item -ItemType Directory -Force -Path $script:BrowserProfileDir | Out-Null
+    foreach ($profileDir in @(
+        $script:BrowserProfileDir,
+        (Join-Path $WebDir ".browser-profile-$PID-$(Get-Date -Format 'yyyyMMddHHmmss')")
+    )) {
+        $script:BrowserPort = Get-FreeTcpPort
+        New-Item -ItemType Directory -Force -Path $profileDir | Out-Null
 
-    $arguments = @(
-        "--remote-debugging-port=$($script:BrowserPort)",
-        "--user-data-dir=$($script:BrowserProfileDir)",
-        '--no-first-run',
-        '--new-window',
-        'about:blank'
-    )
+        $arguments = @(
+            "--remote-debugging-port=$($script:BrowserPort)",
+            "--user-data-dir=$profileDir",
+            '--no-first-run',
+            '--new-window',
+            'about:blank'
+        )
 
-    Start-Process -FilePath $browserPath -ArgumentList $arguments | Out-Null
-    Wait-DevTools -Port $script:BrowserPort
+        Start-Process -FilePath $browserPath -ArgumentList $arguments | Out-Null
+
+        try {
+            Wait-DevTools -Port $script:BrowserPort
+            $script:BrowserProfileDir = $profileDir
+            return
+        }
+        catch {
+            Write-Warning $_.Exception.Message
+            $script:BrowserPort = $null
+        }
+    }
+
+    throw 'Browser DevTools did not start.'
 }
 
 function Open-DevToolsUrl {
@@ -207,19 +229,93 @@ function Test-ChallengeHtml {
     return $Html -match '(?i)(403 Forbidden|Enable JavaScript and cookies to continue|cf_challenge|cf-challenge|Just a moment|security check to continue)'
 }
 
+function Get-BrowserSnapshotExpression {
+    return @'
+(() => {
+  const items = [];
+  const seenRoots = new Set();
+  const add = (type, value) => {
+    if (!value) return;
+    try {
+      const url = new URL(value, document.baseURI).href;
+      if (/^(javascript|mailto|tel|data|blob|about):/i.test(url)) return;
+      items.push({ type, url, original: value });
+    } catch (_) {}
+  };
+  const walk = (root) => {
+    if (!root || seenRoots.has(root)) return;
+    seenRoots.add(root);
+    root.querySelectorAll('a[href]').forEach(el => add('page', el.getAttribute('href')));
+    root.querySelectorAll('iframe[src]').forEach(el => add('iframe', el.getAttribute('src')));
+    root.querySelectorAll('img[src],script[src],link[href],source[src],video[src],audio[src],track[src],embed[src],object[data]').forEach(el => {
+      add('resource', el.getAttribute('src') || el.getAttribute('href') || el.getAttribute('data'));
+      add('resource', el.getAttribute('poster'));
+    });
+    root.querySelectorAll('[srcset],[imagesrcset]').forEach(el => {
+      const srcset = el.getAttribute('srcset') || el.getAttribute('imagesrcset') || '';
+      srcset.split(',').forEach(part => add('resource', part.trim().split(/\s+/)[0]));
+    });
+    root.querySelectorAll('*').forEach(el => {
+      if (el.shadowRoot) walk(el.shadowRoot);
+      const style = el.getAttribute('style') || '';
+      for (const match of style.matchAll(/url\((?:"|'|&quot;)?([^"')\s]+)["']?\)/gi)) {
+        add('resource', match[1]);
+      }
+    });
+  };
+  walk(document);
+  const isVisible = (el) => {
+    const style = getComputedStyle(el);
+    if (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity) === 0) return false;
+    const rect = el.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0;
+  };
+  const loadingSelectors = [
+    'spinner',
+    '.spinner',
+    '[aria-busy="true"]',
+    '[class*="loading" i]',
+    '[class*="skeleton" i]',
+    '[class*="progress" i]',
+    '[class*="shimmer" i]'
+  ];
+  const loadingElements = loadingSelectors
+    .flatMap(selector => Array.from(document.querySelectorAll(selector)))
+    .filter(isVisible);
+  const html = document.documentElement.outerHTML;
+  return JSON.stringify({
+    href: location.href,
+    readyState: document.readyState,
+    title: document.title,
+    html,
+    htmlLength: html.length,
+    loadingCount: loadingElements.length,
+    isLoading: document.readyState !== 'complete' || loadingElements.length > 0,
+    itemCount: items.length,
+    items
+  });
+})()
+'@
+}
+
 function Get-PageFromBrowser {
     param([string]$PageUrl)
 
     Write-Host "Opening browser page: $PageUrl"
     $page = Open-DevToolsUrl $PageUrl
     $attempt = 0
+    $firstUsableAt = $null
+    $stableSince = $null
+    $lastSignature = ''
+    $openedAt = Get-Date
+    $snapshotExpression = Get-BrowserSnapshotExpression
 
     while ($true) {
         $attempt++
         Start-Sleep -Seconds $BrowserPollSeconds
 
         try {
-            $json = Invoke-PageEval -Page $page -Expression 'JSON.stringify({href: location.href, readyState: document.readyState, title: document.title, html: document.documentElement.outerHTML})'
+            $json = Invoke-PageEval -Page $page -Expression $snapshotExpression
             $data = $json | ConvertFrom-Json
         }
         catch {
@@ -228,12 +324,52 @@ function Get-PageFromBrowser {
         }
 
         if (-not (Test-ChallengeHtml $data.html) -and $data.html -match '(?i)<body\b') {
-            return [pscustomobject]@{
-                OriginalUrl = $PageUrl
-                FinalUrl = [string]$data.href
-                Html = [string]$data.html
-                TargetId = [string]$page.id
+            if (-not $firstUsableAt) {
+                $firstUsableAt = Get-Date
             }
+
+            $usableWaitedSeconds = ((Get-Date) - $firstUsableAt).TotalSeconds
+            $totalWaitedSeconds = ((Get-Date) - $openedAt).TotalSeconds
+            $signature = "$($data.href)|$($data.readyState)|$($data.isLoading)|$($data.loadingCount)|$($data.itemCount)|$($data.htmlLength)"
+
+            if ($signature -ne $lastSignature) {
+                $lastSignature = $signature
+                $stableSince = Get-Date
+            }
+
+            $stableSeconds = ((Get-Date) - $stableSince).TotalSeconds
+            $isReady = -not [System.Convert]::ToBoolean($data.isLoading)
+            $minWaitDone = $usableWaitedSeconds -ge $MinPageWaitSeconds
+            $idleDone = $stableSeconds -ge $PageIdleSeconds
+
+            if ($isReady -and $minWaitDone -and $idleDone) {
+                return [pscustomobject]@{
+                    OriginalUrl = $PageUrl
+                    FinalUrl = [string]$data.href
+                    Html = [string]$data.html
+                    Items = @($data.items)
+                    TargetId = [string]$page.id
+                }
+            }
+
+            if ($totalWaitedSeconds -ge $PageLoadTimeoutSeconds) {
+                Write-Warning "Page load timeout reached. Saving current DOM: $($data.href)"
+                return [pscustomobject]@{
+                    OriginalUrl = $PageUrl
+                    FinalUrl = [string]$data.href
+                    Html = [string]$data.html
+                    Items = @($data.items)
+                    TargetId = [string]$page.id
+                }
+            }
+
+            if (-not $isReady) {
+                Write-Host "Waiting for loading to finish... attempt $attempt, state=$($data.readyState), loading=$($data.loadingCount), items=$($data.itemCount)"
+                continue
+            }
+
+            Write-Host "Waiting for DOM to become idle... attempt $attempt, stable=$([int]$stableSeconds)s, items=$($data.itemCount)"
+            continue
         }
 
         Write-Host "Waiting for page/challenge... attempt $attempt, state=$($data.readyState), title=$($data.title)"
@@ -420,6 +556,26 @@ function Get-LocalPathForUrl {
     return $localPath
 }
 
+function ConvertTo-RelativeWebPath {
+    param(
+        [string]$FromFile,
+        [string]$ToFile
+    )
+
+    $fromDir = Split-Path -Parent ([System.IO.Path]::GetFullPath($FromFile))
+    $fromUri = [Uri]((Join-Path $fromDir '.') + [System.IO.Path]::DirectorySeparatorChar)
+    $toUri = [Uri]([System.IO.Path]::GetFullPath($ToFile))
+    return $fromUri.MakeRelativeUri($toUri).ToString()
+}
+
+function ConvertTo-RelativeRootPath {
+    param([string]$Path)
+
+    $rootUri = [Uri]((Join-Path $Root '.') + [System.IO.Path]::DirectorySeparatorChar)
+    $pathUri = [Uri]([System.IO.Path]::GetFullPath($Path))
+    return $rootUri.MakeRelativeUri($pathUri).ToString()
+}
+
 function Get-AttributeLinks {
     param(
         [string]$Html,
@@ -470,18 +626,69 @@ function Get-AttributeLinks {
     return $items
 }
 
-function Update-HtmlRedirectLinks {
+function Add-RewriteMapEntry {
     param(
-        [string]$Html,
-        [hashtable]$RedirectMap
+        [hashtable]$Map,
+        [string]$From,
+        [string]$To
     )
 
-    $updated = $Html
-    foreach ($key in $RedirectMap.Keys) {
-        $from = [regex]::Escape($key)
-        $to = [System.Net.WebUtility]::HtmlEncode($RedirectMap[$key])
-        $updated = [regex]::Replace($updated, "(href\s*=\s*[""'])$from([""'])", "`${1}$to`${2}", 'IgnoreCase')
+    if ([string]::IsNullOrWhiteSpace($From) -or [string]::IsNullOrWhiteSpace($To)) {
+        return
     }
+
+    $decoded = [System.Net.WebUtility]::HtmlDecode($From)
+    $Map[$From] = $To
+    $Map[$decoded] = $To
+    $Map[[System.Net.WebUtility]::HtmlEncode($decoded)] = $To
+}
+
+function Update-HtmlDownloadedLinks {
+    param(
+        [string]$Html,
+        [hashtable]$RewriteMap
+    )
+
+    if (-not $RewriteMap -or $RewriteMap.Count -eq 0) {
+        return $Html
+    }
+
+    $updated = $Html
+
+    foreach ($key in ($RewriteMap.Keys | Sort-Object Length -Descending)) {
+        $target = $RewriteMap[$key]
+        $from = [regex]::Escape($key)
+        $encodedTarget = [System.Net.WebUtility]::HtmlEncode($target)
+
+        $updated = [regex]::Replace($updated, "((?:href|src|poster|data)\s*=\s*[""'])$from([""'])", "`${1}$encodedTarget`${2}", 'IgnoreCase')
+        $updated = [regex]::Replace($updated, "(url\((?:&quot;|[""'])?)$from((?:&quot;|[""'])?\))", "`${1}$target`${2}", 'IgnoreCase')
+    }
+
+    $updated = [regex]::Replace($updated, '\b(?<attr>srcset|imagesrcset)\s*=\s*(?<quote>["''])(?<value>.*?)(\k<quote>)', {
+        param($Match)
+
+        $attr = $Match.Groups['attr'].Value
+        $quote = $Match.Groups['quote'].Value
+        $value = [System.Net.WebUtility]::HtmlDecode($Match.Groups['value'].Value)
+        $parts = New-Object System.Collections.Generic.List[string]
+
+        foreach ($part in $value.Split(',')) {
+            $trimmed = $part.Trim()
+            if ([string]::IsNullOrWhiteSpace($trimmed)) {
+                continue
+            }
+
+            $tokens = $trimmed -split '\s+'
+            $candidate = $tokens[0]
+            if ($RewriteMap.ContainsKey($candidate)) {
+                $tokens[0] = $RewriteMap[$candidate]
+            }
+
+            $parts.Add(($tokens -join ' '))
+        }
+
+        return "$attr=$quote$([System.Net.WebUtility]::HtmlEncode(($parts -join ', ')))$quote"
+    }, 'IgnoreCase')
 
     return $updated
 }
@@ -537,6 +744,14 @@ function Save-BrowserResponseBody {
         [void](Invoke-CdpCommand -Socket $socket -Id $commandId -Method 'Network.enable')
         $commandId++
         [void](Invoke-CdpCommand -Socket $socket -Id $commandId -Method 'Page.enable')
+        $commandId++
+        try {
+            [void](Invoke-CdpCommand -Socket $socket -Id $commandId -Method 'Page.setDownloadBehavior' -Params @{
+                behavior = 'deny'
+            })
+        }
+        catch {
+        }
         $commandId++
         [void](Invoke-CdpCommand -Socket $socket -Id $commandId -Method 'Page.navigate' -Params @{ url = $ResourceUrl })
         $commandId++
@@ -627,9 +842,21 @@ function Process-ResourceQueue {
         if ($extension -eq '.css') {
             try {
                 $css = Get-Content -LiteralPath $resourceResult.LocalPath -Raw
+                $cssRewriteMap = @{}
                 foreach ($match in [regex]::Matches($css, 'url\((?:&quot;|"|''|\\")?(?<url>[^"''\)\s\\]+)', 'IgnoreCase')) {
                     $url = Resolve-Url -BaseUrl $resourceResult.Url -Value $match.Groups['url'].Value
                     Add-ResourceTask -Queue $Queue -Seen $Seen -ResourceUrl $url
+                    if ($url) {
+                        $nestedLocalPath = Get-LocalPathForUrl -ItemUrl $url -Kind 'resource'
+                        $relativeNestedPath = ConvertTo-RelativeWebPath -FromFile $resourceResult.LocalPath -ToFile $nestedLocalPath
+                        Add-RewriteMapEntry -Map $cssRewriteMap -From $match.Groups['url'].Value -To $relativeNestedPath
+                        Add-RewriteMapEntry -Map $cssRewriteMap -From $url -To $relativeNestedPath
+                    }
+                }
+
+                if ($cssRewriteMap.Count -gt 0) {
+                    $css = Update-HtmlDownloadedLinks -Html $css -RewriteMap $cssRewriteMap
+                    [System.IO.File]::WriteAllText($resourceResult.LocalPath, $css, [System.Text.UTF8Encoding]::new($false))
                 }
             }
             catch {
@@ -644,12 +871,51 @@ $seenPages = @{}
 $resourceQueue = New-Object System.Collections.ArrayList
 $seenResources = @{}
 
+function Get-PageSeenKey {
+    param([string]$PageUrl)
+
+    return "page:$(([Uri]$PageUrl).AbsoluteUri.TrimEnd('/').ToLowerInvariant())"
+}
+
+function Mark-PageSeen {
+    param(
+        [hashtable]$Seen,
+        [string[]]$Urls
+    )
+
+    foreach ($pageUrl in $Urls) {
+        if ([string]::IsNullOrWhiteSpace($pageUrl)) {
+            continue
+        }
+
+        try {
+            $Seen[(Get-PageSeenKey $pageUrl)] = $true
+        }
+        catch {
+        }
+    }
+}
+
+function Test-PageSeen {
+    param(
+        [hashtable]$Seen,
+        [string]$PageUrl
+    )
+
+    try {
+        return $Seen.ContainsKey((Get-PageSeenKey $PageUrl))
+    }
+    catch {
+        return $false
+    }
+}
+
 [void]$pageQueue.Add([pscustomobject]@{
     Url = ([Uri]$Url).AbsoluteUri
     Kind = 'page'
     OriginalUrl = ([Uri]$Url).AbsoluteUri
 })
-$seenPages[(([Uri]$Url).AbsoluteUri.ToLowerInvariant())] = $true
+Mark-PageSeen -Seen $seenPages -Urls @(([Uri]$Url).AbsoluteUri)
 
 $downloadedPages = 0
 
@@ -666,21 +932,31 @@ while ($pageQueue.Count -gt 0) {
     try {
         $pageResult = Get-PageFromBrowser -PageUrl $task.Url
         $finalUrl = $pageResult.FinalUrl
+        Mark-PageSeen -Seen $seenPages -Urls @($task.Url, $task.OriginalUrl, $finalUrl)
         $html = $pageResult.Html
-        $items = @(Get-AttributeLinks -Html $html -BaseUrl $finalUrl)
-        $redirectMap = @{}
+        $items = @($pageResult.Items) + @(Get-AttributeLinks -Html $html -BaseUrl $finalUrl)
+        $localPath = Get-LocalPathForUrl -ItemUrl $finalUrl -Kind 'page'
+        $rewriteMap = @{}
 
         foreach ($item in $items) {
             if ($item.Type -eq 'resource') {
                 Add-ResourceTask -Queue $resourceQueue -Seen $seenResources -ResourceUrl $item.Url
+                $resourceLocalPath = Get-LocalPathForUrl -ItemUrl $item.Url -Kind 'resource'
+                $relativeResourcePath = ConvertTo-RelativeWebPath -FromFile $localPath -ToFile $resourceLocalPath
+                Add-RewriteMapEntry -Map $rewriteMap -From $item.Original -To $relativeResourcePath
+                Add-RewriteMapEntry -Map $rewriteMap -From $item.Url -To $relativeResourcePath
                 continue
             }
 
             if ($item.Type -eq 'iframe') {
                 if (Test-IframeAllowed $item.Url) {
-                    $iframeKey = "iframe:$($item.Url.ToLowerInvariant())"
-                    if (-not $seenPages.ContainsKey($iframeKey)) {
-                        $seenPages[$iframeKey] = $true
+                    $iframeLocalPath = Get-LocalPathForUrl -ItemUrl $item.Url -Kind 'page'
+                    $relativeIframePath = ConvertTo-RelativeWebPath -FromFile $localPath -ToFile $iframeLocalPath
+                    Add-RewriteMapEntry -Map $rewriteMap -From $item.Original -To $relativeIframePath
+                    Add-RewriteMapEntry -Map $rewriteMap -From $item.Url -To $relativeIframePath
+
+                    if (-not (Test-PageSeen -Seen $seenPages -PageUrl $item.Url)) {
+                        Mark-PageSeen -Seen $seenPages -Urls @($item.Url)
                         [void]$pageQueue.Add([pscustomobject]@{
                             Url = $item.Url
                             Kind = 'iframe'
@@ -693,6 +969,10 @@ while ($pageQueue.Count -gt 0) {
 
             if (-not (Test-LooksLikePageUrl $item.Url)) {
                 Add-ResourceTask -Queue $resourceQueue -Seen $seenResources -ResourceUrl $item.Url
+                $resourceLocalPath = Get-LocalPathForUrl -ItemUrl $item.Url -Kind 'resource'
+                $relativeResourcePath = ConvertTo-RelativeWebPath -FromFile $localPath -ToFile $resourceLocalPath
+                Add-RewriteMapEntry -Map $rewriteMap -From $item.Original -To $relativeResourcePath
+                Add-RewriteMapEntry -Map $rewriteMap -From $item.Url -To $relativeResourcePath
                 continue
             }
 
@@ -703,13 +983,14 @@ while ($pageQueue.Count -gt 0) {
             }
 
             if (Test-UrlInScope $resolvedUrl) {
-                if (-not $resolvedUrl.Equals($candidateUrl, [System.StringComparison]::OrdinalIgnoreCase)) {
-                    $redirectMap[$item.Original] = $resolvedUrl
-                }
+                $targetLocalPath = Get-LocalPathForUrl -ItemUrl $resolvedUrl -Kind 'page'
+                $relativePagePath = ConvertTo-RelativeWebPath -FromFile $localPath -ToFile $targetLocalPath
+                Add-RewriteMapEntry -Map $rewriteMap -From $item.Original -To $relativePagePath
+                Add-RewriteMapEntry -Map $rewriteMap -From $candidateUrl -To $relativePagePath
+                Add-RewriteMapEntry -Map $rewriteMap -From $resolvedUrl -To $relativePagePath
 
-                $pageKey = "page:$($resolvedUrl.ToLowerInvariant())"
-                if (-not $seenPages.ContainsKey($pageKey)) {
-                    $seenPages[$pageKey] = $true
+                if (-not ((Test-PageSeen -Seen $seenPages -PageUrl $candidateUrl) -or (Test-PageSeen -Seen $seenPages -PageUrl $resolvedUrl))) {
+                    Mark-PageSeen -Seen $seenPages -Urls @($candidateUrl, $resolvedUrl)
                     [void]$pageQueue.Add([pscustomobject]@{
                         Url = $resolvedUrl
                         Kind = 'page'
@@ -719,16 +1000,13 @@ while ($pageQueue.Count -gt 0) {
             }
         }
 
-        if ($redirectMap.Count -gt 0) {
-            $html = Update-HtmlRedirectLinks -Html $html -RedirectMap $redirectMap
-        }
-
-        $localPath = Get-LocalPathForUrl -ItemUrl $finalUrl -Kind 'page'
+        $html = Update-HtmlDownloadedLinks -Html $html -RewriteMap $rewriteMap
         New-Item -ItemType Directory -Force -Path (Split-Path -Parent $localPath) | Out-Null
         [System.IO.File]::WriteAllText($localPath, $html, [System.Text.UTF8Encoding]::new($false))
 
         if ($task.Kind -eq 'page') {
-            Add-Content -LiteralPath $ListPath -Value "$($task.OriginalUrl)`t$finalUrl`t$localPath" -Encoding UTF8
+            $relativeListPath = ConvertTo-RelativeRootPath $localPath
+            Add-Content -LiteralPath $ListPath -Value "$($task.OriginalUrl)`t$finalUrl`t$relativeListPath" -Encoding UTF8
             $downloadedPages++
         }
 
