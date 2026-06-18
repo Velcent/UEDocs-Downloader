@@ -2,11 +2,16 @@ param(
     [string]$Url = 'https://dev.epicgames.com/documentation/unreal-engine/BlueprintAPI',
     [string]$OutputRoot = (Join-Path $PSScriptRoot 'mhtml\BlueprintAPI'),
     [int]$BrowserPollSeconds = 1,
-    [int]$PageIdleSeconds = 0,
+    [int]$PageIdleSeconds = .1,
     [int]$PageLoadTimeoutSeconds = 120,
     [int]$MaxLoadAttempts = 10,
+    [int]$ParallelPages = 30,
     [int]$MaxPages = 0,
-    [switch]$Overwrite
+    [switch]$Overwrite,
+    [switch]$WorkerMode,
+    [int]$WorkerBrowserPort = 0,
+    [string]$WorkerPageUrl = '',
+    [string]$WorkerSaveFolder = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -16,16 +21,30 @@ $BrowserPollSeconds = [Math]::Max(1, $BrowserPollSeconds)
 $PageIdleSeconds = [Math]::Max(0, $PageIdleSeconds)
 $PageLoadTimeoutSeconds = [Math]::Max(1, $PageLoadTimeoutSeconds)
 $MaxLoadAttempts = [Math]::Max(1, $MaxLoadAttempts)
+$ParallelPages = [Math]::Min(16, [Math]::Max(1, $ParallelPages))
 
 $MhtmlRoot = Join-Path $PSScriptRoot 'mhtml'
 $OutputRoot = [System.IO.Path]::GetFullPath($OutputRoot)
 $ListPath = Join-Path $MhtmlRoot 'mhtml-list.tsv'
-$script:BrowserPort = $null
+$script:BrowserPort = if ($WorkerMode) { $WorkerBrowserPort } else { $null }
 $script:BrowserProfileDir = Join-Path $MhtmlRoot '.edge-profile'
 $script:CdpCommandId = 0
 
-New-Item -ItemType Directory -Force -Path $MhtmlRoot, $OutputRoot | Out-Null
-Set-Content -LiteralPath $ListPath -Value "url`tfinal_url`tfile`ttitle`tchild_count`tparent_url" -Encoding UTF8
+if ($WorkerMode) {
+    if ($WorkerBrowserPort -le 0) {
+        throw 'WorkerBrowserPort wajib diisi untuk WorkerMode.'
+    }
+    if ([string]::IsNullOrWhiteSpace($WorkerPageUrl)) {
+        throw 'WorkerPageUrl wajib diisi untuk WorkerMode.'
+    }
+    if ([string]::IsNullOrWhiteSpace($WorkerSaveFolder)) {
+        throw 'WorkerSaveFolder wajib diisi untuk WorkerMode.'
+    }
+}
+else {
+    New-Item -ItemType Directory -Force -Path $MhtmlRoot, $OutputRoot | Out-Null
+    Set-Content -LiteralPath $ListPath -Value "url`tfinal_url`tfile`ttitle`tchild_count`tparent_url" -Encoding UTF8
+}
 
 function Get-EdgePath {
     $command = Get-Command 'msedge' -ErrorAction SilentlyContinue
@@ -476,12 +495,14 @@ function Save-BlueprintPageAsMhtml {
         New-Item -ItemType Directory -Force -Path $Folder | Out-Null
         $filePath = Get-PageFilePath -Folder $Folder -Title $data.h1
 
+        $saved = $false
         if ((Test-Path -LiteralPath $filePath) -and -not $Overwrite) {
             Write-Host "Lewati file yang sudah ada: $(ConvertTo-RelativeRootPath $filePath)"
         }
         else {
             $snapshot = Invoke-CdpCommand -Socket $socket -Method 'Page.captureSnapshot' -Params @{ format = 'mhtml' }
             [System.IO.File]::WriteAllText($filePath, [string]$snapshot.result.data, [System.Text.UTF8Encoding]::new($false))
+            $saved = $true
             Write-Host "Simpan MHTML: $(ConvertTo-RelativeRootPath $filePath)"
         }
 
@@ -490,6 +511,7 @@ function Save-BlueprintPageAsMhtml {
             FinalUrl = [string]$data.href
             Title = [string]$data.h1
             FilePath = $filePath
+            Saved = $saved
             Actions = @($data.actions)
             ParentUrl = [string]$data.parentUrl
         }
@@ -504,9 +526,45 @@ function Save-BlueprintPageAsMhtml {
     }
 }
 
+if ($WorkerMode) {
+    try {
+        $workerResult = Save-BlueprintPageAsMhtml -PageUrl $WorkerPageUrl -Folder ([System.IO.Path]::GetFullPath($WorkerSaveFolder))
+        [pscustomobject]@{
+            WorkerResult = $true
+            Success = $true
+            OriginalUrl = $workerResult.OriginalUrl
+            FinalUrl = $workerResult.FinalUrl
+            Title = $workerResult.Title
+            FilePath = $workerResult.FilePath
+            RelativeFile = (ConvertTo-RelativeRootPath $workerResult.FilePath)
+            Saved = $workerResult.Saved
+            Actions = @($workerResult.Actions)
+            ParentUrl = $workerResult.ParentUrl
+            Error = ''
+        }
+    }
+    catch {
+        [pscustomobject]@{
+            WorkerResult = $true
+            Success = $false
+            OriginalUrl = $WorkerPageUrl
+            FinalUrl = ''
+            Title = ''
+            FilePath = ''
+            RelativeFile = ''
+            Saved = $false
+            Actions = @()
+            ParentUrl = ''
+            Error = $_.Exception.Message
+        }
+    }
+    return
+}
+
 $stack = New-Object System.Collections.ArrayList
 $visited = @{}
 $downloaded = 0
+$started = 0
 
 [void]$stack.Add([pscustomobject]@{
     Url = ([Uri]$Url).AbsoluteUri
@@ -514,45 +572,192 @@ $downloaded = 0
     ChildFolder = $OutputRoot
 })
 
-while ($stack.Count -gt 0) {
-    if ($MaxPages -gt 0 -and $downloaded -ge $MaxPages) {
-        Write-Host "MaxPages tercapai: $MaxPages"
-        break
+function Add-ChildTasks {
+    param(
+        [System.Collections.ArrayList]$Queue,
+        [hashtable]$Seen,
+        $Task,
+        $Result
+    )
+
+    $actions = @($Result.Actions)
+    for ($index = $actions.Count - 1; $index -ge 0; $index--) {
+        $action = $actions[$index]
+        if ([string]::IsNullOrWhiteSpace([string]$action.url)) {
+            continue
+        }
+
+        $key = Get-CanonicalUrlKey ([string]$action.url)
+        if ($Seen.ContainsKey($key)) {
+            continue
+        }
+
+        $childFolderName = ConvertTo-SafeSegment -Value $action.name -MaxLength 90
+        [void]$Queue.Add([pscustomobject]@{
+            Url = [string]$action.url
+            SaveFolder = $Task.ChildFolder
+            ChildFolder = (Join-Path $Task.ChildFolder $childFolderName)
+        })
+    }
+}
+
+function Write-ListEntry {
+    param($Result)
+
+    $relativeFile = if ($Result.RelativeFile) { $Result.RelativeFile } else { ConvertTo-RelativeRootPath $Result.FilePath }
+    Add-Content -LiteralPath $ListPath -Value "$($Result.OriginalUrl)`t$($Result.FinalUrl)`t$relativeFile`t$($Result.Title)`t$(@($Result.Actions).Count)`t$($Result.ParentUrl)" -Encoding UTF8
+}
+
+function Get-NextTask {
+    param(
+        [System.Collections.ArrayList]$Queue,
+        [hashtable]$Seen
+    )
+
+    while ($Queue.Count -gt 0) {
+        $task = $Queue[$Queue.Count - 1]
+        $Queue.RemoveAt($Queue.Count - 1)
+
+        $key = Get-CanonicalUrlKey $task.Url
+        if ($Seen.ContainsKey($key)) {
+            continue
+        }
+        $Seen[$key] = $true
+        return $task
     }
 
-    $task = $stack[$stack.Count - 1]
-    $stack.RemoveAt($stack.Count - 1)
+    return $null
+}
 
-    $key = Get-CanonicalUrlKey $task.Url
-    if ($visited.ContainsKey($key)) {
-        continue
+function Test-CanStartMore {
+    param([int]$StartedCount)
+
+    return ($MaxPages -le 0 -or $StartedCount -lt $MaxPages)
+}
+
+function Start-PageWorkerJob {
+    param($Task)
+
+    Ensure-Edge
+    Write-Host "Mulai job: $($Task.Url)"
+
+    $scriptPath = $PSCommandPath
+    $initialization = {
+        Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
     }
-    $visited[$key] = $true
 
-    try {
-        $result = Save-BlueprintPageAsMhtml -PageUrl $task.Url -Folder $task.SaveFolder
-        $downloaded++
+    return Start-Job -InitializationScript $initialization -ScriptBlock {
+        param(
+            [string]$ScriptPath,
+            [int]$BrowserPort,
+            [string]$PageUrl,
+            [string]$SaveFolder,
+            [int]$BrowserPollSeconds,
+            [int]$PageIdleSeconds,
+            [int]$PageLoadTimeoutSeconds,
+            [int]$MaxLoadAttempts,
+            [bool]$OverwriteFlag
+        )
 
-        $relativeFile = ConvertTo-RelativeRootPath $result.FilePath
-        Add-Content -LiteralPath $ListPath -Value "$($result.OriginalUrl)`t$($result.FinalUrl)`t$relativeFile`t$($result.Title)`t$(@($result.Actions).Count)`t$($result.ParentUrl)" -Encoding UTF8
+        & $ScriptPath `
+            -WorkerMode `
+            -WorkerBrowserPort $BrowserPort `
+            -WorkerPageUrl $PageUrl `
+            -WorkerSaveFolder $SaveFolder `
+            -BrowserPollSeconds $BrowserPollSeconds `
+            -PageIdleSeconds $PageIdleSeconds `
+            -PageLoadTimeoutSeconds $PageLoadTimeoutSeconds `
+            -MaxLoadAttempts $MaxLoadAttempts `
+            -Overwrite:$OverwriteFlag
+    } -ArgumentList @(
+        $scriptPath,
+        $script:BrowserPort,
+        [string]$Task.Url,
+        [string]$Task.SaveFolder,
+        $BrowserPollSeconds,
+        $PageIdleSeconds,
+        $PageLoadTimeoutSeconds,
+        $MaxLoadAttempts,
+        $Overwrite.IsPresent
+    )
+}
 
-        $actions = @($result.Actions)
-        for ($index = $actions.Count - 1; $index -ge 0; $index--) {
-            $action = $actions[$index]
-            if ([string]::IsNullOrWhiteSpace([string]$action.url)) {
-                continue
-            }
+if ($ParallelPages -le 1) {
+    while ($stack.Count -gt 0) {
+        if (-not (Test-CanStartMore -StartedCount $started)) {
+            Write-Host "MaxPages tercapai: $MaxPages"
+            break
+        }
 
-            $childFolderName = ConvertTo-SafeSegment -Value $action.name -MaxLength 90
-            [void]$stack.Add([pscustomobject]@{
-                Url = [string]$action.url
-                SaveFolder = $task.ChildFolder
-                ChildFolder = (Join-Path $task.ChildFolder $childFolderName)
-            })
+        $task = Get-NextTask -Queue $stack -Seen $visited
+        if (-not $task) {
+            break
+        }
+
+        $started++
+        try {
+            $result = Save-BlueprintPageAsMhtml -PageUrl $task.Url -Folder $task.SaveFolder
+            $downloaded++
+            Write-ListEntry -Result $result
+            Add-ChildTasks -Queue $stack -Seen $visited -Task $task -Result $result
+        }
+        catch {
+            Write-Warning "Gagal memproses: $($task.Url) - $($_.Exception.Message)"
         }
     }
-    catch {
-        Write-Warning "Gagal memproses: $($task.Url) - $($_.Exception.Message)"
+}
+else {
+    Ensure-Edge
+    Write-Host "ParallelPages aktif: $ParallelPages"
+
+    $active = New-Object System.Collections.ArrayList
+    while ($stack.Count -gt 0 -or $active.Count -gt 0) {
+        while ($active.Count -lt $ParallelPages -and (Test-CanStartMore -StartedCount $started)) {
+            $task = Get-NextTask -Queue $stack -Seen $visited
+            if (-not $task) {
+                break
+            }
+
+            $job = Start-PageWorkerJob -Task $task
+            [void]$active.Add([pscustomobject]@{
+                Job = $job
+                Task = $task
+            })
+            $started++
+        }
+
+        if ($active.Count -eq 0) {
+            if (-not (Test-CanStartMore -StartedCount $started) -and $MaxPages -gt 0) {
+                Write-Host "MaxPages tercapai: $MaxPages"
+            }
+            break
+        }
+
+        [void](Wait-Job -Job @($active | ForEach-Object { $_.Job }) -Any)
+        $completed = @($active | Where-Object { $_.Job.State -ne 'Running' })
+
+        foreach ($item in $completed) {
+            $received = @(Receive-Job -Job $item.Job -ErrorAction SilentlyContinue -WarningAction SilentlyContinue)
+            $result = $received | Where-Object { $_.PSObject.Properties['WorkerResult'] } | Select-Object -Last 1
+
+            if ($result -and $result.Success) {
+                $downloaded++
+                Write-ListEntry -Result $result
+                Add-ChildTasks -Queue $stack -Seen $visited -Task $item.Task -Result $result
+
+                $status = if ($result.Saved) { 'Simpan' } else { 'Lewati existing' }
+                Write-Host "${status}: $($result.RelativeFile)"
+            }
+            elseif ($result) {
+                Write-Warning "Gagal memproses: $($item.Task.Url) - $($result.Error)"
+            }
+            else {
+                Write-Warning "Gagal memproses: $($item.Task.Url) - job tidak mengembalikan hasil."
+            }
+
+            Remove-Job -Job $item.Job -Force
+            [void]$active.Remove($item)
+        }
     }
 }
 
