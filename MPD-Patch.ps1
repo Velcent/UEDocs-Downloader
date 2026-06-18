@@ -102,13 +102,11 @@ function Get-VideoPlayerHtml {
         [string]$PosterUrl
     )
 
-    $mp4Link = "mp4/$VideoId.mp4"
-    $posterAttribute = ''
-    $posterStyle = ''
+    $mp4Link = "https://media.local/mp4/$VideoId.mp4"
+    $background = '#000'
 
     if (-not [string]::IsNullOrWhiteSpace($PosterUrl)) {
-        $posterAttribute = " poster=""$(ConvertTo-HtmlAttributeValue $PosterUrl)"""
-        $posterStyle = " background-image: url(""$(ConvertTo-CssUrlValue $PosterUrl)""); background-size: contain; background-position: center; background-repeat: no-repeat;"
+        $background = "#000 url(""$(ConvertTo-CssUrlValue $PosterUrl)"") center / contain no-repeat"
     }
 
     return @"
@@ -123,17 +121,40 @@ html, body {
   margin: 0;
   background: #000;
 }
-video {
+
+.video-link {
   display: block;
   width: 100%;
   height: 100%;
-  object-fit: contain;
-  background-color: #000;$posterStyle
+  background: $background;
+  position: relative;
+}
+
+.play {
+  position: absolute;
+  inset: 0;
+  margin: auto;
+  width: 72px;
+  height: 72px;
+  border-radius: 50%;
+  background: rgba(0,0,0,.55);
+}
+
+.play::after {
+  content: "";
+  position: absolute;
+  left: 29px;
+  top: 22px;
+  border-left: 24px solid white;
+  border-top: 14px solid transparent;
+  border-bottom: 14px solid transparent;
 }
 </style>
 </head>
 <body>
-<video controls playsinline preload="metadata"$posterAttribute src="$mp4Link"></video>
+<a class="video-link" href="$mp4Link">
+  <span class="play"></span>
+</a>
 </body>
 </html>
 "@
