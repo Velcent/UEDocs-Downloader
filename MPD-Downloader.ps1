@@ -1,6 +1,6 @@
 param(
     [string]$Root = $PSScriptRoot,
-    [int]$BrowserPollSeconds = 2,
+    [int]$BrowserPollSeconds = 0.5,
     [int]$ParallelDownloads = 10
 )
 
@@ -400,7 +400,7 @@ function Save-EmbedHtmlFromBrowser {
             continue
         }
 
-        Write-Host "Embed page loaded but qsep videoUrl is not visible yet. Waiting... attempt $attempt"
+        # Write-Host "Embed page loaded but qsep videoUrl is not visible yet. Waiting... attempt $attempt"
     }
 }
 
