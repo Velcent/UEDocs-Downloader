@@ -481,6 +481,82 @@ function Resolve-RedirectUrl {
     }
 }
 
+function Get-QueryMap {
+    param([string]$Query)
+
+    $map = @{}
+    if ([string]::IsNullOrWhiteSpace($Query)) {
+        return $map
+    }
+
+    foreach ($part in $Query.TrimStart('?').Split('&')) {
+        if ([string]::IsNullOrWhiteSpace($part)) {
+            continue
+        }
+
+        $pieces = $part.Split('=', 2)
+        $key = [System.Uri]::UnescapeDataString($pieces[0])
+        $value = if ($pieces.Count -gt 1) { [System.Uri]::UnescapeDataString($pieces[1]) } else { '' }
+        $map[$key] = $value
+    }
+
+    return $map
+}
+
+function Get-PageCanonicalKey {
+    param([string]$PageUrl)
+
+    $uri = [Uri]$PageUrl
+    $queryMap = Get-QueryMap $uri.Query
+    $queryKeys = @($queryMap.Keys | Where-Object { $_ -ne 'application_version' } | Sort-Object)
+    $query = ''
+
+    if ($queryKeys.Count -gt 0) {
+        $parts = foreach ($key in $queryKeys) {
+            "$([System.Uri]::EscapeDataString($key))=$([System.Uri]::EscapeDataString([string]$queryMap[$key]))"
+        }
+        $query = '?' + ($parts -join '&')
+    }
+
+    return "$($uri.Scheme.ToLowerInvariant())://$($uri.Host.ToLowerInvariant())$($uri.AbsolutePath.TrimEnd('/'))$query"
+}
+
+function Get-ApplicationVersion {
+    param([string]$PageUrl)
+
+    try {
+        $queryMap = Get-QueryMap ([Uri]$PageUrl).Query
+        if ($queryMap.ContainsKey('application_version')) {
+            return [version]([string]$queryMap['application_version'])
+        }
+    }
+    catch {
+    }
+
+    return $null
+}
+
+function Compare-ApplicationVersion {
+    param(
+        [object]$Left,
+        [object]$Right
+    )
+
+    if ($null -eq $Left -and $null -eq $Right) {
+        return 0
+    }
+
+    if ($null -eq $Left) {
+        return -1
+    }
+
+    if ($null -eq $Right) {
+        return 1
+    }
+
+    return ([version]$Left).CompareTo([version]$Right)
+}
+
 function Get-ShortHash {
     param([string]$Text)
 
@@ -899,6 +975,8 @@ function Process-ResourceQueue {
 
 $pageQueue = New-Object System.Collections.ArrayList
 $seenPages = @{}
+$bestPageVersions = @{}
+$downloadedPageCanonicals = @{}
 $resourceQueue = New-Object System.Collections.ArrayList
 $seenResources = @{}
 
@@ -941,11 +1019,56 @@ function Test-PageSeen {
     }
 }
 
-[void]$pageQueue.Add([pscustomobject]@{
-    Url = ([Uri]$Url).AbsoluteUri
-    Kind = 'page'
-    OriginalUrl = ([Uri]$Url).AbsoluteUri
-})
+function Add-PageTask {
+    param(
+        [System.Collections.ArrayList]$Queue,
+        [hashtable]$BestVersions,
+        [hashtable]$DownloadedCanonicals,
+        [string]$TaskUrl,
+        [string]$Kind,
+        [string]$OriginalUrl
+    )
+
+    $canonicalKey = Get-PageCanonicalKey $TaskUrl
+    $version = Get-ApplicationVersion $TaskUrl
+
+    if ($DownloadedCanonicals.ContainsKey($canonicalKey)) {
+        $downloadedVersion = $DownloadedCanonicals[$canonicalKey]
+        if ((Compare-ApplicationVersion -Left $version -Right $downloadedVersion) -le 0) {
+            return $false
+        }
+    }
+
+    if ($BestVersions.ContainsKey($canonicalKey)) {
+        $bestVersion = $BestVersions[$canonicalKey]
+        if ((Compare-ApplicationVersion -Left $version -Right $bestVersion) -lt 0) {
+            return $false
+        }
+
+        for ($index = $Queue.Count - 1; $index -ge 0; $index--) {
+            try {
+                if ((Get-PageCanonicalKey $Queue[$index].Url) -eq $canonicalKey) {
+                    $Queue.RemoveAt($index)
+                }
+            }
+            catch {
+            }
+        }
+    }
+
+    $BestVersions[$canonicalKey] = $version
+    [void]$Queue.Add([pscustomobject]@{
+        Url = $TaskUrl
+        Kind = $Kind
+        OriginalUrl = $OriginalUrl
+        CanonicalKey = $canonicalKey
+        ApplicationVersion = $version
+    })
+
+    return $true
+}
+
+[void](Add-PageTask -Queue $pageQueue -BestVersions $bestPageVersions -DownloadedCanonicals $downloadedPageCanonicals -TaskUrl ([Uri]$Url).AbsoluteUri -Kind 'page' -OriginalUrl ([Uri]$Url).AbsoluteUri)
 Mark-PageSeen -Seen $seenPages -Urls @(([Uri]$Url).AbsoluteUri)
 
 $downloadedPages = 0
@@ -986,14 +1109,8 @@ while ($pageQueue.Count -gt 0) {
                     Add-RewriteMapEntry -Map $rewriteMap -From $item.Original -To $relativeIframePath
                     Add-RewriteMapEntry -Map $rewriteMap -From $item.Url -To $relativeIframePath
 
-                    if (-not (Test-PageSeen -Seen $seenPages -PageUrl $item.Url)) {
-                        Mark-PageSeen -Seen $seenPages -Urls @($item.Url)
-                        [void]$pageQueue.Add([pscustomobject]@{
-                            Url = $item.Url
-                            Kind = 'iframe'
-                            OriginalUrl = $item.Url
-                        })
-                    }
+                    [void](Add-PageTask -Queue $pageQueue -BestVersions $bestPageVersions -DownloadedCanonicals $downloadedPageCanonicals -TaskUrl $item.Url -Kind 'iframe' -OriginalUrl $item.Url)
+                    Mark-PageSeen -Seen $seenPages -Urls @($item.Url)
                 }
                 continue
             }
@@ -1020,14 +1137,8 @@ while ($pageQueue.Count -gt 0) {
                 Add-RewriteMapEntry -Map $rewriteMap -From $candidateUrl -To $relativePagePath
                 Add-RewriteMapEntry -Map $rewriteMap -From $resolvedUrl -To $relativePagePath
 
-                if (-not ((Test-PageSeen -Seen $seenPages -PageUrl $candidateUrl) -or (Test-PageSeen -Seen $seenPages -PageUrl $resolvedUrl))) {
-                    Mark-PageSeen -Seen $seenPages -Urls @($candidateUrl, $resolvedUrl)
-                    [void]$pageQueue.Add([pscustomobject]@{
-                        Url = $resolvedUrl
-                        Kind = 'page'
-                        OriginalUrl = $candidateUrl
-                    })
-                }
+                [void](Add-PageTask -Queue $pageQueue -BestVersions $bestPageVersions -DownloadedCanonicals $downloadedPageCanonicals -TaskUrl $resolvedUrl -Kind 'page' -OriginalUrl $candidateUrl)
+                Mark-PageSeen -Seen $seenPages -Urls @($candidateUrl, $resolvedUrl)
             }
         }
 
@@ -1040,6 +1151,8 @@ while ($pageQueue.Count -gt 0) {
             Add-Content -LiteralPath $ListPath -Value "$($task.OriginalUrl)`t$finalUrl`t$relativeListPath" -Encoding UTF8
             $downloadedPages++
         }
+
+        $downloadedPageCanonicals[(Get-PageCanonicalKey $finalUrl)] = Get-ApplicationVersion $finalUrl
 
         Write-Host "Saved $($task.Kind): $finalUrl"
         if ($pageResult) {
