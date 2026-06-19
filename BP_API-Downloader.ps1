@@ -3,9 +3,9 @@ param(
     [string]$OutputRoot = (Join-Path $PSScriptRoot 'mhtml\BlueprintAPI'),
     [int]$BrowserPollSeconds = 1,
     [int]$PageIdleSeconds = .1,
-    [int]$PageLoadTimeoutSeconds = 10000,
-    [int]$MaxLoadAttempts = 10,
-    [int]$ParallelPages = 16,
+    [int]$PageLoadTimeoutSeconds = 1000,
+    [int]$MaxLoadAttempts = 100,
+    [int]$ParallelPages = 30,
     [int]$MaxPages = 0,
     [switch]$Overwrite,
     [switch]$WorkerMode,
@@ -21,7 +21,7 @@ $BrowserPollSeconds = [Math]::Max(1, $BrowserPollSeconds)
 $PageIdleSeconds = [Math]::Max(0, $PageIdleSeconds)
 $PageLoadTimeoutSeconds = [Math]::Max(1, $PageLoadTimeoutSeconds)
 $MaxLoadAttempts = [Math]::Max(1, $MaxLoadAttempts)
-$ParallelPages = [Math]::Min(16, [Math]::Max(1, $ParallelPages))
+$ParallelPages = [Math]::Min(30, [Math]::Max(1, $ParallelPages))
 
 $MhtmlRoot = Join-Path $PSScriptRoot 'mhtml'
 $OutputRoot = [System.IO.Path]::GetFullPath($OutputRoot)
