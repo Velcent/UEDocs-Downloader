@@ -11,9 +11,7 @@ param(
     [switch]$WorkerMode,
     [int]$WorkerBrowserPort = 0,
     [string]$WorkerPageUrl = '',
-    [string]$WorkerSaveFolder = '',
-    [string]$WorkerReadySignalPath = '',
-    [string]$WorkerStartSignalPath = ''
+    [string]$WorkerSaveFolder = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -632,9 +630,7 @@ function Wait-BlueprintPageReady {
 function Save-BlueprintPageAsMhtml {
     param(
         [string]$PageUrl,
-        [string]$Folder,
-        [string]$ReadySignalPath = '',
-        [string]$StartSignalPath = ''
+        [string]$Folder
     )
 
     $page = $null
@@ -650,21 +646,6 @@ function Save-BlueprintPageAsMhtml {
         [void](Invoke-CdpCommand -Socket $socket -Method 'Page.enable')
         [void](Invoke-CdpCommand -Socket $socket -Method 'Runtime.enable')
         [void](Invoke-CdpCommand -Socket $socket -Method 'Network.enable')
-
-        if (-not [string]::IsNullOrWhiteSpace($ReadySignalPath)) {
-            New-Item -ItemType Directory -Force -Path (Split-Path -Parent $ReadySignalPath) | Out-Null
-            Set-Content -LiteralPath $ReadySignalPath -Value "ready`t$PageUrl" -Encoding UTF8
-        }
-
-        if (-not [string]::IsNullOrWhiteSpace($StartSignalPath)) {
-            $startDeadline = (Get-Date).AddSeconds(120)
-            while (-not (Test-Path -LiteralPath $StartSignalPath)) {
-                if ((Get-Date) -ge $startDeadline) {
-                    throw "Timeout menunggu sinyal start batch: $PageUrl"
-                }
-                Start-Sleep -Milliseconds 100
-            }
-        }
 
         $data = $null
         for ($attempt = 1; $attempt -le $MaxLoadAttempts; $attempt++) {
@@ -726,11 +707,7 @@ function Save-BlueprintPageAsMhtml {
 
 if ($WorkerMode) {
     try {
-        $workerResult = Save-BlueprintPageAsMhtml `
-            -PageUrl $WorkerPageUrl `
-            -Folder ([System.IO.Path]::GetFullPath($WorkerSaveFolder)) `
-            -ReadySignalPath $WorkerReadySignalPath `
-            -StartSignalPath $WorkerStartSignalPath
+        $workerResult = Save-BlueprintPageAsMhtml -PageUrl $WorkerPageUrl -Folder ([System.IO.Path]::GetFullPath($WorkerSaveFolder))
         [pscustomobject]@{
             WorkerResult = $true
             Success = $true
@@ -1000,11 +977,7 @@ function Add-FailedTaskBack {
 }
 
 function Start-PageWorkerJob {
-    param(
-        $Task,
-        [string]$ReadySignalPath,
-        [string]$StartSignalPath
-    )
+    param($Task)
 
     Ensure-Edge
     Write-Host "Mulai job: $($Task.Url)"
@@ -1024,9 +997,7 @@ function Start-PageWorkerJob {
             [int]$PageIdleSeconds,
             [int]$PageLoadTimeoutSeconds,
             [int]$MaxLoadAttempts,
-            [bool]$OverwriteFlag,
-            [string]$ReadySignalPath,
-            [string]$StartSignalPath
+            [bool]$OverwriteFlag
         )
 
         & $ScriptPath `
@@ -1038,9 +1009,7 @@ function Start-PageWorkerJob {
             -PageIdleSeconds $PageIdleSeconds `
             -PageLoadTimeoutSeconds $PageLoadTimeoutSeconds `
             -MaxLoadAttempts $MaxLoadAttempts `
-            -Overwrite:$OverwriteFlag `
-            -WorkerReadySignalPath $ReadySignalPath `
-            -WorkerStartSignalPath $StartSignalPath
+            -Overwrite:$OverwriteFlag
     } -ArgumentList @(
         $scriptPath,
         $script:BrowserPort,
@@ -1050,38 +1019,8 @@ function Start-PageWorkerJob {
         $PageIdleSeconds,
         $PageLoadTimeoutSeconds,
         $MaxLoadAttempts,
-        $Overwrite.IsPresent,
-        $ReadySignalPath,
-        $StartSignalPath
+        $Overwrite.IsPresent
     )
-}
-
-function Wait-WorkerBatchReady {
-    param(
-        [object[]]$Batch,
-        [int]$TimeoutSeconds = 120
-    )
-
-    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
-    while ((Get-Date) -lt $deadline) {
-        $readyCount = @($Batch | Where-Object { Test-Path -LiteralPath $_.ReadySignalPath }).Count
-        $failedCount = @($Batch | Where-Object { $_.Job.State -ne 'Running' -and -not (Test-Path -LiteralPath $_.ReadySignalPath) }).Count
-
-        if ($readyCount -eq $Batch.Count -or $failedCount -gt 0) {
-            return
-        }
-
-        Start-Sleep -Milliseconds 100
-    }
-
-    Write-Warning "Timeout menunggu semua worker ready. Melepas batch yang sudah siap."
-}
-
-function Start-WorkerBatchNavigation {
-    param([string]$StartSignalPath)
-
-    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $StartSignalPath) | Out-Null
-    Set-Content -LiteralPath $StartSignalPath -Value "start`t$(Get-Date -Format o)" -Encoding UTF8
 }
 
 if ($ParallelPages -le 1) {
@@ -1121,9 +1060,6 @@ else {
 
     while ($stack.Count -gt 0) {
         $batch = New-Object System.Collections.ArrayList
-        $batchId = "$PID-$(Get-Date -Format 'yyyyMMddHHmmssfff')-$started"
-        $batchSignalDir = Join-Path $MhtmlRoot ".batch-signals\$batchId"
-        $startSignalPath = Join-Path $batchSignalDir 'start.signal'
 
         while ($batch.Count -lt $ParallelPages -and (Test-CanStartMore -StartedCount $started)) {
             $task = Get-NextTask -Queue $stack -Seen $visited
@@ -1135,12 +1071,10 @@ else {
                 continue
             }
 
-            $readySignalPath = Join-Path $batchSignalDir "ready-$($batch.Count).signal"
-            $job = Start-PageWorkerJob -Task $task -ReadySignalPath $readySignalPath -StartSignalPath $startSignalPath
+            $job = Start-PageWorkerJob -Task $task
             [void]$batch.Add([pscustomobject]@{
                 Job = $job
                 Task = $task
-                ReadySignalPath = $readySignalPath
             })
             $started++
         }
@@ -1151,11 +1085,6 @@ else {
             }
             break
         }
-
-        Write-Host "Menunggu worker ready: $($batch.Count) job"
-        Wait-WorkerBatchReady -Batch @($batch)
-        Write-Host "Start batch serentak: $($batch.Count) job"
-        Start-WorkerBatchNavigation -StartSignalPath $startSignalPath
 
         Write-Host "Menunggu batch selesai: $($batch.Count) job"
         [void](Wait-Job -Job @($batch | ForEach-Object { $_.Job }))
@@ -1187,8 +1116,6 @@ else {
 
             Remove-Job -Job $item.Job -Force
         }
-
-        Remove-Item -LiteralPath $batchSignalDir -Recurse -Force -ErrorAction SilentlyContinue
     }
 }
 
