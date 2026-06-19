@@ -3,7 +3,7 @@ param(
     [string]$OutputRoot = (Join-Path $PSScriptRoot 'mhtml\BlueprintAPI'),
     [int]$BrowserPollSeconds = 1,
     [int]$PageIdleSeconds = .1,
-    [int]$PageLoadTimeoutSeconds = 1000,
+    [int]$PageLoadTimeoutSeconds = 3000,
     [int]$MaxLoadAttempts = 100,
     [int]$ParallelPages = 30,
     [int]$MaxPages = 0,
