@@ -1058,9 +1058,10 @@ else {
     Ensure-Edge
     Write-Host "ParallelPages aktif: $ParallelPages"
 
-    $active = New-Object System.Collections.ArrayList
-    while ($stack.Count -gt 0 -or $active.Count -gt 0) {
-        while ($active.Count -lt $ParallelPages -and (Test-CanStartMore -StartedCount $started)) {
+    while ($stack.Count -gt 0) {
+        $batch = New-Object System.Collections.ArrayList
+
+        while ($batch.Count -lt $ParallelPages -and (Test-CanStartMore -StartedCount $started)) {
             $task = Get-NextTask -Queue $stack -Seen $visited
             if (-not $task) {
                 break
@@ -1071,24 +1072,24 @@ else {
             }
 
             $job = Start-PageWorkerJob -Task $task
-            [void]$active.Add([pscustomobject]@{
+            [void]$batch.Add([pscustomobject]@{
                 Job = $job
                 Task = $task
             })
             $started++
         }
 
-        if ($active.Count -eq 0) {
+        if ($batch.Count -eq 0) {
             if (-not (Test-CanStartMore -StartedCount $started) -and $MaxPages -gt 0) {
                 Write-Host "MaxPages tercapai: $MaxPages"
             }
             break
         }
 
-        [void](Wait-Job -Job @($active | ForEach-Object { $_.Job }) -Any)
-        $completed = @($active | Where-Object { $_.Job.State -ne 'Running' })
+        Write-Host "Menunggu batch selesai: $($batch.Count) job"
+        [void](Wait-Job -Job @($batch | ForEach-Object { $_.Job }))
 
-        foreach ($item in $completed) {
+        foreach ($item in @($batch)) {
             $received = @(Receive-Job -Job $item.Job -ErrorAction SilentlyContinue -WarningAction SilentlyContinue)
             $result = $received | Where-Object { $_.PSObject.Properties['WorkerResult'] } | Select-Object -Last 1
 
@@ -1114,7 +1115,6 @@ else {
             }
 
             Remove-Job -Job $item.Job -Force
-            [void]$active.Remove($item)
         }
     }
 }
