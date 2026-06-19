@@ -4,14 +4,16 @@ param(
     [int]$BrowserPollSeconds = 1,
     [int]$PageIdleSeconds = .1,
     [int]$PageLoadTimeoutSeconds = 3000,
-    [int]$MaxLoadAttempts = 100,
-    [int]$ParallelPages = 30,
+    [int]$MaxLoadAttempts = 100000,
+    [int]$ParallelPages = 5,
     [int]$MaxPages = 0,
     [switch]$Overwrite,
     [switch]$WorkerMode,
     [int]$WorkerBrowserPort = 0,
     [string]$WorkerPageUrl = '',
-    [string]$WorkerSaveFolder = ''
+    [string]$WorkerSaveFolder = '',
+    [int]$WorkerId = 0,
+    [string]$WorkerIpcDir = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -38,11 +40,18 @@ if ($WorkerMode) {
     if ($WorkerBrowserPort -le 0) {
         throw 'WorkerBrowserPort wajib diisi untuk WorkerMode.'
     }
-    if ([string]::IsNullOrWhiteSpace($WorkerPageUrl)) {
-        throw 'WorkerPageUrl wajib diisi untuk WorkerMode.'
+    if (-not [string]::IsNullOrWhiteSpace($WorkerIpcDir)) {
+        if ($WorkerId -le 0) {
+            throw 'WorkerId wajib diisi untuk WorkerMode IPC.'
+        }
     }
-    if ([string]::IsNullOrWhiteSpace($WorkerSaveFolder)) {
-        throw 'WorkerSaveFolder wajib diisi untuk WorkerMode.'
+    else {
+        if ([string]::IsNullOrWhiteSpace($WorkerPageUrl)) {
+            throw 'WorkerPageUrl wajib diisi untuk WorkerMode.'
+        }
+        if ([string]::IsNullOrWhiteSpace($WorkerSaveFolder)) {
+            throw 'WorkerSaveFolder wajib diisi untuk WorkerMode.'
+        }
     }
 }
 else {
@@ -627,115 +636,266 @@ function Wait-BlueprintPageReady {
     throw "Timeout load dan h1 belum tersedia: $PageUrl"
 }
 
-function Save-BlueprintPageAsMhtml {
-    param(
-        [string]$PageUrl,
-        [string]$Folder
-    )
-
-    $page = $null
-    $socket = $null
+function New-BlueprintPageSession {
+    Write-Host "Buka tab Edge"
+    $page = Open-DevToolsUrl 'about:blank'
+    $socket = [System.Net.WebSockets.ClientWebSocket]::new()
 
     try {
-        Write-Host ""
-        Write-Host "Buka Edge: $PageUrl"
-        $page = Open-DevToolsUrl 'about:blank'
-        $socket = [System.Net.WebSockets.ClientWebSocket]::new()
         [void]$socket.ConnectAsync([Uri]$page.webSocketDebuggerUrl, [Threading.CancellationToken]::None).GetAwaiter().GetResult()
 
         [void](Invoke-CdpCommand -Socket $socket -Method 'Page.enable')
         [void](Invoke-CdpCommand -Socket $socket -Method 'Runtime.enable')
         [void](Invoke-CdpCommand -Socket $socket -Method 'Network.enable')
 
-        $data = $null
-        for ($attempt = 1; $attempt -le $MaxLoadAttempts; $attempt++) {
-            Reset-NetworkState
-            if ($attempt -eq 1) {
-                [void](Invoke-CdpCommand -Socket $socket -Method 'Page.navigate' -Params @{ url = $PageUrl })
-            }
-            else {
-                Write-Warning "Reload halaman karena metadata belum lengkap: $PageUrl"
-                [void](Invoke-CdpCommand -Socket $socket -Method 'Page.reload' -Params @{ ignoreCache = $true })
-            }
-
-            try {
-                $data = Wait-BlueprintPageReady -Socket $socket -PageUrl $PageUrl -Attempt $attempt
-                Assert-PageLoadOk -Data $data
-                break
-            }
-            catch {
-                if ($attempt -ge $MaxLoadAttempts) {
-                    throw
-                }
-                Write-Warning $_.Exception.Message
-            }
-        }
-
-        New-Item -ItemType Directory -Force -Path $Folder | Out-Null
-        $filePath = Get-PageFilePath -Folder $Folder -Title $data.h1
-
-        $saved = $false
-        if ((Test-Path -LiteralPath $filePath) -and -not $Overwrite) {
-            Write-Host "Lewati file yang sudah ada: $(ConvertTo-RelativeRootPath $filePath)"
-        }
-        else {
-            $snapshot = Invoke-CdpCommand -Socket $socket -Method 'Page.captureSnapshot' -Params @{ format = 'mhtml' }
-            [System.IO.File]::WriteAllText($filePath, [string]$snapshot.result.data, [System.Text.UTF8Encoding]::new($false))
-            $saved = $true
-            Write-Host "Simpan MHTML: $(ConvertTo-RelativeRootPath $filePath)"
-        }
-
         return [pscustomobject]@{
-            OriginalUrl = $PageUrl
-            FinalUrl = [string]$data.href
-            Title = [string]$data.h1
-            FilePath = $filePath
-            Saved = $saved
-            Actions = @($data.actions)
-            ParentUrl = [string]$data.parentUrl
+            Page = $page
+            Socket = $socket
         }
     }
-    finally {
-        if ($socket) {
-            $socket.Dispose()
-        }
+    catch {
+        $socket.Dispose()
         if ($page) {
             Close-DevToolsPage -TargetId $page.id
         }
+        throw
+    }
+}
+
+function Close-BlueprintPageSession {
+    param($Session)
+
+    if (-not $Session) {
+        return
+    }
+
+    if ($Session.Socket) {
+        $Session.Socket.Dispose()
+    }
+    if ($Session.Page) {
+        Close-DevToolsPage -TargetId $Session.Page.id
+    }
+}
+
+function Save-BlueprintPageAsMhtmlInSession {
+    param(
+        [System.Net.WebSockets.ClientWebSocket]$Socket,
+        [string]$PageUrl,
+        [string]$Folder
+    )
+
+    Write-Host ""
+    Write-Host "Buka Edge: $PageUrl"
+
+    $data = $null
+    for ($attempt = 1; $attempt -le $MaxLoadAttempts; $attempt++) {
+        Reset-NetworkState
+        if ($attempt -eq 1) {
+            [void](Invoke-CdpCommand -Socket $Socket -Method 'Page.navigate' -Params @{ url = $PageUrl })
+        }
+        else {
+            Write-Warning "Reload halaman karena metadata belum lengkap: $PageUrl"
+            [void](Invoke-CdpCommand -Socket $Socket -Method 'Page.reload' -Params @{ ignoreCache = $true })
+        }
+
+        try {
+            $data = Wait-BlueprintPageReady -Socket $Socket -PageUrl $PageUrl -Attempt $attempt
+            Assert-PageLoadOk -Data $data
+            break
+        }
+        catch {
+            if ($attempt -ge $MaxLoadAttempts) {
+                throw
+            }
+            Write-Warning $_.Exception.Message
+        }
+    }
+
+    New-Item -ItemType Directory -Force -Path $Folder | Out-Null
+    $filePath = Get-PageFilePath -Folder $Folder -Title $data.h1
+
+    $saved = $false
+    if ((Test-Path -LiteralPath $filePath) -and -not $Overwrite) {
+        Write-Host "Lewati file yang sudah ada: $(ConvertTo-RelativeRootPath $filePath)"
+    }
+    else {
+        $snapshot = Invoke-CdpCommand -Socket $Socket -Method 'Page.captureSnapshot' -Params @{ format = 'mhtml' }
+        [System.IO.File]::WriteAllText($filePath, [string]$snapshot.result.data, [System.Text.UTF8Encoding]::new($false))
+        $saved = $true
+        Write-Host "Simpan MHTML: $(ConvertTo-RelativeRootPath $filePath)"
+    }
+
+    return [pscustomobject]@{
+        OriginalUrl = $PageUrl
+        FinalUrl = [string]$data.href
+        Title = [string]$data.h1
+        FilePath = $filePath
+        Saved = $saved
+        Actions = @($data.actions)
+        ParentUrl = [string]$data.parentUrl
+    }
+}
+
+function Save-BlueprintPageAsMhtml {
+    param(
+        [string]$PageUrl,
+        [string]$Folder
+    )
+
+    $session = $null
+    try {
+        $session = New-BlueprintPageSession
+        return Save-BlueprintPageAsMhtmlInSession -Socket $session.Socket -PageUrl $PageUrl -Folder $Folder
+    }
+    finally {
+        Close-BlueprintPageSession -Session $session
+    }
+}
+
+function Get-WorkerFilePath {
+    param(
+        [string]$Directory,
+        [int]$Id,
+        [string]$Kind
+    )
+
+    return (Join-Path $Directory ("worker-{0:D3}.{1}" -f $Id, $Kind))
+}
+
+function New-WorkerSuccessResult {
+    param(
+        [int]$Id,
+        [int]$TaskId,
+        $Result
+    )
+
+    return [pscustomobject]@{
+        WorkerResult = $true
+        WorkerId = $Id
+        TaskId = $TaskId
+        Success = $true
+        OriginalUrl = $Result.OriginalUrl
+        FinalUrl = $Result.FinalUrl
+        Title = $Result.Title
+        FilePath = $Result.FilePath
+        RelativeFile = (ConvertTo-RelativeRootPath $Result.FilePath)
+        Saved = $Result.Saved
+        Actions = @($Result.Actions)
+        ParentUrl = $Result.ParentUrl
+        Error = ''
+    }
+}
+
+function New-WorkerErrorResult {
+    param(
+        [int]$Id,
+        [int]$TaskId,
+        [string]$PageUrl,
+        [string]$ErrorMessage
+    )
+
+    return [pscustomobject]@{
+        WorkerResult = $true
+        WorkerId = $Id
+        TaskId = $TaskId
+        Success = $false
+        OriginalUrl = $PageUrl
+        FinalUrl = ''
+        Title = ''
+        FilePath = ''
+        RelativeFile = ''
+        Saved = $false
+        Actions = @()
+        ParentUrl = ''
+        Error = $ErrorMessage
+    }
+}
+
+function Invoke-PersistentPageWorker {
+    param(
+        [int]$Id,
+        [string]$Directory
+    )
+
+    $workerDir = [System.IO.Path]::GetFullPath($Directory)
+    $taskPath = Get-WorkerFilePath -Directory $workerDir -Id $Id -Kind 'task.json'
+    $processingPath = Get-WorkerFilePath -Directory $workerDir -Id $Id -Kind 'processing.json'
+    $resultPath = Get-WorkerFilePath -Directory $workerDir -Id $Id -Kind 'result.json'
+    $stopPath = Get-WorkerFilePath -Directory $workerDir -Id $Id -Kind 'stop'
+
+    $session = $null
+    try {
+        $session = New-BlueprintPageSession
+        Write-Host "Worker #$Id siap menunggu task."
+
+        while ($true) {
+            if ((Test-Path -LiteralPath $stopPath) -and -not (Test-Path -LiteralPath $taskPath) -and -not (Test-Path -LiteralPath $processingPath)) {
+                break
+            }
+
+            $currentTaskPath = $null
+            if (Test-Path -LiteralPath $processingPath) {
+                $currentTaskPath = $processingPath
+            }
+            elseif (Test-Path -LiteralPath $taskPath) {
+                try {
+                    Move-Item -LiteralPath $taskPath -Destination $processingPath -Force -ErrorAction Stop
+                    $currentTaskPath = $processingPath
+                }
+                catch {
+                    Start-Sleep -Milliseconds 250
+                    continue
+                }
+            }
+
+            if (-not $currentTaskPath) {
+                Start-Sleep -Milliseconds 250
+                continue
+            }
+
+            $task = $null
+            $taskId = 0
+            $pageUrl = ''
+            try {
+                $task = Get-Content -LiteralPath $currentTaskPath -Raw | ConvertFrom-Json
+                $taskId = [int]$task.TaskId
+                $pageUrl = [string]$task.Url
+
+                if (-not $session -or $session.Socket.State -ne [System.Net.WebSockets.WebSocketState]::Open) {
+                    Close-BlueprintPageSession -Session $session
+                    $session = New-BlueprintPageSession
+                }
+
+                $workerResult = Save-BlueprintPageAsMhtmlInSession -Socket $session.Socket -PageUrl $pageUrl -Folder ([System.IO.Path]::GetFullPath([string]$task.SaveFolder))
+                $result = New-WorkerSuccessResult -Id $Id -TaskId $taskId -Result $workerResult
+            }
+            catch {
+                $result = New-WorkerErrorResult -Id $Id -TaskId $taskId -PageUrl $pageUrl -ErrorMessage $_.Exception.Message
+            }
+
+            $tempResultPath = "$resultPath.tmp"
+            $result | ConvertTo-Json -Depth 30 | Set-Content -LiteralPath $tempResultPath -Encoding UTF8
+            Move-Item -LiteralPath $tempResultPath -Destination $resultPath -Force
+            Remove-Item -LiteralPath $currentTaskPath -Force -ErrorAction SilentlyContinue
+        }
+    }
+    finally {
+        Close-BlueprintPageSession -Session $session
     }
 }
 
 if ($WorkerMode) {
+    if (-not [string]::IsNullOrWhiteSpace($WorkerIpcDir)) {
+        Invoke-PersistentPageWorker -Id $WorkerId -Directory $WorkerIpcDir
+        return
+    }
+
     try {
         $workerResult = Save-BlueprintPageAsMhtml -PageUrl $WorkerPageUrl -Folder ([System.IO.Path]::GetFullPath($WorkerSaveFolder))
-        [pscustomobject]@{
-            WorkerResult = $true
-            Success = $true
-            OriginalUrl = $workerResult.OriginalUrl
-            FinalUrl = $workerResult.FinalUrl
-            Title = $workerResult.Title
-            FilePath = $workerResult.FilePath
-            RelativeFile = (ConvertTo-RelativeRootPath $workerResult.FilePath)
-            Saved = $workerResult.Saved
-            Actions = @($workerResult.Actions)
-            ParentUrl = $workerResult.ParentUrl
-            Error = ''
-        }
+        New-WorkerSuccessResult -Id $WorkerId -TaskId 0 -Result $workerResult
     }
     catch {
-        [pscustomobject]@{
-            WorkerResult = $true
-            Success = $false
-            OriginalUrl = $WorkerPageUrl
-            FinalUrl = ''
-            Title = ''
-            FilePath = ''
-            RelativeFile = ''
-            Saved = $false
-            Actions = @()
-            ParentUrl = ''
-            Error = $_.Exception.Message
-        }
+        New-WorkerErrorResult -Id $WorkerId -TaskId 0 -PageUrl $WorkerPageUrl -ErrorMessage $_.Exception.Message
     }
     return
 }
@@ -977,10 +1137,13 @@ function Add-FailedTaskBack {
 }
 
 function Start-PageWorkerJob {
-    param($Task)
+    param(
+        [int]$Id,
+        [string]$IpcDir
+    )
 
     Ensure-Edge
-    Write-Host "Mulai job: $($Task.Url)"
+    Write-Host "Mulai worker #${Id}"
 
     $scriptPath = $PSCommandPath
     $initialization = {
@@ -991,8 +1154,8 @@ function Start-PageWorkerJob {
         param(
             [string]$ScriptPath,
             [int]$BrowserPort,
-            [string]$PageUrl,
-            [string]$SaveFolder,
+            [int]$Id,
+            [string]$IpcDir,
             [int]$BrowserPollSeconds,
             [int]$PageIdleSeconds,
             [int]$PageLoadTimeoutSeconds,
@@ -1003,8 +1166,8 @@ function Start-PageWorkerJob {
         & $ScriptPath `
             -WorkerMode `
             -WorkerBrowserPort $BrowserPort `
-            -WorkerPageUrl $PageUrl `
-            -WorkerSaveFolder $SaveFolder `
+            -WorkerId $Id `
+            -WorkerIpcDir $IpcDir `
             -BrowserPollSeconds $BrowserPollSeconds `
             -PageIdleSeconds $PageIdleSeconds `
             -PageLoadTimeoutSeconds $PageLoadTimeoutSeconds `
@@ -1013,14 +1176,123 @@ function Start-PageWorkerJob {
     } -ArgumentList @(
         $scriptPath,
         $script:BrowserPort,
-        [string]$Task.Url,
-        [string]$Task.SaveFolder,
+        $Id,
+        $IpcDir,
         $BrowserPollSeconds,
         $PageIdleSeconds,
         $PageLoadTimeoutSeconds,
         $MaxLoadAttempts,
         $Overwrite.IsPresent
     )
+}
+
+function Receive-PageWorkerOutput {
+    param($Worker)
+
+    if (-not $Worker -or -not $Worker.Job) {
+        return
+    }
+
+    Receive-Job -Job $Worker.Job -ErrorAction SilentlyContinue -WarningAction SilentlyContinue | Out-Host
+}
+
+function Send-TaskToWorker {
+    param(
+        $Worker,
+        $Task,
+        [int]$TaskId
+    )
+
+    $payload = [pscustomobject]@{
+        TaskId = $TaskId
+        Url = [string]$Task.Url
+        SaveFolder = [string]$Task.SaveFolder
+        ChildFolder = [string]$Task.ChildFolder
+        RetryCount = if ($Task.PSObject.Properties['RetryCount']) { [int]$Task.RetryCount } else { 0 }
+    }
+
+    $tempPath = "$($Worker.TaskPath).tmp"
+    $payload | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $tempPath -Encoding UTF8
+    Move-Item -LiteralPath $tempPath -Destination $Worker.TaskPath -Force
+
+    $Worker.Busy = $true
+    $Worker.Task = $Task
+    $Worker.TaskId = $TaskId
+    Write-Host "Worker #$($Worker.Id) proses: $($Task.Url)"
+}
+
+function Receive-WorkerResult {
+    param($Worker)
+
+    if (-not (Test-Path -LiteralPath $Worker.ResultPath)) {
+        return $null
+    }
+
+    $result = Get-Content -LiteralPath $Worker.ResultPath -Raw | ConvertFrom-Json
+    Remove-Item -LiteralPath $Worker.ResultPath -Force -ErrorAction SilentlyContinue
+    return $result
+}
+
+function Clear-WorkerPendingFiles {
+    param($Worker)
+
+    foreach ($path in @(
+        $Worker.TaskPath,
+        ($Worker.TaskPath -replace '\.task\.json$', '.processing.json'),
+        $Worker.ResultPath,
+        "$($Worker.TaskPath).tmp",
+        "$($Worker.ResultPath).tmp"
+    )) {
+        if (-not [string]::IsNullOrWhiteSpace($path)) {
+            Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
+function Get-NextBrowserTask {
+    param(
+        [System.Collections.ArrayList]$Queue,
+        [hashtable]$Seen,
+        [hashtable]$DownloadedMap
+    )
+
+    while ($Queue.Count -gt 0 -and (Test-CanStartMore -StartedCount $started)) {
+        $task = Get-NextTask -Queue $Queue -Seen $Seen
+        if (-not $task) {
+            return $null
+        }
+
+        if (Invoke-LocalTaskIfAvailable -Queue $Queue -Seen $Seen -DownloadedMap $DownloadedMap -Task $task) {
+            continue
+        }
+
+        return $task
+    }
+
+    return $null
+}
+
+function Stop-PageWorkers {
+    param(
+        [System.Collections.ArrayList]$Workers,
+        [string]$IpcDir
+    )
+
+    foreach ($worker in @($Workers)) {
+        New-Item -ItemType File -Force -Path $worker.StopPath | Out-Null
+    }
+
+    foreach ($worker in @($Workers)) {
+        if ($worker.Job) {
+            [void](Wait-Job -Job $worker.Job -Timeout 10)
+            Receive-PageWorkerOutput -Worker $worker
+            Remove-Job -Job $worker.Job -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($IpcDir) -and (Test-Path -LiteralPath $IpcDir)) {
+        Remove-Item -LiteralPath $IpcDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
 }
 
 if ($ParallelPages -le 1) {
@@ -1058,64 +1330,110 @@ else {
     Ensure-Edge
     Write-Host "ParallelPages aktif: $ParallelPages"
 
-    $active = New-Object System.Collections.ArrayList
-    while ($stack.Count -gt 0 -or $active.Count -gt 0) {
-        while ($active.Count -lt $ParallelPages -and (Test-CanStartMore -StartedCount $started)) {
-            $task = Get-NextTask -Queue $stack -Seen $visited
-            if (-not $task) {
-                break
-            }
+    $workerIpcDir = Join-Path $MhtmlRoot (".bp-workers-$PID-{0}" -f (Get-Date -Format 'yyyyMMddHHmmss'))
+    New-Item -ItemType Directory -Force -Path $workerIpcDir | Out-Null
 
-            if (Invoke-LocalTaskIfAvailable -Queue $stack -Seen $visited -DownloadedMap $downloadedMap -Task $task) {
-                continue
-            }
+    $workers = New-Object System.Collections.ArrayList
+    for ($workerId = 1; $workerId -le $ParallelPages; $workerId++) {
+        $job = Start-PageWorkerJob -Id $workerId -IpcDir $workerIpcDir
+        [void]$workers.Add([pscustomobject]@{
+            Id = $workerId
+            Job = $job
+            Busy = $false
+            Task = $null
+            TaskId = 0
+            TaskPath = (Get-WorkerFilePath -Directory $workerIpcDir -Id $workerId -Kind 'task.json')
+            ResultPath = (Get-WorkerFilePath -Directory $workerIpcDir -Id $workerId -Kind 'result.json')
+            StopPath = (Get-WorkerFilePath -Directory $workerIpcDir -Id $workerId -Kind 'stop')
+        })
+    }
 
-            $job = Start-PageWorkerJob -Task $task
-            [void]$active.Add([pscustomobject]@{
-                Job = $job
-                Task = $task
-            })
-            $started++
-        }
+    $nextTaskId = 0
+    try {
+        while ($stack.Count -gt 0 -or @($workers | Where-Object { $_.Busy }).Count -gt 0) {
+            $madeProgress = $false
 
-        if ($active.Count -eq 0) {
-            if (-not (Test-CanStartMore -StartedCount $started) -and $MaxPages -gt 0) {
-                Write-Host "MaxPages tercapai: $MaxPages"
-            }
-            break
-        }
+            foreach ($worker in @($workers)) {
+                Receive-PageWorkerOutput -Worker $worker
 
-        [void](Wait-Job -Job @($active | ForEach-Object { $_.Job }) -Any)
-        $completed = @($active | Where-Object { $_.Job.State -ne 'Running' })
+                $result = Receive-WorkerResult -Worker $worker
+                if ($result) {
+                    if ($result.Success) {
+                        $downloaded++
+                        Write-ListEntry -Result $result
+                        Add-ChildTasks -Queue $stack -Seen $visited -Task $worker.Task -Result $result
 
-        foreach ($item in $completed) {
-            $received = @(Receive-Job -Job $item.Job -ErrorAction SilentlyContinue -WarningAction SilentlyContinue)
-            $result = $received | Where-Object { $_.PSObject.Properties['WorkerResult'] } | Select-Object -Last 1
+                        $status = if ($result.Saved) { 'Simpan' } else { 'Lewati existing' }
+                        Write-Host "${status}: $($result.RelativeFile)"
+                    }
+                    else {
+                        if ($started -gt 0) {
+                            $started--
+                        }
+                        Add-FailedTaskBack -Queue $stack -Seen $visited -Task $worker.Task -ErrorMessage $result.Error
+                    }
 
-            if ($result -and $result.Success) {
-                $downloaded++
-                Write-ListEntry -Result $result
-                Add-ChildTasks -Queue $stack -Seen $visited -Task $item.Task -Result $result
-
-                $status = if ($result.Saved) { 'Simpan' } else { 'Lewati existing' }
-                Write-Host "${status}: $($result.RelativeFile)"
-            }
-            elseif ($result) {
-                if ($started -gt 0) {
-                    $started--
+                    $worker.Busy = $false
+                    $worker.Task = $null
+                    $worker.TaskId = 0
+                    $madeProgress = $true
                 }
-                Add-FailedTaskBack -Queue $stack -Seen $visited -Task $item.Task -ErrorMessage $result.Error
-            }
-            else {
-                if ($started -gt 0) {
-                    $started--
+                elseif ($worker.Busy -and $worker.Job.State -ne 'Running') {
+                    if ($started -gt 0) {
+                        $started--
+                    }
+                    Add-FailedTaskBack -Queue $stack -Seen $visited -Task $worker.Task -ErrorMessage "worker #$($worker.Id) berhenti sebelum mengembalikan hasil"
+
+                    Clear-WorkerPendingFiles -Worker $worker
+                    Remove-Job -Job $worker.Job -Force -ErrorAction SilentlyContinue
+                    $worker.Job = Start-PageWorkerJob -Id $worker.Id -IpcDir $workerIpcDir
+                    $worker.Busy = $false
+                    $worker.Task = $null
+                    $worker.TaskId = 0
+                    $madeProgress = $true
                 }
-                Add-FailedTaskBack -Queue $stack -Seen $visited -Task $item.Task -ErrorMessage 'job tidak mengembalikan hasil'
+                elseif (-not $worker.Busy -and $worker.Job.State -ne 'Running') {
+                    Clear-WorkerPendingFiles -Worker $worker
+                    Remove-Job -Job $worker.Job -Force -ErrorAction SilentlyContinue
+                    $worker.Job = Start-PageWorkerJob -Id $worker.Id -IpcDir $workerIpcDir
+                    $madeProgress = $true
+                }
             }
 
-            Remove-Job -Job $item.Job -Force
-            [void]$active.Remove($item)
+            foreach ($worker in @($workers | Where-Object { -not $_.Busy })) {
+                if (-not (Test-CanStartMore -StartedCount $started)) {
+                    break
+                }
+
+                $task = Get-NextBrowserTask -Queue $stack -Seen $visited -DownloadedMap $downloadedMap
+                if (-not $task) {
+                    break
+                }
+
+                $nextTaskId++
+                Send-TaskToWorker -Worker $worker -Task $task -TaskId $nextTaskId
+                $started++
+                $madeProgress = $true
+            }
+
+            if (@($workers | Where-Object { $_.Busy }).Count -eq 0) {
+                if (-not (Test-CanStartMore -StartedCount $started) -and $MaxPages -gt 0) {
+                    Write-Host "MaxPages tercapai: $MaxPages"
+                    break
+                }
+
+                if ($stack.Count -eq 0) {
+                    break
+                }
+            }
+
+            if (-not $madeProgress) {
+                Start-Sleep -Milliseconds 250
+            }
         }
+    }
+    finally {
+        Stop-PageWorkers -Workers $workers -IpcDir $workerIpcDir
     }
 }
 
