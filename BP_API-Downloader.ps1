@@ -29,6 +29,10 @@ $ListPath = Join-Path $MhtmlRoot 'bp_api-list.tsv'
 $script:BrowserPort = if ($WorkerMode) { $WorkerBrowserPort } else { $null }
 $script:BrowserProfileDir = Join-Path $MhtmlRoot '.edge-profile'
 $script:CdpCommandId = 0
+$script:MainDocumentStatus = $null
+$script:MainDocumentStatusText = ''
+$script:MainDocumentFailedText = ''
+$script:MainDocumentRequestId = ''
 
 if ($WorkerMode) {
     if ($WorkerBrowserPort -le 0) {
@@ -43,7 +47,12 @@ if ($WorkerMode) {
 }
 else {
     New-Item -ItemType Directory -Force -Path $MhtmlRoot, $OutputRoot | Out-Null
-    Set-Content -LiteralPath $ListPath -Value "url`tfinal_url`tfile`ttitle`tchild_count`tparent_url" -Encoding UTF8
+    if (-not (Test-Path -LiteralPath $ListPath) -or (Get-Item -LiteralPath $ListPath).Length -eq 0) {
+        Set-Content -LiteralPath $ListPath -Value "url`tfinal_url`tfile`ttitle`tchild_count`tparent_url" -Encoding UTF8
+    }
+    else {
+        Write-Host "Resume dari list: $ListPath"
+    }
 }
 
 function Get-EdgePath {
@@ -202,6 +211,9 @@ function Invoke-CdpCommand {
     do {
         $responseText = Receive-WebSocketText $Socket
         $response = $responseText | ConvertFrom-Json
+        if (-not $response.id) {
+            Update-NetworkStateFromEvent -Message $response
+        }
     } while ($response.id -ne $id)
 
     if ($response.error) {
@@ -209,6 +221,51 @@ function Invoke-CdpCommand {
     }
 
     return $response
+}
+
+function Reset-NetworkState {
+    $script:MainDocumentStatus = $null
+    $script:MainDocumentStatusText = ''
+    $script:MainDocumentFailedText = ''
+    $script:MainDocumentRequestId = ''
+}
+
+function Update-NetworkStateFromEvent {
+    param($Message)
+
+    if (-not $Message -or -not $Message.method) {
+        return
+    }
+
+    if ($Message.method -eq 'Network.responseReceived' -and $Message.params.type -eq 'Document') {
+        $script:MainDocumentRequestId = [string]$Message.params.requestId
+        $script:MainDocumentStatus = [int]$Message.params.response.status
+        $script:MainDocumentStatusText = [string]$Message.params.response.statusText
+        return
+    }
+
+    if ($Message.method -eq 'Network.loadingFailed' -and $script:MainDocumentRequestId -and ([string]$Message.params.requestId) -eq $script:MainDocumentRequestId) {
+        $script:MainDocumentFailedText = [string]$Message.params.errorText
+    }
+}
+
+function Assert-PageLoadOk {
+    param($Data)
+
+    if (-not [string]::IsNullOrWhiteSpace($script:MainDocumentFailedText)) {
+        throw "Network error: $($script:MainDocumentFailedText)"
+    }
+
+    if ($null -ne $script:MainDocumentStatus -and $script:MainDocumentStatus -ge 400) {
+        $statusText = if ($script:MainDocumentStatusText) { " $($script:MainDocumentStatusText)" } else { '' }
+        throw "HTTP $($script:MainDocumentStatus)$statusText"
+    }
+
+    $title = [string]$Data.title
+    $h1 = [string]$Data.h1
+    if ("$title $h1" -match '(?i)\b(404|502|503|504|not found|bad gateway|service unavailable|gateway timeout)\b') {
+        throw "Halaman terlihat error: title='$title', h1='$h1'"
+    }
 }
 
 function Get-BlueprintSnapshotExpression {
@@ -396,6 +453,125 @@ function Get-PageFilePath {
     return (Join-Path $Folder "$baseName.mhtml")
 }
 
+function ConvertFrom-QuotedPrintableText {
+    param([string]$Text)
+
+    if ([string]::IsNullOrEmpty($Text)) {
+        return ''
+    }
+
+    $withoutSoftBreaks = [regex]::Replace($Text, "=\r?\n", '')
+    return [regex]::Replace($withoutSoftBreaks, '=([0-9A-Fa-f]{2})', {
+        param($Match)
+        [char][Convert]::ToInt32($Match.Groups[1].Value, 16)
+    })
+}
+
+function Get-TagAttributeValue {
+    param(
+        [string]$TagText,
+        [string]$Name
+    )
+
+    if ([string]::IsNullOrWhiteSpace($TagText)) {
+        return ''
+    }
+
+    $pattern = "(?i)\b$([regex]::Escape($Name))\s*=\s*(?:""(?<value>[^""]*)""|'(?<value>[^']*)'|(?<value>[^\s>]+))"
+    $match = [regex]::Match($TagText, $pattern)
+    if (-not $match.Success) {
+        return ''
+    }
+
+    return [System.Net.WebUtility]::HtmlDecode($match.Groups['value'].Value)
+}
+
+function Resolve-PageUrl {
+    param(
+        [string]$BaseUrl,
+        [string]$Value
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Value)) {
+        return ''
+    }
+
+    try {
+        return ([Uri]::new([Uri]$BaseUrl, $Value)).AbsoluteUri
+    }
+    catch {
+        return ''
+    }
+}
+
+function Get-BlueprintDataFromMhtml {
+    param(
+        [string]$MhtmlPath,
+        [string]$BaseUrl,
+        [string]$FallbackTitle = '',
+        [string]$FallbackParentUrl = ''
+    )
+
+    if (-not (Test-Path -LiteralPath $MhtmlPath)) {
+        return $null
+    }
+
+    $raw = [System.IO.File]::ReadAllText($MhtmlPath)
+    $decoded = [System.Net.WebUtility]::HtmlDecode((ConvertFrom-QuotedPrintableText $raw))
+    $title = $FallbackTitle
+
+    $h1Match = [regex]::Match($decoded, '<h1\b[^>]*>(?<value>.*?)</h1>', 'IgnoreCase,Singleline')
+    if ($h1Match.Success) {
+        $title = ([regex]::Replace($h1Match.Groups['value'].Value, '<[^>]+>', '') -replace '\s+', ' ').Trim()
+    }
+
+    $parentUrl = $FallbackParentUrl
+    $navMatch = [regex]::Match($decoded, '<h2\b[^>]*\bid\s*=\s*(?:"navigation"|''navigation''|navigation)[^>]*>.*?</h2>(?<section>.*?)(?=<h[1-6]\b|$)', 'IgnoreCase,Singleline')
+    if ($navMatch.Success) {
+        $links = [regex]::Matches($navMatch.Groups['section'].Value, '<a\b(?<attrs>[^>]*)>', 'IgnoreCase')
+        if ($links.Count -gt 0) {
+            $lastHref = Get-TagAttributeValue -TagText $links[$links.Count - 1].Groups['attrs'].Value -Name 'href'
+            $resolvedParent = Resolve-PageUrl -BaseUrl $BaseUrl -Value $lastHref
+            if ($resolvedParent) {
+                $parentUrl = $resolvedParent
+            }
+        }
+    }
+
+    $actions = New-Object System.Collections.Generic.List[object]
+    $actionsMatch = [regex]::Match($decoded, '<h2\b[^>]*\bid\s*=\s*(?:"actionsandcategories"|''actionsandcategories''|actionsandcategories)[^>]*>.*?</h2>(?<section>.*?)(?=<h[1-6]\b|$)', 'IgnoreCase,Singleline')
+    if ($actionsMatch.Success) {
+        foreach ($match in [regex]::Matches($actionsMatch.Groups['section'].Value, '<block-dir-item-md\b(?<attrs>[^>]*)>', 'IgnoreCase')) {
+            $attrs = $match.Groups['attrs'].Value
+            $href = Resolve-PageUrl -BaseUrl $BaseUrl -Value (Get-TagAttributeValue -TagText $attrs -Name 'href')
+            if (-not $href) {
+                continue
+            }
+
+            $name = Get-TagAttributeValue -TagText $attrs -Name 'page-name'
+            if ([string]::IsNullOrWhiteSpace($name)) {
+                $name = ([Uri]$href).Segments[-1].Trim('/')
+            }
+
+            $actions.Add([pscustomobject]@{
+                name = ($name -replace '\s+', ' ').Trim()
+                url = $href
+            })
+        }
+    }
+
+    return [pscustomobject]@{
+        OriginalUrl = $BaseUrl
+        FinalUrl = $BaseUrl
+        Title = $title
+        FilePath = $MhtmlPath
+        Saved = $false
+        Actions = @($actions.ToArray())
+        ParentUrl = $parentUrl
+        Local = $true
+    }
+}
+
 function Wait-BlueprintPageReady {
     param(
         [System.Net.WebSockets.ClientWebSocket]$Socket,
@@ -469,9 +645,11 @@ function Save-BlueprintPageAsMhtml {
 
         [void](Invoke-CdpCommand -Socket $socket -Method 'Page.enable')
         [void](Invoke-CdpCommand -Socket $socket -Method 'Runtime.enable')
+        [void](Invoke-CdpCommand -Socket $socket -Method 'Network.enable')
 
         $data = $null
         for ($attempt = 1; $attempt -le $MaxLoadAttempts; $attempt++) {
+            Reset-NetworkState
             if ($attempt -eq 1) {
                 [void](Invoke-CdpCommand -Socket $socket -Method 'Page.navigate' -Params @{ url = $PageUrl })
             }
@@ -482,6 +660,7 @@ function Save-BlueprintPageAsMhtml {
 
             try {
                 $data = Wait-BlueprintPageReady -Socket $socket -PageUrl $PageUrl -Attempt $attempt
+                Assert-PageLoadOk -Data $data
                 break
             }
             catch {
@@ -561,10 +740,108 @@ if ($WorkerMode) {
     return
 }
 
+function ConvertTo-LocalPathFromListValue {
+    param([string]$Value)
+
+    if ([string]::IsNullOrWhiteSpace($Value)) {
+        return ''
+    }
+
+    if ($Value -match '^file:/') {
+        return ([Uri]$Value).LocalPath
+    }
+
+    if ([System.IO.Path]::IsPathRooted($Value)) {
+        return $Value
+    }
+
+    return (Join-Path $PSScriptRoot $Value)
+}
+
+function Get-DownloadedPageMap {
+    param([string]$Path)
+
+    $map = @{}
+    if (-not (Test-Path -LiteralPath $Path)) {
+        return $map
+    }
+
+    try {
+        $rows = @(Import-Csv -LiteralPath $Path -Delimiter "`t")
+    }
+    catch {
+        Write-Warning "Tidak bisa membaca list resume: $Path - $($_.Exception.Message)"
+        return $map
+    }
+
+    foreach ($row in $rows) {
+        $filePath = ConvertTo-LocalPathFromListValue $row.file
+        if ([string]::IsNullOrWhiteSpace($filePath) -or -not (Test-Path -LiteralPath $filePath)) {
+            continue
+        }
+
+        foreach ($urlValue in @($row.url, $row.final_url)) {
+            if ([string]::IsNullOrWhiteSpace($urlValue)) {
+                continue
+            }
+
+            try {
+                $map[(Get-CanonicalUrlKey $urlValue)] = [pscustomobject]@{
+                    Url = [string]$row.url
+                    FinalUrl = [string]$row.final_url
+                    FilePath = $filePath
+                    Title = [string]$row.title
+                    ChildCount = if ($row.child_count -match '^\d+$') { [int]$row.child_count } else { 0 }
+                    ParentUrl = [string]$row.parent_url
+                }
+            }
+            catch {
+            }
+        }
+    }
+
+    return $map
+}
+
+function Get-LocalResultForTask {
+    param(
+        $Task,
+        [hashtable]$DownloadedMap
+    )
+
+    if ($Overwrite -or -not $DownloadedMap) {
+        return $null
+    }
+
+    $key = Get-CanonicalUrlKey $Task.Url
+    if (-not $DownloadedMap.ContainsKey($key)) {
+        return $null
+    }
+
+    $entry = $DownloadedMap[$key]
+    $baseUrl = if ($entry.FinalUrl) { $entry.FinalUrl } else { $Task.Url }
+    $result = Get-BlueprintDataFromMhtml -MhtmlPath $entry.FilePath -BaseUrl $baseUrl -FallbackTitle $entry.Title -FallbackParentUrl $entry.ParentUrl
+    if (-not $result) {
+        return $null
+    }
+
+    if ($entry.ChildCount -gt 0 -and @($result.Actions).Count -eq 0) {
+        Write-Warning "File lokal ada tapi child link tidak terbaca, fallback ke browser: $($entry.FilePath)"
+        return $null
+    }
+
+    return $result
+}
+
 $stack = New-Object System.Collections.ArrayList
 $visited = @{}
+$downloadedMap = Get-DownloadedPageMap -Path $ListPath
 $downloaded = 0
 $started = 0
+
+if ($downloadedMap.Count -gt 0) {
+    Write-Host "Index lokal terbaca: $($downloadedMap.Count) URL dari $ListPath"
+}
 
 [void]$stack.Add([pscustomobject]@{
     Url = ([Uri]$Url).AbsoluteUri
@@ -606,6 +883,25 @@ function Write-ListEntry {
 
     $relativeFile = if ($Result.RelativeFile) { $Result.RelativeFile } else { ConvertTo-RelativeRootPath $Result.FilePath }
     Add-Content -LiteralPath $ListPath -Value "$($Result.OriginalUrl)`t$($Result.FinalUrl)`t$relativeFile`t$($Result.Title)`t$(@($Result.Actions).Count)`t$($Result.ParentUrl)" -Encoding UTF8
+
+    foreach ($urlValue in @($Result.OriginalUrl, $Result.FinalUrl)) {
+        if ([string]::IsNullOrWhiteSpace([string]$urlValue)) {
+            continue
+        }
+
+        try {
+            $downloadedMap[(Get-CanonicalUrlKey ([string]$urlValue))] = [pscustomobject]@{
+                Url = [string]$Result.OriginalUrl
+                FinalUrl = [string]$Result.FinalUrl
+                FilePath = [string]$Result.FilePath
+                Title = [string]$Result.Title
+                ChildCount = @($Result.Actions).Count
+                ParentUrl = [string]$Result.ParentUrl
+            }
+        }
+        catch {
+        }
+    }
 }
 
 function Get-NextTask {
@@ -633,6 +929,51 @@ function Test-CanStartMore {
     param([int]$StartedCount)
 
     return ($MaxPages -le 0 -or $StartedCount -lt $MaxPages)
+}
+
+function Invoke-LocalTaskIfAvailable {
+    param(
+        [System.Collections.ArrayList]$Queue,
+        [hashtable]$Seen,
+        [hashtable]$DownloadedMap,
+        $Task
+    )
+
+    $localResult = Get-LocalResultForTask -Task $Task -DownloadedMap $DownloadedMap
+    if (-not $localResult) {
+        return $false
+    }
+
+    Write-Host "Baca lokal: $(ConvertTo-RelativeRootPath $localResult.FilePath)"
+    Add-ChildTasks -Queue $Queue -Seen $Seen -Task $Task -Result $localResult
+    return $true
+}
+
+function Add-FailedTaskBack {
+    param(
+        [System.Collections.ArrayList]$Queue,
+        [hashtable]$Seen,
+        $Task,
+        [string]$ErrorMessage
+    )
+
+    $key = Get-CanonicalUrlKey $Task.Url
+    if ($Seen.ContainsKey($key)) {
+        $Seen.Remove($key)
+    }
+
+    $retryCount = 1
+    if ($Task.PSObject.Properties['RetryCount']) {
+        $retryCount = [int]$Task.RetryCount + 1
+    }
+
+    Write-Warning "Job gagal, masuk antrean ulang #${retryCount}: $($Task.Url) - $ErrorMessage"
+    [void]$Queue.Add([pscustomobject]@{
+        Url = [string]$Task.Url
+        SaveFolder = [string]$Task.SaveFolder
+        ChildFolder = [string]$Task.ChildFolder
+        RetryCount = $retryCount
+    })
 }
 
 function Start-PageWorkerJob {
@@ -694,6 +1035,10 @@ if ($ParallelPages -le 1) {
             break
         }
 
+        if (Invoke-LocalTaskIfAvailable -Queue $stack -Seen $visited -DownloadedMap $downloadedMap -Task $task) {
+            continue
+        }
+
         $started++
         try {
             $result = Save-BlueprintPageAsMhtml -PageUrl $task.Url -Folder $task.SaveFolder
@@ -702,7 +1047,10 @@ if ($ParallelPages -le 1) {
             Add-ChildTasks -Queue $stack -Seen $visited -Task $task -Result $result
         }
         catch {
-            Write-Warning "Gagal memproses: $($task.Url) - $($_.Exception.Message)"
+            if ($started -gt 0) {
+                $started--
+            }
+            Add-FailedTaskBack -Queue $stack -Seen $visited -Task $task -ErrorMessage $_.Exception.Message
         }
     }
 }
@@ -716,6 +1064,10 @@ else {
             $task = Get-NextTask -Queue $stack -Seen $visited
             if (-not $task) {
                 break
+            }
+
+            if (Invoke-LocalTaskIfAvailable -Queue $stack -Seen $visited -DownloadedMap $downloadedMap -Task $task) {
+                continue
             }
 
             $job = Start-PageWorkerJob -Task $task
@@ -749,10 +1101,16 @@ else {
                 Write-Host "${status}: $($result.RelativeFile)"
             }
             elseif ($result) {
-                Write-Warning "Gagal memproses: $($item.Task.Url) - $($result.Error)"
+                if ($started -gt 0) {
+                    $started--
+                }
+                Add-FailedTaskBack -Queue $stack -Seen $visited -Task $item.Task -ErrorMessage $result.Error
             }
             else {
-                Write-Warning "Gagal memproses: $($item.Task.Url) - job tidak mengembalikan hasil."
+                if ($started -gt 0) {
+                    $started--
+                }
+                Add-FailedTaskBack -Queue $stack -Seen $visited -Task $item.Task -ErrorMessage 'job tidak mengembalikan hasil'
             }
 
             Remove-Job -Job $item.Job -Force
