@@ -145,52 +145,9 @@ function Ensure-Edge {
 }
 
 function Open-DevToolsUrl {
-    param(
-        [string]$OpenUrl,
-        [switch]$Foreground
-    )
+    param([string]$OpenUrl)
 
     Ensure-Edge
-
-    if (-not $Foreground) {
-        $browserSocket = $null
-        try {
-            $version = Invoke-RestMethod -Uri "http://127.0.0.1:$($script:BrowserPort)/json/version" -ErrorAction Stop
-            $browserSocket = [System.Net.WebSockets.ClientWebSocket]::new()
-            [void]$browserSocket.ConnectAsync([Uri]$version.webSocketDebuggerUrl, [Threading.CancellationToken]::None).GetAwaiter().GetResult()
-
-            $target = Invoke-CdpCommand -Socket $browserSocket -Method 'Target.createTarget' -Params @{
-                url = $OpenUrl
-                background = $true
-            }
-
-            $targetId = [string]$target.result.targetId
-            $deadline = (Get-Date).AddSeconds(10)
-            while ((Get-Date) -lt $deadline) {
-                $pages = @(Invoke-RestMethod -Uri "http://127.0.0.1:$($script:BrowserPort)/json/list" -ErrorAction Stop)
-                $page = $pages | Where-Object { $_.id -eq $targetId } | Select-Object -First 1
-                if ($page -and $page.webSocketDebuggerUrl) {
-                    return $page
-                }
-
-                Start-Sleep -Milliseconds 100
-            }
-
-            return [pscustomobject]@{
-                id = $targetId
-                webSocketDebuggerUrl = "ws://127.0.0.1:$($script:BrowserPort)/devtools/page/$targetId"
-            }
-        }
-        catch {
-            Write-Warning "Gagal membuka tab background, fallback ke tab biasa: $($_.Exception.Message)"
-        }
-        finally {
-            if ($browserSocket) {
-                $browserSocket.Dispose()
-            }
-        }
-    }
-
     $escapedUrl = [System.Uri]::EscapeDataString($OpenUrl)
     $devToolsUrl = "http://127.0.0.1:$($script:BrowserPort)/json/new?$escapedUrl"
 
