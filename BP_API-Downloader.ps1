@@ -25,7 +25,7 @@ $ParallelPages = [Math]::Min(16, [Math]::Max(1, $ParallelPages))
 
 $MhtmlRoot = Join-Path $PSScriptRoot 'mhtml'
 $OutputRoot = [System.IO.Path]::GetFullPath($OutputRoot)
-$ListPath = Join-Path $MhtmlRoot 'mhtml-list.tsv'
+$ListPath = Join-Path $MhtmlRoot 'bp_api-list.tsv'
 $script:BrowserPort = if ($WorkerMode) { $WorkerBrowserPort } else { $null }
 $script:BrowserProfileDir = Join-Path $MhtmlRoot '.edge-profile'
 $script:CdpCommandId = 0
