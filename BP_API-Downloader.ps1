@@ -3,7 +3,7 @@ param(
     [string]$OutputRoot = (Join-Path $PSScriptRoot 'mhtml\BlueprintAPI'),
     [int]$BrowserPollSeconds = 1,
     [int]$PageIdleSeconds = .1,
-    [int]$PageLoadTimeoutSeconds = 120,
+    [int]$PageLoadTimeoutSeconds = 10000,
     [int]$MaxLoadAttempts = 10,
     [int]$ParallelPages = 16,
     [int]$MaxPages = 0,
@@ -616,7 +616,7 @@ function Wait-BlueprintPageReady {
             throw "h1 tidak ditemukan setelah halaman selesai load: $PageUrl"
         }
 
-        Write-Host "Menunggu load selesai: attempt=$Attempt ready=$($data.readyState) loading=$($data.loadingCount) stable=$([int]$stableSeconds)s url=$($data.href)"
+        # Write-Host "Menunggu load selesai: attempt=$Attempt ready=$($data.readyState) loading=$($data.loadingCount) stable=$([int]$stableSeconds)s url=$($data.href)"
     }
 
     if ($lastData -and -not [string]::IsNullOrWhiteSpace([string]$lastData.h1)) {
