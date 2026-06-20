@@ -711,15 +711,16 @@ function Wait-BlueprintPageReady {
         }
 
         $stableSeconds = if ($stableSince) { ((Get-Date) - $stableSince).TotalSeconds } else { 0 }
+        $documentComplete = ([string]$data.readyState) -eq 'complete'
         $isReady = -not [System.Convert]::ToBoolean($data.isLoading)
         $hasH1 = [System.Convert]::ToBoolean($data.hasH1) -and -not [string]::IsNullOrWhiteSpace([string]$data.h1)
 
-        if ($isReady -and $stableSeconds -ge $PageIdleSeconds) {
+        if (($isReady -or $documentComplete) -and $stableSeconds -ge $PageIdleSeconds) {
             if ($hasH1) {
                 return $data
             }
 
-            throw "h1 tidak ditemukan setelah halaman selesai load: $PageUrl"
+            throw "h1 tidak ditemukan setelah halaman complete: $PageUrl"
         }
 
         # Write-Host "Menunggu load selesai: attempt=$Attempt ready=$($data.readyState) loading=$($data.loadingCount) stable=$([int]$stableSeconds)s url=$($data.href)"
