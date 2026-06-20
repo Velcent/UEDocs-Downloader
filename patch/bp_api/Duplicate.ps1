@@ -8,7 +8,7 @@ foreach ($File in $Files) {
         ForEach-Object {
 
             # ambil kolom pertama sebelum TAB
-            ($_ -split "`t")[2].Trim()
+            ($_ -split "`t")[0].Trim()
 
         } |
         Where-Object { $_ -ne "" } |

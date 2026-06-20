@@ -488,22 +488,6 @@ function Get-PageFilePath {
     return (Join-Path $Folder "$baseName.mhtml")
 }
 
-function Get-NumberedSiblingPath {
-    param(
-        [string]$Path,
-        [int]$Index
-    )
-
-    if ($Index -le 0) {
-        return $Path
-    }
-
-    $directory = [System.IO.Path]::GetDirectoryName($Path)
-    $name = [System.IO.Path]::GetFileNameWithoutExtension($Path)
-    $extension = [System.IO.Path]::GetExtension($Path)
-    return (Join-Path $directory "${name}_${Index}${extension}")
-}
-
 function Get-NumberedDirectoryPath {
     param(
         [string]$Path,
@@ -517,46 +501,6 @@ function Get-NumberedDirectoryPath {
     $directory = [System.IO.Path]::GetDirectoryName($Path)
     $name = [System.IO.Path]::GetFileName($Path)
     return (Join-Path $directory "${name}_${Index}")
-}
-
-function Write-TextToUniqueFile {
-    param(
-        [string]$Path,
-        [string]$Content,
-        [bool]$OverwriteFile
-    )
-
-    if ($OverwriteFile) {
-        [System.IO.File]::WriteAllText($Path, $Content, [System.Text.UTF8Encoding]::new($false))
-        return $Path
-    }
-
-    for ($index = 0; ; $index++) {
-        $candidate = Get-NumberedSiblingPath -Path $Path -Index $index
-        $stream = $null
-        $writer = $null
-        try {
-            $stream = [System.IO.FileStream]::new($candidate, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
-            $writer = [System.IO.StreamWriter]::new($stream, [System.Text.UTF8Encoding]::new($false))
-            $stream = $null
-            $writer.Write($Content)
-            return $candidate
-        }
-        catch [System.IO.IOException] {
-            if (Test-Path -LiteralPath $candidate) {
-                continue
-            }
-            throw
-        }
-        finally {
-            if ($writer) {
-                $writer.Dispose()
-            }
-            elseif ($stream) {
-                $stream.Dispose()
-            }
-        }
-    }
 }
 
 function ConvertFrom-QuotedPrintableText {
@@ -813,7 +757,7 @@ function Save-BlueprintPageAsMhtmlInSession {
     $filePath = Get-PageFilePath -Folder $Folder -Title $data.h1
 
     $snapshot = Invoke-CdpCommand -Socket $Socket -Method 'Page.captureSnapshot' -Params @{ format = 'mhtml' }
-    $filePath = Write-TextToUniqueFile -Path $filePath -Content ([string]$snapshot.result.data) -OverwriteFile $Overwrite.IsPresent
+    [System.IO.File]::WriteAllText($filePath, [string]$snapshot.result.data, [System.Text.UTF8Encoding]::new($false))
     $saved = $true
     Write-Host "Simpan MHTML: $(ConvertTo-RelativeRootPath $filePath)"
 
