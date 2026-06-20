@@ -57,7 +57,7 @@ if ($WorkerMode) {
 else {
     New-Item -ItemType Directory -Force -Path $MhtmlRoot, $OutputRoot | Out-Null
     if (-not (Test-Path -LiteralPath $ListPath) -or (Get-Item -LiteralPath $ListPath).Length -eq 0) {
-        Set-Content -LiteralPath $ListPath -Value "url`tfinal_url`tfile`ttitle`tchild_count`tparent_url" -Encoding UTF8
+        Set-Content -LiteralPath $ListPath -Value "url`tfile`ttitle`tchild_count`tparent_url" -Encoding UTF8
     }
     else {
         Write-Host "Resume dari list: $ListPath"
@@ -946,23 +946,20 @@ function Get-DownloadedPageMap {
             continue
         }
 
-        foreach ($urlValue in @($row.url, $row.final_url)) {
-            if ([string]::IsNullOrWhiteSpace($urlValue)) {
-                continue
-            }
+        if ([string]::IsNullOrWhiteSpace([string]$row.url)) {
+            continue
+        }
 
-            try {
-                $map[(Get-CanonicalUrlKey $urlValue)] = [pscustomobject]@{
-                    Url = [string]$row.url
-                    FinalUrl = [string]$row.final_url
-                    FilePath = $filePath
-                    Title = [string]$row.title
-                    ChildCount = if ($row.child_count -match '^\d+$') { [int]$row.child_count } else { 0 }
-                    ParentUrl = [string]$row.parent_url
-                }
+        try {
+            $map[(Get-CanonicalUrlKey ([string]$row.url))] = [pscustomobject]@{
+                Url = [string]$row.url
+                FilePath = $filePath
+                Title = [string]$row.title
+                ChildCount = if ($row.child_count -match '^\d+$') { [int]$row.child_count } else { 0 }
+                ParentUrl = [string]$row.parent_url
             }
-            catch {
-            }
+        }
+        catch {
         }
     }
 
@@ -985,7 +982,7 @@ function Get-LocalResultForTask {
     }
 
     $entry = $DownloadedMap[$key]
-    $baseUrl = if ($entry.FinalUrl) { $entry.FinalUrl } else { $Task.Url }
+    $baseUrl = if ($entry.Url) { $entry.Url } else { $Task.Url }
     $result = Get-BlueprintDataFromMhtml -MhtmlPath $entry.FilePath -BaseUrl $baseUrl -FallbackTitle $entry.Title -FallbackParentUrl $entry.ParentUrl
     if (-not $result) {
         return $null
@@ -1048,17 +1045,12 @@ function Write-ListEntry {
     param($Result)
 
     $relativeFile = if ($Result.RelativeFile) { $Result.RelativeFile } else { ConvertTo-RelativeRootPath $Result.FilePath }
-    Add-Content -LiteralPath $ListPath -Value "$($Result.OriginalUrl)`t$($Result.FinalUrl)`t$relativeFile`t$($Result.Title)`t$(@($Result.Actions).Count)`t$($Result.ParentUrl)" -Encoding UTF8
+    Add-Content -LiteralPath $ListPath -Value "$($Result.OriginalUrl)`t$relativeFile`t$($Result.Title)`t$(@($Result.Actions).Count)`t$($Result.ParentUrl)" -Encoding UTF8
 
-    foreach ($urlValue in @($Result.OriginalUrl, $Result.FinalUrl)) {
-        if ([string]::IsNullOrWhiteSpace([string]$urlValue)) {
-            continue
-        }
-
+    if (-not [string]::IsNullOrWhiteSpace([string]$Result.OriginalUrl)) {
         try {
-            $downloadedMap[(Get-CanonicalUrlKey ([string]$urlValue))] = [pscustomobject]@{
+            $downloadedMap[(Get-CanonicalUrlKey ([string]$Result.OriginalUrl))] = [pscustomobject]@{
                 Url = [string]$Result.OriginalUrl
-                FinalUrl = [string]$Result.FinalUrl
                 FilePath = [string]$Result.FilePath
                 Title = [string]$Result.Title
                 ChildCount = @($Result.Actions).Count
