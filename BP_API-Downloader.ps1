@@ -481,11 +481,35 @@ function ConvertTo-RelativeRootPath {
 function Get-PageFilePath {
     param(
         [string]$Folder,
-        [string]$Title
+        [string]$Title,
+        [string]$FileBaseName = ''
     )
 
-    $baseName = ConvertTo-SafeSegment -Value $Title -MaxLength 120
+    $baseName = if ([string]::IsNullOrWhiteSpace($FileBaseName)) {
+        ConvertTo-SafeSegment -Value $Title -MaxLength 120
+    }
+    else {
+        ConvertTo-SafeSegment -Value $FileBaseName -MaxLength 120
+    }
+
     return (Join-Path $Folder "$baseName.mhtml")
+}
+
+function Get-TaskFileBaseName {
+    param($Task)
+
+    if (-not $Task -or [string]::IsNullOrWhiteSpace([string]$Task.SaveFolder) -or [string]::IsNullOrWhiteSpace([string]$Task.ChildFolder)) {
+        return ''
+    }
+
+    $saveFolder = [System.IO.Path]::GetFullPath([string]$Task.SaveFolder)
+    $childFolder = [System.IO.Path]::GetFullPath([string]$Task.ChildFolder)
+    $childParent = [System.IO.Path]::GetDirectoryName($childFolder)
+    if ($childParent -and $childParent.Equals($saveFolder, [System.StringComparison]::OrdinalIgnoreCase)) {
+        return [System.IO.Path]::GetFileName($childFolder)
+    }
+
+    return ''
 }
 
 function Get-NumberedDirectoryPath {
@@ -723,7 +747,8 @@ function Save-BlueprintPageAsMhtmlInSession {
     param(
         [System.Net.WebSockets.ClientWebSocket]$Socket,
         [string]$PageUrl,
-        [string]$Folder
+        [string]$Folder,
+        [string]$FileBaseName = ''
     )
 
     Write-Host ""
@@ -754,7 +779,7 @@ function Save-BlueprintPageAsMhtmlInSession {
     }
 
     New-Item -ItemType Directory -Force -Path $Folder | Out-Null
-    $filePath = Get-PageFilePath -Folder $Folder -Title $data.h1
+    $filePath = Get-PageFilePath -Folder $Folder -Title $data.h1 -FileBaseName $FileBaseName
 
     $snapshot = Invoke-CdpCommand -Socket $Socket -Method 'Page.captureSnapshot' -Params @{ format = 'mhtml' }
     [System.IO.File]::WriteAllText($filePath, [string]$snapshot.result.data, [System.Text.UTF8Encoding]::new($false))
@@ -775,13 +800,14 @@ function Save-BlueprintPageAsMhtmlInSession {
 function Save-BlueprintPageAsMhtml {
     param(
         [string]$PageUrl,
-        [string]$Folder
+        [string]$Folder,
+        [string]$FileBaseName = ''
     )
 
     $session = $null
     try {
         $session = New-BlueprintPageSession
-        return Save-BlueprintPageAsMhtmlInSession -Socket $session.Socket -PageUrl $PageUrl -Folder $Folder
+        return Save-BlueprintPageAsMhtmlInSession -Socket $session.Socket -PageUrl $PageUrl -Folder $Folder -FileBaseName $FileBaseName
     }
     finally {
         Close-BlueprintPageSession -Session $session
@@ -902,7 +928,7 @@ function Invoke-PersistentPageWorker {
                     $session = New-BlueprintPageSession
                 }
 
-                $workerResult = Save-BlueprintPageAsMhtmlInSession -Socket $session.Socket -PageUrl $pageUrl -Folder ([System.IO.Path]::GetFullPath([string]$task.SaveFolder))
+                $workerResult = Save-BlueprintPageAsMhtmlInSession -Socket $session.Socket -PageUrl $pageUrl -Folder ([System.IO.Path]::GetFullPath([string]$task.SaveFolder)) -FileBaseName ([string]$task.FileBaseName)
                 $result = New-WorkerSuccessResult -Id $Id -TaskId $taskId -Result $workerResult
             }
             catch {
@@ -1073,6 +1099,10 @@ function Get-LinkTaskMap {
                 Url = [string]$row.url
                 SaveFolder = [System.IO.Path]::GetFullPath($saveFolder)
                 ChildFolder = [System.IO.Path]::GetFullPath($childFolder)
+                FileBaseName = (Get-TaskFileBaseName ([pscustomobject]@{
+                    SaveFolder = [System.IO.Path]::GetFullPath($saveFolder)
+                    ChildFolder = [System.IO.Path]::GetFullPath($childFolder)
+                }))
                 Name = [string]$row.name
                 ParentUrl = [string]$row.parent_url
             }
@@ -1147,6 +1177,7 @@ function Add-LinkTask {
     $childFolder = Get-UniqueLinkChildFolder -LinkMap $LinkMap -Path $childFolder
     $Task.SaveFolder = $saveFolder
     $Task.ChildFolder = $childFolder
+    $Task | Add-Member -NotePropertyName FileBaseName -NotePropertyValue (Get-TaskFileBaseName $Task) -Force
     $relativeSaveFolder = ConvertTo-RelativeRootPath $saveFolder
     $relativeChildFolder = ConvertTo-RelativeRootPath $childFolder
 
@@ -1155,6 +1186,7 @@ function Add-LinkTask {
         Url = [string]$Task.Url
         SaveFolder = $saveFolder
         ChildFolder = $childFolder
+        FileBaseName = [string]$Task.FileBaseName
         Name = $Name
         ParentUrl = $ParentUrl
     }
@@ -1181,6 +1213,7 @@ function Add-PendingLinkTasks {
             Url = [string]$task.Url
             SaveFolder = [string]$task.SaveFolder
             ChildFolder = [string]$task.ChildFolder
+            FileBaseName = [string]$task.FileBaseName
         })
     }
 }
@@ -1235,7 +1268,14 @@ function Add-ChildTasks {
             ChildFolder = (Join-Path $Task.ChildFolder $childFolderName)
         }
 
-        [void](Add-LinkTask -LinkMap $LinkMap -Task $childTask -Name ([string]$action.name) -ParentUrl ([string]$Result.OriginalUrl))
+        $addedLink = Add-LinkTask -LinkMap $LinkMap -Task $childTask -Name ([string]$action.name) -ParentUrl ([string]$Result.OriginalUrl)
+        if (-not $addedLink -and $LinkMap.Contains($key)) {
+            $existingTask = $LinkMap[$key]
+            $childTask.SaveFolder = [string]$existingTask.SaveFolder
+            $childTask.ChildFolder = [string]$existingTask.ChildFolder
+            $childTask | Add-Member -NotePropertyName FileBaseName -NotePropertyValue ([string]$existingTask.FileBaseName) -Force
+        }
+
         if ($DownloadedMap.ContainsKey($key)) {
             continue
         }
@@ -1363,6 +1403,7 @@ function Add-FailedTaskBack {
         Url = [string]$Task.Url
         SaveFolder = [string]$Task.SaveFolder
         ChildFolder = [string]$Task.ChildFolder
+        FileBaseName = [string]$Task.FileBaseName
         RetryCount = $retryCount
     })
 }
@@ -1439,6 +1480,7 @@ function Send-TaskToWorker {
         Url = [string]$Task.Url
         SaveFolder = [string]$Task.SaveFolder
         ChildFolder = [string]$Task.ChildFolder
+        FileBaseName = [string]$Task.FileBaseName
         RetryCount = if ($Task.PSObject.Properties['RetryCount']) { [int]$Task.RetryCount } else { 0 }
     }
 
@@ -1541,7 +1583,7 @@ if ($ParallelPages -le 1) {
 
         $started++
         try {
-            $result = Save-BlueprintPageAsMhtml -PageUrl $task.Url -Folder $task.SaveFolder
+            $result = Save-BlueprintPageAsMhtml -PageUrl $task.Url -Folder $task.SaveFolder -FileBaseName ([string]$task.FileBaseName)
             $downloaded++
             Write-ListEntry -Result $result
             Add-ChildTasks -Queue $stack -Seen $visited -DownloadedMap $downloadedMap -LinkMap $linkMap -Task $task -Result $result
