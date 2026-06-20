@@ -413,11 +413,23 @@ function ConvertTo-SafeSegment {
     }
 
     $text = ($text -replace '\s+', ' ').Trim()
+    $invalidChars = [System.Collections.Generic.HashSet[int]]::new()
     foreach ($char in [System.IO.Path]::GetInvalidFileNameChars()) {
-        $text = $text.Replace($char, '_')
+        [void]$invalidChars.Add([int][char]$char)
     }
 
-    $text = ($text -replace '[\x00-\x1f]', '_').Trim(' ', '.')
+    $builder = [System.Text.StringBuilder]::new()
+    foreach ($char in $text.ToCharArray()) {
+        $code = [int][char]$char
+        if ($invalidChars.Contains($code) -or $code -lt 32) {
+            [void]$builder.Append("&#$code;")
+        }
+        else {
+            [void]$builder.Append($char)
+        }
+    }
+
+    $text = $builder.ToString().Trim(' ', '.')
     if ([string]::IsNullOrWhiteSpace($text)) {
         $text = '_'
     }
