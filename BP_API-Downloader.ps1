@@ -28,6 +28,7 @@ $ParallelPages = [Math]::Min(30, [Math]::Max(1, $ParallelPages))
 $MhtmlRoot = Join-Path $PSScriptRoot 'mhtml'
 $OutputRoot = [System.IO.Path]::GetFullPath($OutputRoot)
 $ListPath = Join-Path $MhtmlRoot 'bp_api-list.tsv'
+$LinkPath = Join-Path $MhtmlRoot 'bp_api-link.tsv'
 $script:BrowserPort = if ($WorkerMode) { $WorkerBrowserPort } else { $null }
 $script:BrowserProfileDir = Join-Path $MhtmlRoot '.edge-profile'
 $script:CdpCommandId = 0
@@ -61,6 +62,13 @@ else {
     }
     else {
         Write-Host "Resume dari list: $ListPath"
+    }
+
+    if (-not (Test-Path -LiteralPath $LinkPath) -or (Get-Item -LiteralPath $LinkPath).Length -eq 0) {
+        Set-Content -LiteralPath $LinkPath -Value "url`tsave_folder`tchild_folder`tname`tparent_url" -Encoding UTF8
+    }
+    else {
+        Write-Host "Resume dari link: $LinkPath"
     }
 }
 
@@ -966,56 +974,154 @@ function Get-DownloadedPageMap {
     return $map
 }
 
-function Get-LocalResultForTask {
+function ConvertTo-TsvValue {
+    param([string]$Value)
+
+    return ([string]$Value -replace "`t", ' ' -replace "\r?\n", ' ').Trim()
+}
+
+function Get-LinkTaskMap {
+    param([string]$Path)
+
+    $map = [ordered]@{}
+    if (-not (Test-Path -LiteralPath $Path)) {
+        return $map
+    }
+
+    try {
+        $rows = @(Import-Csv -LiteralPath $Path -Delimiter "`t")
+    }
+    catch {
+        Write-Warning "Tidak bisa membaca link resume: $Path - $($_.Exception.Message)"
+        return $map
+    }
+
+    foreach ($row in $rows) {
+        if ([string]::IsNullOrWhiteSpace([string]$row.url)) {
+            continue
+        }
+
+        try {
+            $key = Get-CanonicalUrlKey ([string]$row.url)
+            if ($map.Contains($key)) {
+                continue
+            }
+
+            $saveFolder = ConvertTo-LocalPathFromListValue ([string]$row.save_folder)
+            $childFolder = ConvertTo-LocalPathFromListValue ([string]$row.child_folder)
+            if ([string]::IsNullOrWhiteSpace($saveFolder)) {
+                $saveFolder = $OutputRoot
+            }
+            if ([string]::IsNullOrWhiteSpace($childFolder)) {
+                $childFolder = $saveFolder
+            }
+
+            $map[$key] = [pscustomobject]@{
+                Url = [string]$row.url
+                SaveFolder = [System.IO.Path]::GetFullPath($saveFolder)
+                ChildFolder = [System.IO.Path]::GetFullPath($childFolder)
+                Name = [string]$row.name
+                ParentUrl = [string]$row.parent_url
+            }
+        }
+        catch {
+        }
+    }
+
+    return $map
+}
+
+function Add-LinkTask {
     param(
+        [System.Collections.Specialized.OrderedDictionary]$LinkMap,
         $Task,
+        [string]$Name = '',
+        [string]$ParentUrl = ''
+    )
+
+    if (-not $Task -or [string]::IsNullOrWhiteSpace([string]$Task.Url)) {
+        return $false
+    }
+
+    try {
+        $key = Get-CanonicalUrlKey ([string]$Task.Url)
+    }
+    catch {
+        return $false
+    }
+
+    if ($LinkMap.Contains($key)) {
+        return $false
+    }
+
+    $saveFolder = [System.IO.Path]::GetFullPath([string]$Task.SaveFolder)
+    $childFolder = [System.IO.Path]::GetFullPath([string]$Task.ChildFolder)
+    $relativeSaveFolder = ConvertTo-RelativeRootPath $saveFolder
+    $relativeChildFolder = ConvertTo-RelativeRootPath $childFolder
+
+    Add-Content -LiteralPath $LinkPath -Value "$(ConvertTo-TsvValue $Task.Url)`t$(ConvertTo-TsvValue $relativeSaveFolder)`t$(ConvertTo-TsvValue $relativeChildFolder)`t$(ConvertTo-TsvValue $Name)`t$(ConvertTo-TsvValue $ParentUrl)" -Encoding UTF8
+    $LinkMap[$key] = [pscustomobject]@{
+        Url = [string]$Task.Url
+        SaveFolder = $saveFolder
+        ChildFolder = $childFolder
+        Name = $Name
+        ParentUrl = $ParentUrl
+    }
+
+    return $true
+}
+
+function Add-PendingLinkTasks {
+    param(
+        [System.Collections.ArrayList]$Queue,
+        [System.Collections.Specialized.OrderedDictionary]$LinkMap,
         [hashtable]$DownloadedMap
     )
 
-    if ($Overwrite -or -not $DownloadedMap) {
-        return $null
-    }
+    $tasks = @($LinkMap.Values)
+    for ($index = $tasks.Count - 1; $index -ge 0; $index--) {
+        $task = $tasks[$index]
+        $key = Get-CanonicalUrlKey ([string]$task.Url)
+        if ($DownloadedMap.ContainsKey($key)) {
+            continue
+        }
 
-    $key = Get-CanonicalUrlKey $Task.Url
-    if (-not $DownloadedMap.ContainsKey($key)) {
-        return $null
+        [void]$Queue.Add([pscustomobject]@{
+            Url = [string]$task.Url
+            SaveFolder = [string]$task.SaveFolder
+            ChildFolder = [string]$task.ChildFolder
+        })
     }
-
-    $entry = $DownloadedMap[$key]
-    $baseUrl = if ($entry.Url) { $entry.Url } else { $Task.Url }
-    $result = Get-BlueprintDataFromMhtml -MhtmlPath $entry.FilePath -BaseUrl $baseUrl -FallbackTitle $entry.Title -FallbackParentUrl $entry.ParentUrl
-    if (-not $result) {
-        return $null
-    }
-
-    if ($entry.ChildCount -gt 0 -and @($result.Actions).Count -eq 0) {
-        Write-Warning "File lokal ada tapi child link tidak terbaca, fallback ke browser: $($entry.FilePath)"
-        return $null
-    }
-
-    return $result
 }
 
 $stack = New-Object System.Collections.ArrayList
 $visited = @{}
 $downloadedMap = Get-DownloadedPageMap -Path $ListPath
+$linkMap = Get-LinkTaskMap -Path $LinkPath
 $downloaded = 0
 $started = 0
 
 if ($downloadedMap.Count -gt 0) {
-    Write-Host "Index lokal terbaca: $($downloadedMap.Count) URL dari $ListPath"
+    Write-Host "Index download terbaca: $($downloadedMap.Count) URL dari $ListPath"
+}
+if ($linkMap.Count -gt 0) {
+    Write-Host "Index link terbaca: $($linkMap.Count) URL dari $LinkPath"
 }
 
-[void]$stack.Add([pscustomobject]@{
+$rootTask = [pscustomobject]@{
     Url = ([Uri]$Url).AbsoluteUri
     SaveFolder = $OutputRoot
     ChildFolder = $OutputRoot
-})
+}
+[void](Add-LinkTask -LinkMap $linkMap -Task $rootTask -Name 'root' -ParentUrl '')
+Add-PendingLinkTasks -Queue $stack -LinkMap $linkMap -DownloadedMap $downloadedMap
 
 function Add-ChildTasks {
     param(
         [System.Collections.ArrayList]$Queue,
         [hashtable]$Seen,
+        [hashtable]$DownloadedMap,
+        [System.Collections.Specialized.OrderedDictionary]$LinkMap,
         $Task,
         $Result
     )
@@ -1033,11 +1139,18 @@ function Add-ChildTasks {
         }
 
         $childFolderName = ConvertTo-SafeSegment -Value $action.name -MaxLength 90
-        [void]$Queue.Add([pscustomobject]@{
+        $childTask = [pscustomobject]@{
             Url = [string]$action.url
             SaveFolder = $Task.ChildFolder
             ChildFolder = (Join-Path $Task.ChildFolder $childFolderName)
-        })
+        }
+
+        [void](Add-LinkTask -LinkMap $LinkMap -Task $childTask -Name ([string]$action.name) -ParentUrl ([string]$Result.OriginalUrl))
+        if ($DownloadedMap.ContainsKey($key)) {
+            continue
+        }
+
+        [void]$Queue.Add($childTask)
     }
 }
 
@@ -1087,24 +1200,6 @@ function Test-CanStartMore {
     param([int]$StartedCount)
 
     return ($MaxPages -le 0 -or $StartedCount -lt $MaxPages)
-}
-
-function Invoke-LocalTaskIfAvailable {
-    param(
-        [System.Collections.ArrayList]$Queue,
-        [hashtable]$Seen,
-        [hashtable]$DownloadedMap,
-        $Task
-    )
-
-    $localResult = Get-LocalResultForTask -Task $Task -DownloadedMap $DownloadedMap
-    if (-not $localResult) {
-        return $false
-    }
-
-    Write-Host "Baca lokal: $(ConvertTo-RelativeRootPath $localResult.FilePath)"
-    Add-ChildTasks -Queue $Queue -Seen $Seen -Task $Task -Result $localResult
-    return $true
 }
 
 function Add-FailedTaskBack {
@@ -1260,7 +1355,8 @@ function Get-NextBrowserTask {
             return $null
         }
 
-        if (Invoke-LocalTaskIfAvailable -Queue $Queue -Seen $Seen -DownloadedMap $DownloadedMap -Task $task) {
+        $key = Get-CanonicalUrlKey ([string]$task.Url)
+        if ($DownloadedMap.ContainsKey($key)) {
             continue
         }
 
@@ -1300,13 +1396,9 @@ if ($ParallelPages -le 1) {
             break
         }
 
-        $task = Get-NextTask -Queue $stack -Seen $visited
+        $task = Get-NextBrowserTask -Queue $stack -Seen $visited -DownloadedMap $downloadedMap
         if (-not $task) {
             break
-        }
-
-        if (Invoke-LocalTaskIfAvailable -Queue $stack -Seen $visited -DownloadedMap $downloadedMap -Task $task) {
-            continue
         }
 
         $started++
@@ -1314,7 +1406,7 @@ if ($ParallelPages -le 1) {
             $result = Save-BlueprintPageAsMhtml -PageUrl $task.Url -Folder $task.SaveFolder
             $downloaded++
             Write-ListEntry -Result $result
-            Add-ChildTasks -Queue $stack -Seen $visited -Task $task -Result $result
+            Add-ChildTasks -Queue $stack -Seen $visited -DownloadedMap $downloadedMap -LinkMap $linkMap -Task $task -Result $result
         }
         catch {
             if ($started -gt 0) {
@@ -1359,7 +1451,7 @@ else {
                     if ($result.Success) {
                         $downloaded++
                         Write-ListEntry -Result $result
-                        Add-ChildTasks -Queue $stack -Seen $visited -Task $worker.Task -Result $result
+                        Add-ChildTasks -Queue $stack -Seen $visited -DownloadedMap $downloadedMap -LinkMap $linkMap -Task $worker.Task -Result $result
 
                         $status = if ($result.Saved) { 'Simpan' } else { 'Lewati existing' }
                         Write-Host "${status}: $($result.RelativeFile)"
