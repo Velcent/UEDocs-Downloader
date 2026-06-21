@@ -29,6 +29,7 @@ $MhtmlRoot = Join-Path $PSScriptRoot 'mhtml'
 $OutputRoot = [System.IO.Path]::GetFullPath($OutputRoot)
 $ListPath = Join-Path $MhtmlRoot 'bp_api-list.tsv'
 $LinkPath = Join-Path $MhtmlRoot 'bp_api-link.tsv'
+$LinkBackupPath = Join-Path $MhtmlRoot 'bp_api-link.bak'
 $script:BrowserPort = if ($WorkerMode) { $WorkerBrowserPort } else { $null }
 $script:BrowserProfileDir = Join-Path $MhtmlRoot '.edge-profile'
 $script:CdpCommandId = 0
@@ -1203,6 +1204,21 @@ function Get-UniqueLinkChildFolder {
     }
 }
 
+function Update-LinkBackup {
+    if (-not (Test-Path -LiteralPath $LinkPath)) {
+        return
+    }
+
+    try {
+        $tempPath = "$LinkBackupPath.tmp"
+        Copy-Item -LiteralPath $LinkPath -Destination $tempPath -Force -ErrorAction Stop
+        Move-Item -LiteralPath $tempPath -Destination $LinkBackupPath -Force -ErrorAction Stop
+    }
+    catch {
+        Write-Warning "Gagal membuat backup link: $LinkBackupPath - $($_.Exception.Message)"
+    }
+}
+
 function Add-LinkTask {
     param(
         [System.Collections.Specialized.OrderedDictionary]$LinkMap,
@@ -1236,6 +1252,7 @@ function Add-LinkTask {
     $relativeChildFolder = ConvertTo-RelativeRootPath $childFolder
 
     Add-Content -LiteralPath $LinkPath -Value "$(ConvertTo-TsvValue $Task.Url)`t$(ConvertTo-TsvValue $relativeSaveFolder)`t$(ConvertTo-TsvValue $relativeChildFolder)`t$(ConvertTo-TsvValue $Name)`t$(ConvertTo-TsvValue $ParentUrl)" -Encoding UTF8
+    Update-LinkBackup
     $LinkMap[$key] = [pscustomobject]@{
         Url = [string]$Task.Url
         SaveFolder = $saveFolder
