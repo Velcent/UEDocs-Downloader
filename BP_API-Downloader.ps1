@@ -5,7 +5,7 @@ param(
     [int]$PageIdleSeconds = .1,
     [int]$PageLoadTimeoutSeconds = 3000,
     [int]$MaxLoadAttempts = 100000,
-    [int]$ParallelPages = 6,
+    [int]$ParallelPages = 5,
     [int]$MaxPages = 0,
     [switch]$Overwrite,
     [switch]$WorkerMode,
