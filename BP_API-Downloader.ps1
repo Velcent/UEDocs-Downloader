@@ -255,6 +255,11 @@ function Update-NetworkStateFromEvent {
         return
     }
 
+    if ($Message.method -eq 'Network.requestWillBeSent' -and $Message.params.type -eq 'Document') {
+        $script:MainDocumentRequestId = [string]$Message.params.requestId
+        return
+    }
+
     if ($Message.method -eq 'Network.responseReceived' -and $Message.params.type -eq 'Document') {
         $script:MainDocumentRequestId = [string]$Message.params.requestId
         $script:MainDocumentStatus = [int]$Message.params.response.status
@@ -262,8 +267,30 @@ function Update-NetworkStateFromEvent {
         return
     }
 
-    if ($Message.method -eq 'Network.loadingFailed' -and $script:MainDocumentRequestId -and ([string]$Message.params.requestId) -eq $script:MainDocumentRequestId) {
-        $script:MainDocumentFailedText = [string]$Message.params.errorText
+    if ($Message.method -eq 'Network.loadingFailed') {
+        $requestId = [string]$Message.params.requestId
+        $errorText = [string]$Message.params.errorText
+        $isDocumentFailure = ([string]$Message.params.type) -eq 'Document'
+        $isKnownMainDocument = $script:MainDocumentRequestId -and $requestId -eq $script:MainDocumentRequestId
+
+        if ($isDocumentFailure -or $isKnownMainDocument) {
+            if ($requestId) {
+                $script:MainDocumentRequestId = $requestId
+            }
+            $script:MainDocumentFailedText = $errorText
+        }
+    }
+}
+
+function Update-NetworkStateFromNavigateResult {
+    param($Response)
+
+    if (-not $Response -or -not $Response.result) {
+        return
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace([string]$Response.result.errorText)) {
+        $script:MainDocumentFailedText = [string]$Response.result.errorText
     }
 }
 
@@ -287,7 +314,7 @@ function Assert-PageLoadOk {
         throw "Halaman terlihat error challenge: h1='$h1', size=$htmlLength bytes"
     }
 
-    if ("$title $h1" -match '(?i)\b(404|502|503|504|not found|bad gateway|service unavailable|gateway timeout)\b') {
+    if ("$title $h1" -match '(?i)\b(404|502|503|504|not found|bad gateway|service unavailable|gateway timeout|ERR_[A-Z_]+|DNS|internet|connection|refused|unreachable|timed out|can''t be reached)\b') {
         throw "Halaman terlihat error: title='$title', h1='$h1'"
     }
 }
@@ -759,14 +786,20 @@ function Save-BlueprintPageAsMhtmlInSession {
     for ($attempt = 1; $attempt -le $MaxLoadAttempts; $attempt++) {
         Reset-NetworkState
         if ($attempt -eq 1) {
-            [void](Invoke-CdpCommand -Socket $Socket -Method 'Page.navigate' -Params @{ url = $PageUrl })
+            $navigateResponse = Invoke-CdpCommand -Socket $Socket -Method 'Page.navigate' -Params @{ url = $PageUrl }
+            Update-NetworkStateFromNavigateResult -Response $navigateResponse
         }
         else {
             Write-Warning "Navigasi ulang ke URL error karena metadata belum lengkap: $PageUrl"
-            [void](Invoke-CdpCommand -Socket $Socket -Method 'Page.navigate' -Params @{ url = $PageUrl })
+            $navigateResponse = Invoke-CdpCommand -Socket $Socket -Method 'Page.navigate' -Params @{ url = $PageUrl }
+            Update-NetworkStateFromNavigateResult -Response $navigateResponse
         }
 
         try {
+            if (-not [string]::IsNullOrWhiteSpace($script:MainDocumentFailedText)) {
+                throw "Network error: $($script:MainDocumentFailedText)"
+            }
+
             $data = Wait-BlueprintPageReady -Socket $Socket -PageUrl $PageUrl -Attempt $attempt
             Assert-PageLoadOk -Data $data
             break
