@@ -1437,36 +1437,107 @@ function Add-ChildTasks {
     )
 
     $actions = @($Result.Actions)
+    $newLinkRows = New-Object System.Collections.ArrayList
+    $newLinkEntries = New-Object System.Collections.ArrayList
+    $pendingLinksByKey = @{}
+    $pendingChildFolders = @{}
+    $tasksToQueue = New-Object System.Collections.ArrayList
+
     for ($index = $actions.Count - 1; $index -ge 0; $index--) {
         $action = $actions[$index]
         if ([string]::IsNullOrWhiteSpace([string]$action.url)) {
             continue
         }
 
-        $key = Get-CanonicalUrlKey ([string]$action.url)
+        try {
+            $key = Get-CanonicalUrlKey ([string]$action.url)
+        }
+        catch {
+            continue
+        }
+
         if ($Seen.ContainsKey($key)) {
             continue
         }
 
-        $childFolderName = ConvertTo-SafeSegment -Value $action.name -MaxLength 90
-        $childTask = [pscustomobject]@{
-            Url = [string]$action.url
-            SaveFolder = $Task.ChildFolder
-            ChildFolder = (Join-Path $Task.ChildFolder $childFolderName)
-        }
-
-        $addedLink = Add-LinkTask -LinkMap $LinkMap -Task $childTask -Name ([string]$action.name) -ParentUrl ([string]$Result.OriginalUrl)
-        if (-not $addedLink -and $LinkMap.Contains($key)) {
+        $childTask = $null
+        if ($LinkMap.Contains($key)) {
             $existingTask = $LinkMap[$key]
-            $childTask.SaveFolder = [string]$existingTask.SaveFolder
-            $childTask.ChildFolder = [string]$existingTask.ChildFolder
-            $childTask | Add-Member -NotePropertyName FileBaseName -NotePropertyValue ([string]$existingTask.FileBaseName) -Force
+            $childTask = [pscustomobject]@{
+                Url = [string]$existingTask.Url
+                SaveFolder = [string]$existingTask.SaveFolder
+                ChildFolder = [string]$existingTask.ChildFolder
+                FileBaseName = [string]$existingTask.FileBaseName
+            }
+        }
+        elseif ($pendingLinksByKey.ContainsKey($key)) {
+            $pendingEntry = $pendingLinksByKey[$key]
+            $childTask = [pscustomobject]@{
+                Url = [string]$pendingEntry.Task.Url
+                SaveFolder = [string]$pendingEntry.Task.SaveFolder
+                ChildFolder = [string]$pendingEntry.Task.ChildFolder
+                FileBaseName = [string]$pendingEntry.Task.FileBaseName
+            }
+        }
+        else {
+            $childFolderName = ConvertTo-SafeSegment -Value $action.name -MaxLength 90
+            $baseChildFolder = Join-Path $Task.ChildFolder $childFolderName
+            for ($folderIndex = 0; ; $folderIndex++) {
+                $childFolder = Get-NumberedDirectoryPath -Path $baseChildFolder -Index $folderIndex
+                $childFolderKey = ([System.IO.Path]::GetFullPath($childFolder)).ToLowerInvariant()
+                if (-not (Test-LinkChildFolderExists -LinkMap $LinkMap -Path $childFolder) -and -not $pendingChildFolders.ContainsKey($childFolderKey)) {
+                    $pendingChildFolders[$childFolderKey] = $true
+                    break
+                }
+            }
+
+            $saveFolder = [System.IO.Path]::GetFullPath([string]$Task.ChildFolder)
+            $childFolder = [System.IO.Path]::GetFullPath($childFolder)
+            $childTask = [pscustomobject]@{
+                Url = [string]$action.url
+                SaveFolder = $saveFolder
+                ChildFolder = $childFolder
+            }
+            $childTask | Add-Member -NotePropertyName FileBaseName -NotePropertyValue (Get-TaskFileBaseName $childTask) -Force
+
+            $relativeSaveFolder = ConvertTo-RelativeRootPath $saveFolder
+            $relativeChildFolder = ConvertTo-RelativeRootPath $childFolder
+            $row = "$(ConvertTo-TsvValue $childTask.Url)`t$(ConvertTo-TsvValue $relativeSaveFolder)`t$(ConvertTo-TsvValue $relativeChildFolder)`t$(ConvertTo-TsvValue ([string]$action.name))`t$(ConvertTo-TsvValue ([string]$Result.OriginalUrl))"
+            $entry = [pscustomobject]@{
+                Key = $key
+                Row = $row
+                Task = $childTask
+                MapValue = [pscustomobject]@{
+                    Url = [string]$childTask.Url
+                    SaveFolder = $saveFolder
+                    ChildFolder = $childFolder
+                    FileBaseName = [string]$childTask.FileBaseName
+                    Name = [string]$action.name
+                    ParentUrl = [string]$Result.OriginalUrl
+                }
+            }
+
+            $pendingLinksByKey[$key] = $entry
+            [void]$newLinkRows.Add($row)
+            [void]$newLinkEntries.Add($entry)
         }
 
         if ($DownloadedMap.ContainsKey($key)) {
             continue
         }
 
+        [void]$tasksToQueue.Add($childTask)
+    }
+
+    if ($newLinkRows.Count -gt 0) {
+        Add-Content -LiteralPath $LinkPath -Value ([string[]]$newLinkRows.ToArray()) -Encoding UTF8
+        foreach ($entry in @($newLinkEntries)) {
+            $LinkMap[$entry.Key] = $entry.MapValue
+        }
+        Update-LinkBackup
+    }
+
+    foreach ($childTask in @($tasksToQueue)) {
         [void]$Queue.Add($childTask)
     }
 }
