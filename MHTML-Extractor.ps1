@@ -3,7 +3,9 @@ param(
     [string]$InputPath = '',
     [string]$AssetsRoot = '',
     [string]$StrippedMhtmlRoot = '',
-    [string]$TsvPath = ''
+    [string]$TsvPath = '',
+    [int]$ImageDownloadAttempts = 3,
+    [int]$BrowserReadyTimeoutSeconds = 60
 )
 
 Set-StrictMode -Version Latest
@@ -11,6 +13,11 @@ $ErrorActionPreference = 'Stop'
 
 $Latin1 = [System.Text.Encoding]::GetEncoding(28591)
 $Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+$ProgressPreference = 'SilentlyContinue'
+$ImageDownloadAttempts = [Math]::Max(1, $ImageDownloadAttempts)
+$BrowserReadyTimeoutSeconds = [Math]::Max(5, $BrowserReadyTimeoutSeconds)
+$script:BrowserPort = $null
+$script:CdpCommandId = 0
 
 if (-not $InputPath) {
     $InputPath = Join-Path $PSScriptRoot 'mhtml'
@@ -30,6 +37,7 @@ if (-not $TsvPath) {
 
 $BinRoot = Join-Path $AssetsRoot 'bin'
 $ScriptRootFull = [System.IO.Path]::GetFullPath($PSScriptRoot)
+$script:BrowserProfileDir = Join-Path $AssetsRoot '.edge-profile'
 
 function ConvertTo-TsvValue {
     param([AllowNull()][string]$Value)
@@ -39,6 +47,19 @@ function ConvertTo-TsvValue {
     }
 
     return (($Value -replace "`t", ' ') -replace "(`r`n|`r|`n)", ' ').Trim()
+}
+
+function Test-ObjectProperty {
+    param(
+        [AllowNull()]$Object,
+        [string]$Name
+    )
+
+    if ($null -eq $Object) {
+        return $false
+    }
+
+    return @($Object.PSObject.Properties.Match($Name)).Count -gt 0
 }
 
 function Get-RelativeAssetPath {
@@ -86,7 +107,7 @@ function Get-Sha256Hex {
 
     $sha = [System.Security.Cryptography.SHA256]::Create()
     try {
-        return ([BitConverter]::ToString($sha.ComputeHash($Bytes))).Replace('-', '').ToLowerInvariant()
+        return ([BitConverter]::ToString($sha.ComputeHash($Bytes, 0, $Bytes.Length))).Replace('-', '').ToLowerInvariant()
     }
     finally {
         $sha.Dispose()
@@ -223,7 +244,8 @@ function Clear-MhtmlExternalPartBodies {
         [string]$Text,
         [string]$Boundary,
         [string]$SnapshotLocation,
-        [System.Collections.Generic.Dictionary[string,object]]$UrlRows
+        [System.Collections.Generic.Dictionary[string,object]]$UrlRows,
+        [object[]]$AdditionalParts = @()
     )
 
     $pattern = '(?m)^--' + [regex]::Escape($Boundary) + '(?<closing>--)?[ \t]*\r?$'
@@ -281,12 +303,29 @@ function Clear-MhtmlExternalPartBodies {
         }
     }
 
+    $added = 0
+    foreach ($part in @($AdditionalParts)) {
+        if (-not $part -or -not $part.link) {
+            continue
+        }
+
+        $contentType = if ($part.content_type) { [string]$part.content_type } else { 'application/octet-stream' }
+        $encoding = if ($part.encoding) { [string]$part.encoding } else { 'base64' }
+        $builder.Append("--$Boundary`r`n") | Out-Null
+        $builder.Append("Content-Type: $contentType`r`n") | Out-Null
+        $builder.Append("Content-Transfer-Encoding: $encoding`r`n") | Out-Null
+        $builder.Append("Content-Location: $($part.link)`r`n") | Out-Null
+        $builder.Append("`r`n") | Out-Null
+        $added++
+    }
+
     $last = $boundaryMatches[($boundaryMatches.Count - 1)]
     $builder.Append($Text.Substring($last.Index)) | Out-Null
 
     return [pscustomobject]@{
         Text = $builder.ToString()
         Cleared = $cleared
+        Added = $added
     }
 }
 
@@ -348,6 +387,571 @@ function Decode-MimeBody {
     }
 }
 
+function Get-ContentTypeFromBytesOrUrl {
+    param(
+        [byte[]]$Bytes,
+        [string]$Url,
+        [string]$ResponseContentType = ''
+    )
+
+    if (-not [string]::IsNullOrWhiteSpace($ResponseContentType)) {
+        return (($ResponseContentType -split ';', 2)[0]).Trim()
+    }
+
+    if ($Bytes -and $Bytes.Length -ge 12) {
+        if ($Bytes[0] -eq 0x89 -and $Bytes[1] -eq 0x50 -and $Bytes[2] -eq 0x4e -and $Bytes[3] -eq 0x47) { return 'image/png' }
+        if ($Bytes[0] -eq 0xff -and $Bytes[1] -eq 0xd8 -and $Bytes[2] -eq 0xff) { return 'image/jpeg' }
+        if ($Bytes[0] -eq 0x47 -and $Bytes[1] -eq 0x49 -and $Bytes[2] -eq 0x46) { return 'image/gif' }
+        if ($Bytes[0] -eq 0x52 -and $Bytes[1] -eq 0x49 -and $Bytes[2] -eq 0x46 -and $Bytes[3] -eq 0x46 -and $Bytes[8] -eq 0x57 -and $Bytes[9] -eq 0x45 -and $Bytes[10] -eq 0x42 -and $Bytes[11] -eq 0x50) { return 'image/webp' }
+        if ($Bytes[0] -eq 0x3c -and $Bytes[1] -eq 0x73 -and $Bytes[2] -eq 0x76 -and $Bytes[3] -eq 0x67) { return 'image/svg+xml' }
+    }
+
+    try {
+        $path = ([Uri]$Url).AbsolutePath.ToLowerInvariant()
+        switch -Regex ($path) {
+            '\.png$' { return 'image/png' }
+            '\.(jpg|jpeg)$' { return 'image/jpeg' }
+            '\.gif$' { return 'image/gif' }
+            '\.webp$' { return 'image/webp' }
+            '\.svg$' { return 'image/svg+xml' }
+            '\.avif$' { return 'image/avif' }
+        }
+    }
+    catch {
+    }
+
+    return 'application/octet-stream'
+}
+
+function Get-ContentTypeForManifestRow {
+    param($Row)
+
+    if (-not $Row -or -not $Row.path) {
+        return 'application/octet-stream'
+    }
+
+    try {
+        $fullPath = ConvertTo-FullPath -RelativePath ([string]$Row.path)
+        if (Test-Path -LiteralPath $fullPath) {
+            $bytes = [System.IO.File]::ReadAllBytes($fullPath)
+            return Get-ContentTypeFromBytesOrUrl -Bytes $bytes -Url ([string]$Row.link)
+        }
+    }
+    catch {
+    }
+
+    return Get-ContentTypeFromBytesOrUrl -Bytes ([byte[]]::new(0)) -Url ([string]$Row.link)
+}
+
+function Resolve-ExternalUrl {
+    param(
+        [string]$RawUrl,
+        [string]$BaseUrl
+    )
+
+    if ([string]::IsNullOrWhiteSpace($RawUrl)) {
+        return ''
+    }
+
+    $value = [System.Net.WebUtility]::HtmlDecode($RawUrl.Trim())
+    if ($value -match '(?i)^(data|cid|blob|javascript|mailto):') {
+        return ''
+    }
+
+    try {
+        if ($value.StartsWith('//')) {
+            $baseUri = [Uri]$BaseUrl
+            return "$($baseUri.Scheme):$value"
+        }
+
+        if ([Uri]::IsWellFormedUriString($value, [UriKind]::Absolute)) {
+            return ([Uri]$value).AbsoluteUri
+        }
+
+        if (-not [string]::IsNullOrWhiteSpace($BaseUrl)) {
+            return ([Uri]::new([Uri]$BaseUrl, $value)).AbsoluteUri
+        }
+    }
+    catch {
+    }
+
+    return ''
+}
+
+function Get-HtmlBaseUrl {
+    param(
+        [string]$Html,
+        [string]$FallbackUrl
+    )
+
+    $match = [regex]::Match($Html, '(?is)<base\b[^>]*\bhref\s*=\s*(?:"(?<dq>[^"]*)"|''(?<sq>[^'']*)''|(?<bare>[^\s>]+))')
+    if ($match.Success) {
+        foreach ($name in @('dq', 'sq', 'bare')) {
+            if ($match.Groups[$name].Success) {
+                $base = Resolve-ExternalUrl -RawUrl $match.Groups[$name].Value -BaseUrl $FallbackUrl
+                if ($base) {
+                    return $base
+                }
+            }
+        }
+    }
+
+    return $FallbackUrl
+}
+
+function Get-ImgUrlsFromHtml {
+    param(
+        [string]$Html,
+        [string]$BaseUrl
+    )
+
+    $urls = New-Object 'System.Collections.Generic.List[string]'
+    $seen = New-Object 'System.Collections.Generic.Dictionary[string,bool]'
+
+    foreach ($img in [regex]::Matches($Html, '(?is)<img\b(?<attrs>[^>]*)>')) {
+        $attrs = $img.Groups['attrs'].Value
+
+        foreach ($attr in [regex]::Matches($attrs, '(?is)\bsrc\s*=\s*(?:"(?<dq>[^"]*)"|''(?<sq>[^'']*)''|(?<bare>[^\s>]+))')) {
+            foreach ($name in @('dq', 'sq', 'bare')) {
+                if ($attr.Groups[$name].Success) {
+                    $url = Resolve-ExternalUrl -RawUrl $attr.Groups[$name].Value -BaseUrl $BaseUrl
+                    if ($url -and $url -match '^https://' -and -not $seen.ContainsKey($url)) {
+                        $seen[$url] = $true
+                        $urls.Add($url) | Out-Null
+                    }
+                    break
+                }
+            }
+        }
+
+        foreach ($attr in [regex]::Matches($attrs, '(?is)\bsrcset\s*=\s*(?:"(?<dq>[^"]*)"|''(?<sq>[^'']*)''|(?<bare>[^\s>]+))')) {
+            $srcset = ''
+            foreach ($name in @('dq', 'sq', 'bare')) {
+                if ($attr.Groups[$name].Success) {
+                    $srcset = $attr.Groups[$name].Value
+                    break
+                }
+            }
+
+            foreach ($candidate in ($srcset -split ',')) {
+                $raw = (($candidate.Trim() -split '\s+', 2)[0])
+                $url = Resolve-ExternalUrl -RawUrl $raw -BaseUrl $BaseUrl
+                if ($url -and $url -match '^https://' -and -not $seen.ContainsKey($url)) {
+                    $seen[$url] = $true
+                    $urls.Add($url) | Out-Null
+                }
+            }
+        }
+    }
+
+    return @($urls)
+}
+
+function Get-MissingImgUrlsFromMhtml {
+    param(
+        [object[]]$Parts,
+        [string]$SnapshotLocation,
+        [System.Collections.Generic.Dictionary[string,bool]]$PartLocations
+    )
+
+    $htmlPart = $null
+    foreach ($part in @($Parts)) {
+        $location = Get-UnfoldedHeaderValue -Headers $part.Headers -Name 'Content-Location' -Url
+        $contentType = Get-UnfoldedHeaderValue -Headers $part.Headers -Name 'Content-Type'
+        if (($SnapshotLocation -and $location -eq $SnapshotLocation) -or $contentType -match '(?i)^text/html\b') {
+            $htmlPart = $part
+            break
+        }
+    }
+
+    if (-not $htmlPart -or [string]::IsNullOrEmpty($htmlPart.Body)) {
+        return @()
+    }
+
+    $encoding = Get-UnfoldedHeaderValue -Headers $htmlPart.Headers -Name 'Content-Transfer-Encoding'
+    if (-not $encoding) {
+        $encoding = '7bit'
+    }
+
+    $bytes = Decode-MimeBody -Body $htmlPart.Body -Encoding $encoding
+    $html = [System.Text.Encoding]::UTF8.GetString($bytes)
+    $baseUrl = Get-HtmlBaseUrl -Html $html -FallbackUrl $SnapshotLocation
+    $missing = New-Object 'System.Collections.Generic.List[string]'
+
+    foreach ($url in Get-ImgUrlsFromHtml -Html $html -BaseUrl $baseUrl) {
+        if (-not $PartLocations.ContainsKey($url)) {
+            $missing.Add($url) | Out-Null
+        }
+    }
+
+    return @($missing)
+}
+
+function Get-EdgePath {
+    $command = Get-Command 'msedge' -ErrorAction SilentlyContinue
+    if ($command) {
+        return $command.Source
+    }
+
+    foreach ($path in @(
+        "$env:ProgramFiles\Microsoft\Edge\Application\msedge.exe",
+        "${env:ProgramFiles(x86)}\Microsoft\Edge\Application\msedge.exe"
+    )) {
+        if ($path -and (Test-Path -LiteralPath $path)) {
+            return $path
+        }
+    }
+
+    return $null
+}
+
+function Get-FreeTcpPort {
+    $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 0)
+    $listener.Start()
+    try {
+        return $listener.LocalEndpoint.Port
+    }
+    finally {
+        $listener.Stop()
+    }
+}
+
+function Wait-DevTools {
+    param([int]$Port)
+
+    $deadline = (Get-Date).AddSeconds(30)
+    while ((Get-Date) -lt $deadline) {
+        try {
+            Invoke-RestMethod -Uri "http://127.0.0.1:$Port/json/version" -ErrorAction Stop | Out-Null
+            return
+        }
+        catch {
+            Start-Sleep -Milliseconds 500
+        }
+    }
+
+    throw "Edge DevTools tidak aktif di port $Port."
+}
+
+function Ensure-Edge {
+    if ($script:BrowserPort) {
+        return
+    }
+
+    $edgePath = Get-EdgePath
+    if (-not $edgePath) {
+        throw 'Microsoft Edge tidak ditemukan.'
+    }
+
+    foreach ($profileDir in @(
+        $script:BrowserProfileDir,
+        (Join-Path $AssetsRoot ".edge-profile-$PID-$(Get-Date -Format 'yyyyMMddHHmmss')")
+    )) {
+        $script:BrowserPort = Get-FreeTcpPort
+        New-Item -ItemType Directory -Force -Path $profileDir | Out-Null
+
+        $arguments = @(
+            "--remote-debugging-port=$($script:BrowserPort)",
+            "--user-data-dir=$profileDir",
+            '--no-first-run',
+            '--new-window',
+            'about:blank'
+        )
+
+        Start-Process -FilePath $edgePath -ArgumentList $arguments -WindowStyle Hidden | Out-Null
+
+        try {
+            Wait-DevTools -Port $script:BrowserPort
+            $script:BrowserProfileDir = $profileDir
+            return
+        }
+        catch {
+            Write-Warning $_.Exception.Message
+            $script:BrowserPort = $null
+        }
+    }
+
+    throw 'Edge DevTools gagal dimulai.'
+}
+
+function Open-DevToolsUrl {
+    param([string]$OpenUrl)
+
+    Ensure-Edge
+    $escapedUrl = [System.Uri]::EscapeDataString($OpenUrl)
+    $devToolsUrl = "http://127.0.0.1:$($script:BrowserPort)/json/new?$escapedUrl"
+
+    try {
+        return Invoke-RestMethod -Method Put -Uri $devToolsUrl -ErrorAction Stop
+    }
+    catch {
+        return Invoke-RestMethod -Uri $devToolsUrl -ErrorAction Stop
+    }
+}
+
+function Close-DevToolsPage {
+    param([string]$TargetId)
+
+    if ([string]::IsNullOrWhiteSpace($TargetId)) {
+        return
+    }
+
+    try {
+        Invoke-RestMethod -Uri "http://127.0.0.1:$($script:BrowserPort)/json/close/$TargetId" -ErrorAction SilentlyContinue | Out-Null
+    }
+    catch {
+    }
+}
+
+function Receive-WebSocketText {
+    param([System.Net.WebSockets.ClientWebSocket]$Socket)
+
+    $buffer = New-Object byte[] 65536
+    $stream = New-Object System.IO.MemoryStream
+
+    try {
+        do {
+            $segment = [ArraySegment[byte]]::new($buffer)
+            $result = $Socket.ReceiveAsync($segment, [Threading.CancellationToken]::None).GetAwaiter().GetResult()
+
+            if ($result.Count -gt 0) {
+                $stream.Write($buffer, 0, $result.Count)
+            }
+        } while (-not $result.EndOfMessage)
+
+        return [System.Text.Encoding]::UTF8.GetString($stream.ToArray())
+    }
+    finally {
+        $stream.Dispose()
+    }
+}
+
+function Invoke-CdpCommand {
+    param(
+        [System.Net.WebSockets.ClientWebSocket]$Socket,
+        [string]$Method,
+        [hashtable]$Params = @{}
+    )
+
+    $script:CdpCommandId++
+    $id = $script:CdpCommandId
+    $message = @{
+        id = $id
+        method = $Method
+        params = $Params
+    } | ConvertTo-Json -Depth 30 -Compress
+
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes($message)
+    $segment = [ArraySegment[byte]]::new($bytes)
+    [void]$Socket.SendAsync($segment, [System.Net.WebSockets.WebSocketMessageType]::Text, $true, [Threading.CancellationToken]::None).GetAwaiter().GetResult()
+
+    do {
+        $responseText = Receive-WebSocketText $Socket
+        $response = $responseText | ConvertFrom-Json
+        $responseId = if (Test-ObjectProperty -Object $response -Name 'id') { $response.id } else { $null }
+    } while ($responseId -ne $id)
+
+    if ((Test-ObjectProperty -Object $response -Name 'error') -and $response.error) {
+        throw "$Method gagal: $($response.error.message)"
+    }
+
+    return $response
+}
+
+function Invoke-PageEval {
+    param(
+        [System.Net.WebSockets.ClientWebSocket]$Socket,
+        [string]$Expression
+    )
+
+    $response = Invoke-CdpCommand -Socket $Socket -Method 'Runtime.evaluate' -Params @{
+        expression = $Expression
+        awaitPromise = $true
+        returnByValue = $true
+    }
+
+    if ((Test-ObjectProperty -Object $response.result -Name 'exceptionDetails') -and $response.result.exceptionDetails) {
+        throw "Runtime.evaluate gagal: $($response.result.exceptionDetails.text)"
+    }
+
+    return $response.result.result.value
+}
+
+function New-AssetDownloadSession {
+    $target = Open-DevToolsUrl -OpenUrl 'about:blank'
+    $socket = [System.Net.WebSockets.ClientWebSocket]::new()
+    $socket.ConnectAsync([Uri]$target.webSocketDebuggerUrl, [Threading.CancellationToken]::None).GetAwaiter().GetResult()
+
+    [void](Invoke-CdpCommand -Socket $socket -Method 'Page.enable')
+    [void](Invoke-CdpCommand -Socket $socket -Method 'Runtime.enable')
+    [void](Invoke-CdpCommand -Socket $socket -Method 'Network.enable')
+
+    return [pscustomobject]@{
+        Socket = $socket
+        TargetId = [string]$target.id
+    }
+}
+
+function Get-AssetSessionSocket {
+    param($Session)
+
+    foreach ($item in @($Session)) {
+        if ($item -and (Test-ObjectProperty -Object $item -Name 'Socket')) {
+            return $item.Socket
+        }
+    }
+
+    return $null
+}
+
+function Get-AssetSessionTargetId {
+    param($Session)
+
+    foreach ($item in @($Session)) {
+        if ($item -and (Test-ObjectProperty -Object $item -Name 'TargetId')) {
+            return [string]$item.TargetId
+        }
+    }
+
+    return ''
+}
+
+function Close-AssetDownloadSession {
+    param($Session)
+
+    if (-not $Session) {
+        return
+    }
+
+    try {
+        $socket = Get-AssetSessionSocket -Session $Session
+        if ($socket) {
+            $socket.Dispose()
+        }
+    }
+    catch {
+    }
+
+    Close-DevToolsPage -TargetId (Get-AssetSessionTargetId -Session $Session)
+}
+
+function Wait-BrowserPageComplete {
+    param(
+        [System.Net.WebSockets.ClientWebSocket]$Socket,
+        [string]$Url
+    )
+
+    $deadline = (Get-Date).AddSeconds($BrowserReadyTimeoutSeconds)
+    while ((Get-Date) -lt $deadline) {
+        try {
+            $json = Invoke-PageEval -Socket $Socket -Expression @'
+JSON.stringify({
+    href: location.href,
+    readyState: document.readyState,
+    title: document.title,
+    bodyText: document.body ? document.body.innerText : ''
+})
+'@
+            $data = $json | ConvertFrom-Json
+            if ($data.readyState -eq 'complete' -and [string]$data.href -ne 'about:blank') {
+                return $data
+            }
+        }
+        catch {
+        }
+
+        Start-Sleep -Milliseconds 250
+    }
+
+    throw "Timeout menunggu complete: $Url"
+}
+
+function Get-AssetBytesWithBrowser {
+    param(
+        $Session,
+        [string]$Url,
+        [string]$Referrer = ''
+    )
+
+    Write-Host "Download img lewat Edge: $Url"
+    $socket = Get-AssetSessionSocket -Session $Session
+    if (-not $socket) {
+        throw 'Session browser tidak punya socket aktif.'
+    }
+
+    $lastError = ''
+    for ($attempt = 1; $attempt -le $ImageDownloadAttempts; $attempt++) {
+        try {
+            if ($attempt -eq 1) {
+                $params = @{ url = $Url }
+                if (-not [string]::IsNullOrWhiteSpace($Referrer)) {
+                    $params.referrer = $Referrer
+                }
+                [void](Invoke-CdpCommand -Socket $socket -Method 'Page.navigate' -Params $params)
+            }
+            else {
+                Write-Warning "Reload ulang img gagal: $Url"
+                [void](Invoke-CdpCommand -Socket $socket -Method 'Page.reload' -Params @{ ignoreCache = $true })
+            }
+
+            [void](Wait-BrowserPageComplete -Socket $socket -Url $Url)
+
+            $script = @'
+(async () => {
+    try {
+        const response = await fetch(location.href, { cache: 'reload', credentials: 'include' });
+        if (!response.ok) {
+            return JSON.stringify({ ok: false, status: response.status, statusText: response.statusText || '' });
+        }
+        const contentType = response.headers.get('content-type') || '';
+        const buffer = await response.arrayBuffer();
+        const bytes = new Uint8Array(buffer);
+        let binary = '';
+        const chunkSize = 0x8000;
+        for (let i = 0; i < bytes.length; i += chunkSize) {
+            binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunkSize));
+        }
+        return JSON.stringify({
+            ok: true,
+            status: response.status,
+            finalUrl: location.href,
+            contentType,
+            base64: btoa(binary)
+        });
+    } catch (error) {
+        return JSON.stringify({ ok: false, error: String(error && error.message ? error.message : error) });
+    }
+})()
+'@
+            $json = Invoke-PageEval -Socket $socket -Expression $script
+            $data = $json | ConvertFrom-Json
+            if (-not $data.ok) {
+                if ((Test-ObjectProperty -Object $data -Name 'error') -and $data.error) {
+                    throw [string]$data.error
+                }
+                $status = if (Test-ObjectProperty -Object $data -Name 'status') { [string]$data.status } else { '' }
+                $statusText = if (Test-ObjectProperty -Object $data -Name 'statusText') { [string]$data.statusText } else { '' }
+                throw "HTTP $status $statusText"
+            }
+
+            $bytes = [Convert]::FromBase64String([string]$data.base64)
+            return [pscustomobject]@{
+                Bytes = $bytes
+                ContentType = [string]$data.contentType
+                FinalUrl = [string]$data.finalUrl
+            }
+        }
+        catch {
+            $lastError = $_.Exception.Message
+            if ($attempt -ge $ImageDownloadAttempts) {
+                break
+            }
+        }
+    }
+
+    throw "Download gagal setelah $ImageDownloadAttempts attempt: $Url ($lastError)"
+}
+
 function Get-InputMhtmlFiles {
     param([string]$Path)
 
@@ -406,7 +1010,7 @@ function Import-ExistingHashMap {
         }
 
         $size = $null
-        if ($row.PSObject.Properties.Name -contains 'size_bytes' -and $row.size_bytes) {
+        if ((Test-ObjectProperty -Object $row -Name 'size_bytes') -and $row.size_bytes) {
             $size = [Int64]$row.size_bytes
         }
         else {
@@ -473,10 +1077,16 @@ $stats = [ordered]@{
     ReusedFiles = 0
     ClearedPartBodies = 0
     StrippedMhtmlFiles = 0
+    MissingImgUrls = 0
+    DownloadedImgUrls = 0
+    FailedImgUrls = 0
+    AddedMissingImgParts = 0
     SkippedExistingUrls = 0
     SkippedSnapshotParts = 0
     SkippedNonHttpsParts = 0
 }
+
+$assetSession = $null
 
 foreach ($file in $files) {
     $stats.Files++
@@ -493,8 +1103,14 @@ foreach ($file in $files) {
         continue
     }
 
-    foreach ($part in Get-MhtmlParts -Text $text -Boundary $boundary) {
+    $parts = @(Get-MhtmlParts -Text $text -Boundary $boundary)
+    $filePartLocations = New-Object 'System.Collections.Generic.Dictionary[string,bool]'
+    foreach ($part in $parts) {
         $location = Get-UnfoldedHeaderValue -Headers $part.Headers -Name 'Content-Location' -Url
+        if ($location -and -not $filePartLocations.ContainsKey($location)) {
+            $filePartLocations[$location] = $true
+        }
+
         if (-not $location -or $location -notmatch '^https://') {
             $stats.SkippedNonHttpsParts++
             continue
@@ -566,16 +1182,100 @@ foreach ($file in $files) {
         $rows.Add($newRow) | Out-Null
     }
 
-    $clearedResult = Clear-MhtmlExternalPartBodies -Text $text -Boundary $boundary -SnapshotLocation $snapshotLocation -UrlRows $urlToRow
-    if ($clearedResult.Cleared -gt 0) {
+    $missingImgParts = New-Object System.Collections.Generic.List[object]
+    foreach ($imgUrl in Get-MissingImgUrlsFromMhtml -Parts $parts -SnapshotLocation $snapshotLocation -PartLocations $filePartLocations) {
+        if ($filePartLocations.ContainsKey($imgUrl)) {
+            continue
+        }
+
+        $stats.MissingImgUrls++
+        $imgRow = $null
+        $contentType = ''
+
+        if ($urlToRow.ContainsKey($imgUrl)) {
+            $imgRow = $urlToRow[$imgUrl]
+            $contentType = Get-ContentTypeForManifestRow -Row $imgRow
+            if (-not $seenRows.ContainsKey($imgUrl)) {
+                $seenRows[$imgUrl] = $true
+                $rows.Add($imgRow) | Out-Null
+            }
+            $stats.SkippedExistingUrls++
+        }
+        else {
+            try {
+                $assetSocket = Get-AssetSessionSocket -Session $assetSession
+                if (-not $assetSocket -or $assetSocket.State -ne [System.Net.WebSockets.WebSocketState]::Open) {
+                    if ($assetSession) {
+                        Close-AssetDownloadSession -Session $assetSession
+                    }
+                    $assetSession = New-AssetDownloadSession
+                }
+
+                $download = Get-AssetBytesWithBrowser -Session $assetSession -Url $imgUrl -Referrer $snapshotLocation
+                $bytes = [byte[]]$download.Bytes
+                $contentType = Get-ContentTypeFromBytesOrUrl -Bytes $bytes -Url $imgUrl -ResponseContentType ([string]$download.ContentType)
+                $sha256 = Get-Sha256Hex -Bytes $bytes
+                $size = [Int64]$bytes.LongLength
+                $contentKey = "$sha256`t$size"
+
+                if ($hashToPath.ContainsKey($contentKey)) {
+                    $relativePath = $hashToPath[$contentKey]
+                    $stats.ReusedFiles++
+                }
+                else {
+                    do {
+                        $uuid = New-UuidV7
+                        $relativePath = Get-RelativeAssetPath -Uuid $uuid
+                        $fullPath = ConvertTo-FullPath -RelativePath $relativePath
+                    } while (Test-Path -LiteralPath $fullPath)
+
+                    [System.IO.File]::WriteAllBytes($fullPath, $bytes)
+                    $hashToPath[$contentKey] = $relativePath
+                    $stats.WrittenFiles++
+                }
+
+                $imgRow = [pscustomobject]@{
+                    link = $imgUrl
+                    path = $relativePath
+                    encoding = 'base64'
+                    sha256 = $sha256
+                    size_bytes = $size
+                }
+                $urlToRow[$imgUrl] = $imgRow
+                $seenRows[$imgUrl] = $true
+                $rows.Add($imgRow) | Out-Null
+                $stats.DownloadedImgUrls++
+            }
+            catch {
+                $stats.FailedImgUrls++
+                Write-Warning "Gagal download img tanpa multipart: $imgUrl - $($_.Exception.Message)"
+                continue
+            }
+        }
+
+        if ($imgRow) {
+            $missingImgParts.Add([pscustomobject]@{
+                link = $imgUrl
+                content_type = $contentType
+                encoding = 'base64'
+            }) | Out-Null
+            $filePartLocations[$imgUrl] = $true
+        }
+    }
+
+    $clearedResult = Clear-MhtmlExternalPartBodies -Text $text -Boundary $boundary -SnapshotLocation $snapshotLocation -UrlRows $urlToRow -AdditionalParts ([object[]]$missingImgParts.ToArray())
+    if ($clearedResult.Cleared -gt 0 -or $clearedResult.Added -gt 0) {
         $relativeMhtmlPath = Get-RelativePathFromBase -BasePath $inputBasePath -FullPath $file.FullName
         $outputMhtmlPath = Join-Path $StrippedMhtmlRoot $relativeMhtmlPath
         New-Item -ItemType Directory -Force -Path (Split-Path -Parent $outputMhtmlPath) | Out-Null
         [System.IO.File]::WriteAllText($outputMhtmlPath, $clearedResult.Text, $Latin1)
         $stats.ClearedPartBodies += $clearedResult.Cleared
+        $stats.AddedMissingImgParts += $clearedResult.Added
         $stats.StrippedMhtmlFiles++
     }
 }
+
+Close-AssetDownloadSession -Session $assetSession
 
 $tsvLines = New-Object System.Collections.Generic.List[string]
 $tsvLines.Add("link`tpath`tencoding`tsha256`tsize_bytes") | Out-Null
@@ -599,6 +1299,10 @@ Write-Host "Files written        : $($stats.WrittenFiles)"
 Write-Host "Files reused         : $($stats.ReusedFiles)"
 Write-Host "Part bodies cleared  : $($stats.ClearedPartBodies)"
 Write-Host "Stripped MHTML files : $($stats.StrippedMhtmlFiles)"
+Write-Host "Missing img URLs     : $($stats.MissingImgUrls)"
+Write-Host "Downloaded img URLs  : $($stats.DownloadedImgUrls)"
+Write-Host "Failed img URLs      : $($stats.FailedImgUrls)"
+Write-Host "Added img parts      : $($stats.AddedMissingImgParts)"
 Write-Host "Skipped existing URL : $($stats.SkippedExistingUrls)"
 Write-Host "Skipped snapshot URL : $($stats.SkippedSnapshotParts)"
 Write-Host "Skipped non-HTTPS    : $($stats.SkippedNonHttpsParts)"
