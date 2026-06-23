@@ -4,7 +4,7 @@ param(
     [double]$PageIdleSeconds = 0.1,
     [int]$PageLoadTimeoutSeconds = 3000,
     [int]$MaxLoadAttempts = 100000,
-    [int]$ParallelPages = 6,
+    [int]$ParallelPages = 5,
     [int]$MaxPages = 0,
     [switch]$Overwrite,
     [switch]$DryRun,
@@ -35,6 +35,7 @@ $script:MainDocumentStatus = $null
 $script:MainDocumentStatusText = ''
 $script:MainDocumentFailedText = ''
 $script:MainDocumentRequestId = ''
+$script:KnownUrlMapCache = @{}
 
 if ($WorkerMode) {
     if ($WorkerBrowserPort -le 0) {
@@ -279,6 +280,12 @@ function Update-NetworkStateFromNavigateResult {
     }
 }
 
+function Test-IgnorableNavigationFailure {
+    param([string]$ErrorText)
+
+    return ([string]$ErrorText) -eq 'net::ERR_ABORTED'
+}
+
 function Get-MhtmlSnapshotExpression {
     return @'
 (() => {
@@ -377,7 +384,12 @@ function Assert-PageLoadOk {
     param($Data)
 
     if (-not [string]::IsNullOrWhiteSpace($script:MainDocumentFailedText)) {
-        throw "Network error: $($script:MainDocumentFailedText)"
+        if (Test-IgnorableNavigationFailure -ErrorText $script:MainDocumentFailedText) {
+            $script:MainDocumentFailedText = ''
+        }
+        else {
+            throw "Network error: $($script:MainDocumentFailedText)"
+        }
     }
 
     if ($null -ne $script:MainDocumentStatus -and $script:MainDocumentStatus -ge 400) {
@@ -395,6 +407,41 @@ function Assert-PageLoadOk {
 
     if ("$title $h1" -match '(?i)\b(404|502|503|504|not found|bad gateway|service unavailable|gateway timeout|ERR_[A-Z_]+|DNS|refused|unreachable|timed out|can''t be reached)\b') {
         throw "Halaman terlihat error: title='$title', h1='$h1'"
+    }
+}
+
+function Assert-FinalUrlDoesNotPointToKnownDifferentPage {
+    param(
+        $Task,
+        $Data
+    )
+
+    if (-not $Task -or -not $Data) {
+        return
+    }
+
+    $originalUrl = [string]$Task.Url
+    $finalUrl = [string]$Data.href
+    if ([string]::IsNullOrWhiteSpace($originalUrl) -or [string]::IsNullOrWhiteSpace($finalUrl)) {
+        return
+    }
+
+    try {
+        $originalKey = Get-CanonicalUrlKey $originalUrl
+        $finalKey = Get-CanonicalUrlKey $finalUrl
+        if ($finalKey -eq $originalKey) {
+            return
+        }
+
+        $knownUrlMap = Get-KnownUrlMapForSourceXml -SourceXml ([string]$Task.SourceXml)
+        if ($knownUrlMap.ContainsKey($finalKey)) {
+            throw "Final URL salah: task '$originalUrl' selesai di URL lain yang ada di list '$finalUrl'"
+        }
+    }
+    catch {
+        if ($_.Exception.Message -like 'Final URL salah:*') {
+            throw
+        }
     }
 }
 
@@ -521,6 +568,66 @@ function Get-IndexPathForXml {
     $folder = [System.IO.Path]::GetDirectoryName($xmlPath)
     $baseName = [System.IO.Path]::GetFileNameWithoutExtension($xmlPath)
     return (Join-Path $folder "$baseName-$Kind.tsv")
+}
+
+function Add-UrlToMap {
+    param(
+        [hashtable]$Map,
+        [string]$Url
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Url)) {
+        return
+    }
+
+    try {
+        $Map[(Get-CanonicalUrlKey $Url)] = $true
+    }
+    catch {
+    }
+}
+
+function Add-TsvUrlsToMap {
+    param(
+        [hashtable]$Map,
+        [string]$Path
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Path) -or -not (Test-Path -LiteralPath $Path)) {
+        return
+    }
+
+    try {
+        $rows = @(Import-Csv -LiteralPath $Path -Delimiter "`t")
+    }
+    catch {
+        Write-Warning "Tidak bisa membaca URL index: $Path - $($_.Exception.Message)"
+        return
+    }
+
+    foreach ($row in $rows) {
+        Add-UrlToMap -Map $Map -Url ([string]$row.url)
+    }
+}
+
+function Get-KnownUrlMapForSourceXml {
+    param([string]$SourceXml)
+
+    if ([string]::IsNullOrWhiteSpace($SourceXml)) {
+        return @{}
+    }
+
+    $xmlPath = [System.IO.Path]::GetFullPath($SourceXml)
+    $cacheKey = $xmlPath.ToLowerInvariant()
+    if ($script:KnownUrlMapCache.ContainsKey($cacheKey)) {
+        return $script:KnownUrlMapCache[$cacheKey]
+    }
+
+    $map = @{}
+    Add-TsvUrlsToMap -Map $map -Path (Get-IndexPathForXml -SourceXml $xmlPath -Kind 'link')
+    Add-TsvUrlsToMap -Map $map -Path (Get-IndexPathForXml -SourceXml $xmlPath -Kind 'list')
+    $script:KnownUrlMapCache[$cacheKey] = $map
+    return $map
 }
 
 function Update-ListBackup {
@@ -892,12 +999,9 @@ function Save-MhtmlPageInSession {
         Update-NetworkStateFromNavigateResult -Response $navigateResponse
 
         try {
-            if (-not [string]::IsNullOrWhiteSpace($script:MainDocumentFailedText)) {
-                throw "Network error: $($script:MainDocumentFailedText)"
-            }
-
             $data = Wait-MhtmlPageReady -Socket $Socket -PageUrl $pageUrl -Attempt $attempt
             Assert-PageLoadOk -Data $data
+            Assert-FinalUrlDoesNotPointToKnownDifferentPage -Task $Task -Data $data
 
             New-Item -ItemType Directory -Force -Path $folder | Out-Null
             $snapshot = Invoke-CdpCommand -Socket $Socket -Method 'Page.captureSnapshot' -Params @{ format = 'mhtml' }
