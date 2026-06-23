@@ -393,7 +393,7 @@ function Assert-PageLoadOk {
         throw "Halaman terlihat error challenge: h1='$h1', size=$htmlLength bytes"
     }
 
-    if ("$title $h1" -match '(?i)\b(404|502|503|504|not found|bad gateway|service unavailable|gateway timeout|ERR_[A-Z_]+|DNS|internet|connection|refused|unreachable|timed out|can''t be reached)\b') {
+    if ("$title $h1" -match '(?i)\b(404|502|503|504|not found|bad gateway|service unavailable|gateway timeout|ERR_[A-Z_]+|DNS|refused|unreachable|timed out|can''t be reached)\b') {
         throw "Halaman terlihat error: title='$title', h1='$h1'"
     }
 }
@@ -543,10 +543,10 @@ function Ensure-ListFile {
     }
 }
 
-function Get-DownloadedFilePathMap {
+function Get-DownloadedResumeMap {
     param([string[]]$Paths)
 
-    $map = @{}
+    $urlMap = @{}
 
     foreach ($path in @($Paths)) {
         if ([string]::IsNullOrWhiteSpace($path) -or -not (Test-Path -LiteralPath $path)) {
@@ -562,24 +562,20 @@ function Get-DownloadedFilePathMap {
         }
 
         foreach ($row in $rows) {
-            if ([string]::IsNullOrWhiteSpace([string]$row.file)) {
-                continue
-            }
-
-            $filePath = [string]$row.file
-            if (-not [System.IO.Path]::IsPathRooted($filePath)) {
-                $filePath = Join-Path $PSScriptRoot $filePath
-            }
-
-            try {
-                $map[[System.IO.Path]::GetFullPath($filePath).ToLowerInvariant()] = $true
-            }
-            catch {
+            if (-not [string]::IsNullOrWhiteSpace([string]$row.url)) {
+                try {
+                    $urlMap[(Get-CanonicalUrlKey ([string]$row.url))] = $true
+                }
+                catch {
+                }
             }
         }
     }
 
-    return $map
+    return [pscustomobject]@{
+        UrlMap = $urlMap
+        Count = $urlMap.Count
+    }
 }
 
 function Get-ElementChildren {
@@ -600,6 +596,70 @@ function Get-ElementChildren {
     }
 
     return @($children)
+}
+
+function ConvertTo-LocalPathFromListValue {
+    param([string]$Value)
+
+    if ([string]::IsNullOrWhiteSpace($Value)) {
+        return ''
+    }
+
+    $path = ([string]$Value).Trim().Trim([char]34) -replace '/', '\'
+    if ([System.IO.Path]::IsPathRooted($path)) {
+        return [System.IO.Path]::GetFullPath($path)
+    }
+
+    return [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot $path))
+}
+
+function Get-LinkIndexTasks {
+    param(
+        [string]$LinkPath,
+        [string]$SourceXml
+    )
+
+    $tasks = New-Object System.Collections.ArrayList
+    if (-not (Test-Path -LiteralPath $LinkPath) -or (Get-Item -LiteralPath $LinkPath).Length -eq 0) {
+        return @($tasks)
+    }
+
+    try {
+        $rows = @(Import-Csv -LiteralPath $LinkPath -Delimiter "`t")
+    }
+    catch {
+        Write-Warning "Tidak bisa membaca link existing: $LinkPath - $($_.Exception.Message)"
+        return @($tasks)
+    }
+
+    foreach ($row in $rows) {
+        if ([string]::IsNullOrWhiteSpace([string]$row.url) -or [string]::IsNullOrWhiteSpace([string]$row.file)) {
+            continue
+        }
+
+        $filePath = ConvertTo-LocalPathFromListValue ([string]$row.file)
+        $saveFolder = ConvertTo-LocalPathFromListValue ([string]$row.save_folder)
+        if ([string]::IsNullOrWhiteSpace($saveFolder)) {
+            $saveFolder = [System.IO.Path]::GetDirectoryName($filePath)
+        }
+
+        $sourceXmlValue = if ([string]::IsNullOrWhiteSpace([string]$row.source_xml)) { $SourceXml } else { ConvertTo-LocalPathFromListValue ([string]$row.source_xml) }
+        $childCount = 0
+        [void][int]::TryParse([string]$row.child_count, [ref]$childCount)
+
+        [void]$tasks.Add([pscustomobject]@{
+            Url = [string]$row.url
+            SaveFolder = $saveFolder
+            FileBaseName = [System.IO.Path]::GetFileNameWithoutExtension($filePath)
+            FilePath = $filePath
+            Title = [string]$row.title
+            ParentUrl = [string]$row.parent_url
+            SourceXml = $sourceXmlValue
+            ChildCount = $childCount
+        })
+    }
+
+    return @($tasks)
 }
 
 function Get-NextElementSibling {
@@ -708,6 +768,16 @@ function Get-XmlDownloadTasks {
     Write-Host "XML langsung di folder mhtml: $($xmlFiles.Count) file"
 
     foreach ($xmlFile in $xmlFiles) {
+        $linkPath = Get-IndexPathForXml -SourceXml $xmlFile.FullName -Kind 'link'
+        $existingTasks = @(Get-LinkIndexTasks -LinkPath $linkPath -SourceXml $xmlFile.FullName)
+        if ($existingTasks.Count -gt 0) {
+            foreach ($task in $existingTasks) {
+                [void]$tasks.Add($task)
+            }
+            Write-Host "Pakai link existing: $(ConvertTo-RelativeRootPath $linkPath) -> $($existingTasks.Count) link"
+            continue
+        }
+
         $raw = Get-Content -LiteralPath $xmlFile.FullName -Raw
         [xml]$doc = '<root>' + $raw + '</root>'
 
@@ -739,6 +809,11 @@ function Write-LinkIndex {
     $groups = @($Tasks | Group-Object -Property SourceXml)
     foreach ($group in $groups) {
         $linkPath = Get-IndexPathForXml -SourceXml $group.Name -Kind 'link'
+        if ((Test-Path -LiteralPath $linkPath) -and (Get-Item -LiteralPath $linkPath).Length -gt 0) {
+            [void]$writtenPaths.Add($linkPath)
+            continue
+        }
+
         $rows = New-Object System.Collections.ArrayList
         [void]$rows.Add("url`tsave_folder`tfile`ttitle`tchild_count`tparent_url`tsource_xml")
         foreach ($task in @($group.Group)) {
@@ -805,23 +880,6 @@ function Save-MhtmlPageInSession {
     $saved = $false
     $data = $null
 
-    if ((Test-Path -LiteralPath $filePath) -and -not $Overwrite) {
-        $existingSize = (Get-Item -LiteralPath $filePath).Length
-        if ($existingSize -ge $MinimumMhtmlBytes) {
-            Write-Host "Lewati existing: $(ConvertTo-RelativeRootPath $filePath) ($existingSize bytes)"
-            return [pscustomobject]@{
-                OriginalUrl = $pageUrl
-                FinalUrl = $pageUrl
-                Title = [string]$Task.Title
-                FilePath = $filePath
-                Saved = $false
-                ChildCount = [int]$Task.ChildCount
-                ParentUrl = [string]$Task.ParentUrl
-                SourceXml = [string]$Task.SourceXml
-            }
-        }
-    }
-
     Write-Host ""
     Write-Host "Buka Edge: $pageUrl"
     for ($attempt = 1; $attempt -le $MaxLoadAttempts; $attempt++) {
@@ -879,24 +937,6 @@ function Save-MhtmlPageInSession {
 
 function Save-MhtmlPage {
     param($Task)
-
-    $filePath = [System.IO.Path]::GetFullPath([string]$Task.FilePath)
-    if ((Test-Path -LiteralPath $filePath) -and -not $Overwrite) {
-        $existingSize = (Get-Item -LiteralPath $filePath).Length
-        if ($existingSize -ge $MinimumMhtmlBytes) {
-            Write-Host "Lewati existing: $(ConvertTo-RelativeRootPath $filePath) ($existingSize bytes)"
-            return [pscustomobject]@{
-                OriginalUrl = [string]$Task.Url
-                FinalUrl = [string]$Task.Url
-                Title = [string]$Task.Title
-                FilePath = $filePath
-                Saved = $false
-                ChildCount = [int]$Task.ChildCount
-                ParentUrl = [string]$Task.ParentUrl
-                SourceXml = [string]$Task.SourceXml
-            }
-        }
-    }
 
     $session = $null
     try {
@@ -1071,15 +1111,23 @@ if ($WorkerMode) {
 function Add-DownloadedResultToList {
     param(
         $Result,
-        [hashtable]$FileMap
+        $ResumeMap
     )
 
     if (-not $Result -or [string]::IsNullOrWhiteSpace([string]$Result.FilePath)) {
         return
     }
 
-    $fileKey = [System.IO.Path]::GetFullPath([string]$Result.FilePath).ToLowerInvariant()
-    if ($FileMap.ContainsKey($fileKey)) {
+    $urlKey = ''
+    if (-not [string]::IsNullOrWhiteSpace([string]$Result.OriginalUrl)) {
+        try {
+            $urlKey = Get-CanonicalUrlKey ([string]$Result.OriginalUrl)
+        }
+        catch {
+        }
+    }
+
+    if ($urlKey -and $ResumeMap.UrlMap.ContainsKey($urlKey)) {
         return
     }
 
@@ -1095,7 +1143,10 @@ function Add-DownloadedResultToList {
         "$(ConvertTo-TsvValue ([string]$Result.Saved))"
     ) -Encoding UTF8
     Update-ListBackup -ListPath $listPath
-    $FileMap[$fileKey] = $true
+    if ($urlKey) {
+        $ResumeMap.UrlMap[$urlKey] = $true
+    }
+    $ResumeMap.Count = $ResumeMap.UrlMap.Count
 }
 
 function Get-NextTask {
@@ -1282,7 +1333,7 @@ function Get-NextBrowserTask {
     param(
         [System.Collections.ArrayList]$Queue,
         [hashtable]$SeenFiles,
-        [hashtable]$DownloadedFileMap
+        $ResumeMap
     )
 
     while ($Queue.Count -gt 0 -and (Test-CanStartMore -StartedCount $started)) {
@@ -1291,8 +1342,14 @@ function Get-NextBrowserTask {
             return $null
         }
 
-        $fileKey = [System.IO.Path]::GetFullPath([string]$task.FilePath).ToLowerInvariant()
-        if ($DownloadedFileMap.ContainsKey($fileKey)) {
+        $urlKey = ''
+        try {
+            $urlKey = Get-CanonicalUrlKey ([string]$task.Url)
+        }
+        catch {
+        }
+
+        if ($urlKey -and $ResumeMap.UrlMap.ContainsKey($urlKey)) {
             continue
         }
 
@@ -1352,12 +1409,12 @@ for ($taskIndex = $allTasks.Count - 1; $taskIndex -ge 0; $taskIndex--) {
 }
 
 $seenFiles = @{}
-$downloadedFileMap = Get-DownloadedFilePathMap -Paths $listPaths
+$downloadedResumeMap = Get-DownloadedResumeMap -Paths $listPaths
 $downloaded = 0
 $started = 0
 
-if ($downloadedFileMap.Count -gt 0) {
-    Write-Host "Index download terbaca: $($downloadedFileMap.Count) file dari $($listPaths.Count) list"
+if ($downloadedResumeMap.Count -gt 0) {
+    Write-Host "Index resume URL terbaca: $($downloadedResumeMap.Count) URL dari $($listPaths.Count) list"
 }
 
 if ($ParallelPages -le 1) {
@@ -1367,7 +1424,7 @@ if ($ParallelPages -le 1) {
             break
         }
 
-        $task = Get-NextBrowserTask -Queue $stack -SeenFiles $seenFiles -DownloadedFileMap $downloadedFileMap
+        $task = Get-NextBrowserTask -Queue $stack -SeenFiles $seenFiles -ResumeMap $downloadedResumeMap
         if (-not $task) {
             break
         }
@@ -1377,7 +1434,7 @@ if ($ParallelPages -le 1) {
             $result = Save-MhtmlPage -Task $task
             $result | Add-Member -NotePropertyName RelativeFile -NotePropertyValue (ConvertTo-RelativeRootPath $result.FilePath) -Force
             $downloaded++
-            Add-DownloadedResultToList -Result $result -FileMap $downloadedFileMap
+            Add-DownloadedResultToList -Result $result -ResumeMap $downloadedResumeMap
         }
         catch {
             if ($started -gt 0) {
@@ -1421,10 +1478,9 @@ else {
                 if ($result) {
                     if ($result.Success) {
                         $downloaded++
-                        Add-DownloadedResultToList -Result $result -FileMap $downloadedFileMap
+                        Add-DownloadedResultToList -Result $result -ResumeMap $downloadedResumeMap
 
-                        $status = if ($result.Saved) { 'Simpan' } else { 'Lewati existing' }
-                        Write-Host "${status}: $($result.RelativeFile)"
+                        Write-Host "Simpan: $($result.RelativeFile)"
                     }
                     else {
                         if ($started -gt 0) {
@@ -1465,7 +1521,7 @@ else {
                     break
                 }
 
-                $task = Get-NextBrowserTask -Queue $stack -SeenFiles $seenFiles -DownloadedFileMap $downloadedFileMap
+                $task = Get-NextBrowserTask -Queue $stack -SeenFiles $seenFiles -ResumeMap $downloadedResumeMap
                 if (-not $task) {
                     break
                 }
