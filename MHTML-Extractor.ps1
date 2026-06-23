@@ -423,6 +423,74 @@ function Get-ContentTypeFromBytesOrUrl {
     return 'application/octet-stream'
 }
 
+function Get-LittleEndianUInt32 {
+    param(
+        [byte[]]$Bytes,
+        [int]$Offset
+    )
+
+    if (-not $Bytes -or $Bytes.Length -lt ($Offset + 4)) {
+        return -1
+    }
+
+    return [Int64](
+        [UInt32]$Bytes[$Offset] -bor
+        ([UInt32]$Bytes[$Offset + 1] -shl 8) -bor
+        ([UInt32]$Bytes[$Offset + 2] -shl 16) -bor
+        ([UInt32]$Bytes[$Offset + 3] -shl 24)
+    )
+}
+
+function Test-ImageBytesComplete {
+    param(
+        [byte[]]$Bytes,
+        [string]$ContentType,
+        [string]$Url,
+        [Int64]$ExpectedLength = -1
+    )
+
+    if (-not $Bytes -or $Bytes.Length -le 0) {
+        return 'bytes kosong'
+    }
+
+    if ($ExpectedLength -gt 0 -and $Bytes.LongLength -ne $ExpectedLength) {
+        return "panjang bytes tidak cocok Content-Length: $($Bytes.LongLength) != $ExpectedLength"
+    }
+
+    $type = Get-ContentTypeFromBytesOrUrl -Bytes $Bytes -Url $Url -ResponseContentType $ContentType
+    switch -Regex ($type) {
+        '^image/png$' {
+            if ($Bytes.Length -lt 12) { return 'PNG terlalu kecil' }
+            $n = $Bytes.Length
+            if (-not (
+                $Bytes[$n - 12] -eq 0x00 -and $Bytes[$n - 11] -eq 0x00 -and $Bytes[$n - 10] -eq 0x00 -and $Bytes[$n - 9] -eq 0x00 -and
+                $Bytes[$n - 8] -eq 0x49 -and $Bytes[$n - 7] -eq 0x45 -and $Bytes[$n - 6] -eq 0x4e -and $Bytes[$n - 5] -eq 0x44
+            )) {
+                return 'PNG tidak punya chunk akhir IEND'
+            }
+        }
+        '^image/jpeg$' {
+            if ($Bytes.Length -lt 2 -or $Bytes[$Bytes.Length - 2] -ne 0xff -or $Bytes[$Bytes.Length - 1] -ne 0xd9) {
+                return 'JPEG tidak punya marker akhir FFD9'
+            }
+        }
+        '^image/gif$' {
+            if ($Bytes[$Bytes.Length - 1] -ne 0x3b) {
+                return 'GIF tidak punya trailer akhir'
+            }
+        }
+        '^image/webp$' {
+            if ($Bytes.Length -lt 12) { return 'WebP terlalu kecil' }
+            $riffSize = Get-LittleEndianUInt32 -Bytes $Bytes -Offset 4
+            if ($riffSize -ge 0 -and ($riffSize + 8) -ne $Bytes.Length) {
+                return "WebP RIFF size tidak cocok: $($Bytes.Length) != $($riffSize + 8)"
+            }
+        }
+    }
+
+    return ''
+}
+
 function Get-ContentTypeForManifestRow {
     param($Row)
 
@@ -908,8 +976,33 @@ function Get-AssetBytesWithBrowser {
             return JSON.stringify({ ok: false, status: response.status, statusText: response.statusText || '' });
         }
         const contentType = response.headers.get('content-type') || '';
+        const contentLength = response.headers.get('content-length') || '';
         const buffer = await response.arrayBuffer();
+        if (contentLength && Number(contentLength) !== buffer.byteLength) {
+            return JSON.stringify({
+                ok: false,
+                status: response.status,
+                statusText: `content-length mismatch ${buffer.byteLength} != ${contentLength}`
+            });
+        }
         const bytes = new Uint8Array(buffer);
+        if ((contentType || '').toLowerCase().startsWith('image/')) {
+            const blob = new Blob([bytes], { type: contentType || 'application/octet-stream' });
+            const objectUrl = URL.createObjectURL(blob);
+            try {
+                await new Promise((resolve, reject) => {
+                    const img = new Image();
+                    img.onload = () => resolve();
+                    img.onerror = () => reject(new Error('image decode failed'));
+                    img.src = objectUrl;
+                    if (img.decode) {
+                        img.decode().then(resolve).catch(reject);
+                    }
+                });
+            } finally {
+                URL.revokeObjectURL(objectUrl);
+            }
+        }
         let binary = '';
         const chunkSize = 0x8000;
         for (let i = 0; i < bytes.length; i += chunkSize) {
@@ -920,6 +1013,7 @@ function Get-AssetBytesWithBrowser {
             status: response.status,
             finalUrl: location.href,
             contentType,
+            contentLength,
             base64: btoa(binary)
         });
     } catch (error) {
@@ -939,9 +1033,20 @@ function Get-AssetBytesWithBrowser {
             }
 
             $bytes = [Convert]::FromBase64String([string]$data.base64)
+            $expectedLength = -1
+            if ((Test-ObjectProperty -Object $data -Name 'contentLength') -and -not [string]::IsNullOrWhiteSpace([string]$data.contentLength)) {
+                [Int64]::TryParse([string]$data.contentLength, [ref]$expectedLength) | Out-Null
+            }
+
+            $validationError = Test-ImageBytesComplete -Bytes $bytes -ContentType ([string]$data.contentType) -Url $Url -ExpectedLength $expectedLength
+            if (-not [string]::IsNullOrWhiteSpace($validationError)) {
+                throw $validationError
+            }
+
             return [pscustomobject]@{
                 Bytes = $bytes
                 ContentType = [string]$data.contentType
+                ContentLength = $expectedLength
                 FinalUrl = [string]$data.finalUrl
             }
         }
