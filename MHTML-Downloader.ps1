@@ -36,6 +36,7 @@ $script:MainDocumentStatusText = ''
 $script:MainDocumentFailedText = ''
 $script:MainDocumentRequestId = ''
 $script:KnownUrlMapCache = @{}
+$script:ApplicationVersionFallbacks = @('5.7', '5.6', '5.5', '5.4', '5.3')
 
 if ($WorkerMode) {
     if ($WorkerBrowserPort -le 0) {
@@ -286,6 +287,114 @@ function Test-IgnorableNavigationFailure {
     return ([string]$ErrorText) -eq 'net::ERR_ABORTED'
 }
 
+function Set-UrlApplicationVersion {
+    param(
+        [string]$PageUrl,
+        [string]$Version
+    )
+
+    try {
+        $builder = [System.UriBuilder]::new($PageUrl)
+        $queryItems = New-Object System.Collections.ArrayList
+        $query = $builder.Query.TrimStart('?')
+        if (-not [string]::IsNullOrWhiteSpace($query)) {
+            foreach ($part in ($query -split '&')) {
+                if ([string]::IsNullOrWhiteSpace($part)) {
+                    continue
+                }
+
+                $name = ($part -split '=', 2)[0]
+                if ($name -ieq 'application_version') {
+                    continue
+                }
+
+                [void]$queryItems.Add($part)
+            }
+        }
+
+        [void]$queryItems.Add("application_version=$Version")
+        $builder.Query = ($queryItems -join '&')
+        return $builder.Uri.AbsoluteUri
+    }
+    catch {
+        $separator = if ($PageUrl.Contains('?')) { '&' } else { '?' }
+        return "$PageUrl${separator}application_version=$Version"
+    }
+}
+
+function Remove-UrlApplicationVersion {
+    param([string]$PageUrl)
+
+    if ([string]::IsNullOrWhiteSpace($PageUrl)) {
+        return ''
+    }
+
+    try {
+        $builder = [System.UriBuilder]::new($PageUrl)
+        $queryItems = New-Object System.Collections.ArrayList
+        $query = $builder.Query.TrimStart('?')
+        if (-not [string]::IsNullOrWhiteSpace($query)) {
+            foreach ($part in ($query -split '&')) {
+                if ([string]::IsNullOrWhiteSpace($part)) {
+                    continue
+                }
+
+                $name = ($part -split '=', 2)[0]
+                if ($name -ieq 'application_version') {
+                    continue
+                }
+
+                [void]$queryItems.Add($part)
+            }
+        }
+
+        $builder.Query = ($queryItems -join '&')
+        return $builder.Uri.AbsoluteUri
+    }
+    catch {
+        return ([string]$PageUrl -replace '([?&])application_version=[^&]*&?', '$1' -replace '[?&]$', '')
+    }
+}
+
+function Get-PageUrlCandidates {
+    param([string]$PageUrl)
+
+    $seen = @{}
+    $candidates = New-Object System.Collections.ArrayList
+    foreach ($candidate in @($PageUrl) + @($script:ApplicationVersionFallbacks | ForEach-Object { Set-UrlApplicationVersion -PageUrl $PageUrl -Version $_ })) {
+        if ([string]::IsNullOrWhiteSpace($candidate)) {
+            continue
+        }
+
+        $key = $candidate.ToLowerInvariant()
+        if ($seen.ContainsKey($key)) {
+            continue
+        }
+
+        $seen[$key] = $true
+        [void]$candidates.Add($candidate)
+    }
+
+    return @($candidates)
+}
+
+function Test-UnrealVersionDocumentationRootUrl {
+    param([string]$PageUrl)
+
+    if ([string]::IsNullOrWhiteSpace($PageUrl)) {
+        return $false
+    }
+
+    try {
+        $uri = [Uri]$PageUrl
+        $path = $uri.AbsolutePath.TrimEnd('/').ToLowerInvariant()
+        return $path -match '/documentation/unreal-engine/unreal-engine-5-\d+-documentation$'
+    }
+    catch {
+        return $false
+    }
+}
+
 function Get-MhtmlSnapshotExpression {
     return @'
 (() => {
@@ -433,13 +542,17 @@ function Assert-FinalUrlDoesNotPointToKnownDifferentPage {
             return
         }
 
+        if (Test-UnrealVersionDocumentationRootUrl -PageUrl $finalUrl) {
+            throw "Final URL menuju root dokumentasi versi: task '$originalUrl' selesai di '$finalUrl'"
+        }
+
         $knownUrlMap = Get-KnownUrlMapForSourceXml -SourceXml ([string]$Task.SourceXml)
         if ($knownUrlMap.ContainsKey($finalKey)) {
             throw "Final URL salah: task '$originalUrl' selesai di URL lain yang ada di list '$finalUrl'"
         }
     }
     catch {
-        if ($_.Exception.Message -like 'Final URL salah:*') {
+        if ($_.Exception.Message -like 'Final URL salah:*' -or $_.Exception.Message -like 'Final URL menuju root dokumentasi versi:*') {
             throw
         }
     }
@@ -986,20 +1099,30 @@ function Save-MhtmlPageInSession {
     $folder = [System.IO.Path]::GetDirectoryName($filePath)
     $saved = $false
     $data = $null
+    $pageUrlCandidates = @(Get-PageUrlCandidates -PageUrl $pageUrl)
+    $candidateIndex = 0
+    $attempt = 0
+    $lastErrorMessage = ''
 
     Write-Host ""
     Write-Host "Buka Edge: $pageUrl"
-    for ($attempt = 1; $attempt -le $MaxLoadAttempts; $attempt++) {
+    while ($attempt -lt $MaxLoadAttempts -and $candidateIndex -lt $pageUrlCandidates.Count) {
+        $attempt++
+        $currentPageUrl = [string]$pageUrlCandidates[$candidateIndex]
         Reset-NetworkState
         if ($attempt -gt 1) {
-            Write-Warning "Navigasi ulang ke URL error: $pageUrl"
+            Write-Warning "Navigasi ulang ke URL error: $currentPageUrl"
         }
 
-        $navigateResponse = Invoke-CdpCommand -Socket $Socket -Method 'Page.navigate' -Params @{ url = $pageUrl }
+        if ($currentPageUrl -ne $pageUrl) {
+            Write-Host "Coba versi dokumentasi: $currentPageUrl"
+        }
+
+        $navigateResponse = Invoke-CdpCommand -Socket $Socket -Method 'Page.navigate' -Params @{ url = $currentPageUrl }
         Update-NetworkStateFromNavigateResult -Response $navigateResponse
 
         try {
-            $data = Wait-MhtmlPageReady -Socket $Socket -PageUrl $pageUrl -Attempt $attempt
+            $data = Wait-MhtmlPageReady -Socket $Socket -PageUrl $currentPageUrl -Attempt $attempt
             Assert-PageLoadOk -Data $data
             Assert-FinalUrlDoesNotPointToKnownDifferentPage -Task $Task -Data $data
 
@@ -1017,11 +1140,28 @@ function Save-MhtmlPageInSession {
             break
         }
         catch {
-            if ($attempt -ge $MaxLoadAttempts) {
+            $lastErrorMessage = $_.Exception.Message
+            if ($lastErrorMessage -like 'Final URL menuju root dokumentasi versi:*') {
+                Write-Warning $lastErrorMessage
+                $candidateIndex++
+                if ($candidateIndex -lt $pageUrlCandidates.Count) {
+                    Write-Warning "Coba fallback application_version berikutnya: $($pageUrlCandidates[$candidateIndex])"
+                    continue
+                }
+            }
+
+            if ($attempt -ge $MaxLoadAttempts -or $candidateIndex -ge $pageUrlCandidates.Count) {
                 throw
             }
-            Write-Warning $_.Exception.Message
+            Write-Warning $lastErrorMessage
         }
+    }
+
+    if (-not $saved) {
+        if ([string]::IsNullOrWhiteSpace($lastErrorMessage)) {
+            $lastErrorMessage = 'Tidak ada kandidat URL yang berhasil.'
+        }
+        throw "Gagal menyimpan MHTML: $pageUrl - $lastErrorMessage"
     }
 
     $title = if ($data -and -not [string]::IsNullOrWhiteSpace([string]$data.h1)) { [string]$data.h1 } else { [string]$Task.Title }
@@ -1222,10 +1362,11 @@ function Add-DownloadedResultToList {
         return
     }
 
+    $cleanOriginalUrl = Remove-UrlApplicationVersion ([string]$Result.OriginalUrl)
     $urlKey = ''
-    if (-not [string]::IsNullOrWhiteSpace([string]$Result.OriginalUrl)) {
+    if (-not [string]::IsNullOrWhiteSpace($cleanOriginalUrl)) {
         try {
-            $urlKey = Get-CanonicalUrlKey ([string]$Result.OriginalUrl)
+            $urlKey = Get-CanonicalUrlKey $cleanOriginalUrl
         }
         catch {
         }
@@ -1238,7 +1379,7 @@ function Add-DownloadedResultToList {
     $listPath = Get-IndexPathForXml -SourceXml $Result.SourceXml -Kind 'list'
     Ensure-ListFile -Path $listPath
     Add-Content -LiteralPath $listPath -Value (
-        "$(ConvertTo-TsvValue $Result.OriginalUrl)`t" +
+        "$(ConvertTo-TsvValue $cleanOriginalUrl)`t" +
         "$(ConvertTo-TsvValue $Result.RelativeFile)`t" +
         "$(ConvertTo-TsvValue $Result.Title)`t" +
         "$(ConvertTo-TsvValue ([string]$Result.ChildCount))`t" +
