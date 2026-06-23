@@ -1123,16 +1123,12 @@ function Get-DownloadedPageMap {
     }
 
     foreach ($row in $rows) {
-        $filePath = ConvertTo-LocalPathFromListValue $row.file
-        if ([string]::IsNullOrWhiteSpace($filePath) -or -not (Test-Path -LiteralPath $filePath)) {
-            continue
-        }
-
         if ([string]::IsNullOrWhiteSpace([string]$row.url)) {
             continue
         }
 
         try {
+            $filePath = ConvertTo-LocalPathFromListValue $row.file
             $map[(Get-CanonicalUrlKey ([string]$row.url))] = [pscustomobject]@{
                 Url = [string]$row.url
                 FilePath = $filePath
