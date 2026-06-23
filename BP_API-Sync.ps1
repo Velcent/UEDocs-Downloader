@@ -1,7 +1,16 @@
 [CmdletBinding()]
-param()
+param(
+    [Parameter(Position = 0)]
+    [ValidateSet('All', 'Missing', 'Extra', 'Kurang', 'Lebih')]
+    [string]$Show = 'All'
+)
 
 $ErrorActionPreference = 'Stop'
+
+switch ($Show) {
+    'Kurang' { $Show = 'Missing' }
+    'Lebih' { $Show = 'Extra' }
+}
 
 $BaseDir = (Resolve-Path -LiteralPath $PSScriptRoot).Path.TrimEnd('\') + '\'
 $ListPath = Join-Path $BaseDir 'mhtml\bp_api-list.tsv'
@@ -58,6 +67,24 @@ function Add-Path {
     }
 }
 
+function Write-PathSection {
+    param(
+        [string]$Title,
+        [object[]]$Keys,
+        [hashtable]$Map,
+        [string]$Prefix
+    )
+
+    Write-Host ($Title + ': ' + $Keys.Count)
+    if ($Keys.Count -eq 0) {
+        Write-Host '  - tidak ada'
+    }
+    else {
+        $Keys | ForEach-Object { Write-Host ('  ' + $Prefix + ' ' + $Map[$_]) }
+    }
+    Write-Host ''
+}
+
 $expected = @{}
 $duplicates = @{}
 Import-Csv -LiteralPath $ListPath -Delimiter "`t" | ForEach-Object {
@@ -79,34 +106,24 @@ Write-Host ('Folder      : ' + $FolderPath)
 Write-Host ('Daftar TSV  : ' + $expected.Count)
 Write-Host ('File asli   : ' + $actual.Count)
 Write-Host ('Cocok       : ' + ($expected.Count - $missing.Count))
+Write-Host ('Kekurangan  : ' + $missing.Count)
+Write-Host ('Kelebihan   : ' + $extra.Count)
+Write-Host ('Duplikat    : ' + $duplicates.Count)
+Write-Host ('Output      : ' + $Show)
 Write-Host ''
 
-Write-Host ('Kekurangan di folder (ada di TSV, tidak ada di file asli): ' + $missing.Count)
-if ($missing.Count -eq 0) {
-    Write-Host '  - tidak ada'
+if ($Show -eq 'All' -or $Show -eq 'Missing') {
+    Write-PathSection 'Kekurangan di folder (ada di TSV, tidak ada di file asli)' $missing $expected '-'
 }
-else {
-    $missing | ForEach-Object { Write-Host ('  - ' + $expected[$_]) }
-}
-Write-Host ''
 
-Write-Host ('Kelebihan di folder (ada di file asli, tidak ada di TSV): ' + $extra.Count)
-if ($extra.Count -eq 0) {
-    Write-Host '  - tidak ada'
+if ($Show -eq 'All' -or $Show -eq 'Extra') {
+    Write-PathSection 'Kelebihan di folder (ada di file asli, tidak ada di TSV)' $extra $actual '+'
 }
-else {
-    $extra | ForEach-Object { Write-Host ('  + ' + $actual[$_]) }
-}
-Write-Host ''
 
-Write-Host ('Duplikat path di TSV: ' + $duplicates.Count)
-if ($duplicates.Count -eq 0) {
-    Write-Host '  - tidak ada'
+if ($Show -eq 'All') {
+    $duplicateKeys = @($duplicates.Keys | Sort-Object)
+    Write-PathSection 'Duplikat path di TSV' $duplicateKeys $duplicates '!'
 }
-else {
-    $duplicates.Keys | Sort-Object | ForEach-Object { Write-Host ('  ! ' + $duplicates[$_]) }
-}
-Write-Host ''
 
 if ($missing.Count -eq 0 -and $extra.Count -eq 0 -and $duplicates.Count -eq 0) {
     Write-Host 'Kesimpulan: SAMA'
