@@ -430,6 +430,10 @@ function Get-ContentTypeForManifestRow {
         return 'application/octet-stream'
     }
 
+    if ((Test-ObjectProperty -Object $Row -Name 'type') -and -not [string]::IsNullOrWhiteSpace([string]$Row.type)) {
+        return [string]$Row.type
+    }
+
     try {
         $fullPath = ConvertTo-FullPath -RelativePath ([string]$Row.path)
         if (Test-Path -LiteralPath $fullPath) {
@@ -1044,6 +1048,7 @@ function Import-ExistingUrlMap {
             $map[$row.link] = [pscustomobject]@{
                 link = $row.link
                 path = $row.path
+                type = if (Test-ObjectProperty -Object $row -Name 'type') { $row.type } else { '' }
                 encoding = $row.encoding
                 sha256 = $row.sha256
                 size_bytes = $row.size_bytes
@@ -1135,6 +1140,13 @@ foreach ($file in $files) {
         if (-not $transferEncoding) {
             $transferEncoding = '7bit'
         }
+        $partContentType = Get-UnfoldedHeaderValue -Headers $part.Headers -Name 'Content-Type'
+        if ($partContentType) {
+            $partContentType = (($partContentType -split ';', 2)[0]).Trim()
+        }
+        if (-not $partContentType) {
+            $partContentType = 'application/octet-stream'
+        }
 
         if ([string]::IsNullOrEmpty($part.Body)) {
             Write-Warning "Body kosong dan URL belum ada di manifest, skip: $location"
@@ -1173,6 +1185,7 @@ foreach ($file in $files) {
         $newRow = [pscustomobject]@{
             link = $location
             path = $relativePath
+            type = $partContentType
             encoding = $transferEncoding
             sha256 = $sha256
             size_bytes = $size
@@ -1237,6 +1250,7 @@ foreach ($file in $files) {
                 $imgRow = [pscustomobject]@{
                     link = $imgUrl
                     path = $relativePath
+                    type = $contentType
                     encoding = 'base64'
                     sha256 = $sha256
                     size_bytes = $size
@@ -1278,11 +1292,19 @@ foreach ($file in $files) {
 Close-AssetDownloadSession -Session $assetSession
 
 $tsvLines = New-Object System.Collections.Generic.List[string]
-$tsvLines.Add("link`tpath`tencoding`tsha256`tsize_bytes") | Out-Null
+$tsvLines.Add("link`tpath`ttype`tencoding`tsha256`tsize_bytes") | Out-Null
 foreach ($row in ($rows | Sort-Object link, path)) {
+    $rowType = if ((Test-ObjectProperty -Object $row -Name 'type') -and -not [string]::IsNullOrWhiteSpace([string]$row.type)) {
+        [string]$row.type
+    }
+    else {
+        Get-ContentTypeForManifestRow -Row $row
+    }
+
     $tsvLines.Add((
         (ConvertTo-TsvValue $row.link),
         (ConvertTo-TsvValue $row.path),
+        (ConvertTo-TsvValue $rowType),
         (ConvertTo-TsvValue $row.encoding),
         (ConvertTo-TsvValue $row.sha256),
         (ConvertTo-TsvValue ([string]$row.size_bytes))
