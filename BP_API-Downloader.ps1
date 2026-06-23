@@ -29,6 +29,7 @@ $MinimumMhtmlBytes = 650KB
 $MhtmlRoot = Join-Path $PSScriptRoot 'mhtml'
 $OutputRoot = [System.IO.Path]::GetFullPath($OutputRoot)
 $ListPath = Join-Path $MhtmlRoot 'bp_api-list.tsv'
+$ListBackupPath = Join-Path $MhtmlRoot 'bp_api-list.bak'
 $LinkPath = Join-Path $MhtmlRoot 'bp_api-link.tsv'
 $LinkBackupPath = Join-Path $MhtmlRoot 'bp_api-link.bak'
 $script:BrowserPort = if ($WorkerMode) { $WorkerBrowserPort } else { $null }
@@ -38,6 +39,21 @@ $script:MainDocumentStatus = $null
 $script:MainDocumentStatusText = ''
 $script:MainDocumentFailedText = ''
 $script:MainDocumentRequestId = ''
+
+function Update-ListBackup {
+    if (-not (Test-Path -LiteralPath $ListPath)) {
+        return
+    }
+
+    try {
+        $tempPath = "$ListBackupPath.tmp"
+        Copy-Item -LiteralPath $ListPath -Destination $tempPath -Force -ErrorAction Stop
+        Move-Item -LiteralPath $tempPath -Destination $ListBackupPath -Force -ErrorAction Stop
+    }
+    catch {
+        Write-Warning "Gagal membuat backup list: $ListBackupPath - $($_.Exception.Message)"
+    }
+}
 
 if ($WorkerMode) {
     if ($WorkerBrowserPort -le 0) {
@@ -61,6 +77,7 @@ else {
     New-Item -ItemType Directory -Force -Path $MhtmlRoot, $OutputRoot | Out-Null
     if (-not (Test-Path -LiteralPath $ListPath) -or (Get-Item -LiteralPath $ListPath).Length -eq 0) {
         Set-Content -LiteralPath $ListPath -Value "url`tfile`ttitle`tchild_count`tparent_url" -Encoding UTF8
+        Update-ListBackup
     }
     else {
         Write-Host "Resume dari list: $ListPath"
@@ -1481,6 +1498,7 @@ function Add-DownloadedResultToList {
 
     $relativeFile = if ($Result.RelativeFile) { $Result.RelativeFile } else { ConvertTo-RelativeRootPath $Result.FilePath }
     Add-Content -LiteralPath $ListPath -Value "$($Result.OriginalUrl)`t$relativeFile`t$($Result.Title)`t$(@($Result.Actions).Count)`t$($Result.ParentUrl)" -Encoding UTF8
+    Update-ListBackup
 
     if (-not $downloadedMap.ContainsKey($key)) {
         $downloadedMap[$key] = [pscustomobject]@{
