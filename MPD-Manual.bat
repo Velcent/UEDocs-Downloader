@@ -1,8 +1,8 @@
 @echo off
 setlocal EnableExtensions EnableDelayedExpansion
 
-set "MPD_DIR=%~dp0mpd"
-set "MP4_DIR=%~dp0mp4"
+set "MPD_DIR=%~dp0video\mpd"
+set "MP4_DIR=%~dp0video\mp4"
 
 if not exist "%MP4_DIR%" mkdir "%MP4_DIR%"
 

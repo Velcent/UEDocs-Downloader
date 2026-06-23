@@ -1,6 +1,6 @@
 param(
     [string]$Root = $PSScriptRoot,
-    [string]$ListFile = 'mpd-list.txt'
+    [string]$ListFile = 'video\mpd-list.tsv'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -102,7 +102,7 @@ function Get-VideoPlayerHtml {
         [string]$PosterUrl
     )
 
-    $mp4Link = "https://media.local/mp4/$VideoId.mp4"
+    $mp4Link = "https://media.local/video/mp4/$VideoId.mp4"
     $background = '#000'
 
     if (-not [string]::IsNullOrWhiteSpace($PosterUrl)) {
@@ -302,7 +302,7 @@ foreach ($group in $groups) {
         if ($result.Patched) {
             $patchedInFile++
             $totalPatched++
-            Write-Host "Patched embed: $videoId -> mp4/$videoId.mp4"
+            Write-Host "Patched embed: $videoId -> video/mp4/$videoId.mp4"
         }
     }
 

@@ -9,12 +9,13 @@ $ProgressPreference = 'SilentlyContinue'
 
 $Root = (Resolve-Path -LiteralPath $Root).Path
 $ParallelDownloads = [Math]::Max(1, $ParallelDownloads)
-$HtmlDir = Join-Path $Root 'html'
-$MpdDir = Join-Path $Root 'mpd'
-$Mp4Dir = Join-Path $Root 'mp4'
-$ListPath = Join-Path $Root 'mpd-list.txt'
+$VideoDir = Join-Path $Root 'video'
+$HtmlDir = Join-Path $VideoDir 'embed'
+$MpdDir = Join-Path $VideoDir 'mpd'
+$Mp4Dir = Join-Path $VideoDir 'mp4'
+$ListPath = Join-Path $VideoDir 'mpd-list.tsv'
 
-New-Item -ItemType Directory -Force -Path $HtmlDir, $MpdDir, $Mp4Dir | Out-Null
+New-Item -ItemType Directory -Force -Path $VideoDir, $HtmlDir, $MpdDir, $Mp4Dir | Out-Null
 
 $script:BrowserPort = $null
 $script:BrowserProfileDir = Join-Path $HtmlDir '.browser-profile'
@@ -663,7 +664,7 @@ $downloadTasks = @()
 $listEntries = @()
 $queuedMp4Paths = @{}
 
-$excludedScanDirs = @($HtmlDir, $MpdDir, $Mp4Dir) | ForEach-Object {
+$excludedScanDirs = @($VideoDir) | ForEach-Object {
     (Resolve-Path -LiteralPath $_).Path.TrimEnd('\') + '\'
 }
 
