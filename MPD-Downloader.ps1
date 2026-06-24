@@ -1,7 +1,7 @@
 param(
     [string]$Root = $PSScriptRoot,
     [int]$BrowserPollSeconds = 0.5,
-    [int]$ParallelDownloads = 10
+    [int]$ParallelDownloads = 6
 )
 
 $ErrorActionPreference = 'Stop'
@@ -78,6 +78,59 @@ function Get-EmbedUrlsFromMhtml {
         if (-not $seen.ContainsKey($url)) {
             $seen[$url] = $true
             $url
+        }
+    }
+}
+
+function Get-YoutubeVideoIdFromUrl {
+    param([string]$Url)
+
+    if ([string]::IsNullOrWhiteSpace($Url)) {
+        return $null
+    }
+
+    $decoded = [System.Net.WebUtility]::HtmlDecode($Url)
+    $patterns = @(
+        '(?i)(?:youtube(?:-nocookie)?\.com/(?:embed|shorts|live)/|youtu\.be/)(?<id>[A-Za-z0-9_-]{11})',
+        '(?i)youtube(?:-nocookie)?\.com/.*?[?&]v=(?<id>[A-Za-z0-9_-]{11})'
+    )
+
+    foreach ($pattern in $patterns) {
+        $match = [regex]::Match($decoded, $pattern)
+        if ($match.Success) {
+            return $match.Groups['id'].Value
+        }
+    }
+
+    return $null
+}
+
+function Get-YoutubeEmbedUrlsFromMhtml {
+    param([string]$MhtmlText)
+
+    $searchText = [System.Net.WebUtility]::HtmlDecode((Convert-QuotedPrintableText $MhtmlText)).Replace('\/', '/')
+    $patterns = @(
+        'https?://(?:www\.)?youtube(?:-nocookie)?\.com/embed/[A-Za-z0-9_-]{11}[^"''<>\s\\)]*',
+        'https?://(?:www\.)?youtube(?:-nocookie)?\.com/watch\?[^"''<>\s\\)]*?v=[A-Za-z0-9_-]{11}[^"''<>\s\\)]*',
+        'https?://(?:www\.)?youtube(?:-nocookie)?\.com/shorts/[A-Za-z0-9_-]{11}[^"''<>\s\\)]*',
+        'https?://(?:www\.)?youtube(?:-nocookie)?\.com/live/[A-Za-z0-9_-]{11}[^"''<>\s\\)]*',
+        'https?://youtu\.be/[A-Za-z0-9_-]{11}[^"''<>\s\\)]*'
+    )
+
+    $seen = @{}
+    foreach ($pattern in $patterns) {
+        foreach ($match in [regex]::Matches($searchText, $pattern, 'IgnoreCase')) {
+            $url = $match.Value.TrimEnd('&', '?')
+            $videoId = Get-YoutubeVideoIdFromUrl $url
+            if (-not $videoId) {
+                continue
+            }
+
+            $canonicalUrl = "https://www.youtube.com/watch?v=$videoId"
+            if (-not $seen.ContainsKey($canonicalUrl)) {
+                $seen[$canonicalUrl] = $true
+                $canonicalUrl
+            }
         }
     }
 }
@@ -567,21 +620,31 @@ function Add-MpdListEntry {
 function Start-DownloadJob {
     param(
         [string]$YtDlpPath,
+        [string]$Kind,
         [string]$MpdPath,
+        [string]$SourceUrl,
         [string]$Mp4Path
     )
 
-    Start-Job -ArgumentList $YtDlpPath, $MpdPath, $Mp4Path -ScriptBlock {
+    Start-Job -ArgumentList $YtDlpPath, $Kind, $MpdPath, $SourceUrl, $Mp4Path -ScriptBlock {
         param(
             [string]$YtDlpPath,
+            [string]$Kind,
             [string]$MpdPath,
+            [string]$SourceUrl,
             [string]$Mp4Path
         )
 
         $outputTemplate = Join-Path (Split-Path -Parent $Mp4Path) "$([System.IO.Path]::GetFileNameWithoutExtension($Mp4Path)).%(ext)s"
-        $mpdUrl = ([System.Uri](Resolve-Path -LiteralPath $MpdPath).Path).AbsoluteUri
 
-        & $YtDlpPath --enable-file-urls $mpdUrl -f 'bestvideo[height<=720]+bestaudio/best[height<=720]' --merge-output-format mp4 -o $outputTemplate
+        if ($Kind -eq 'youtube') {
+            & $YtDlpPath $SourceUrl -f 'bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=720]+bestaudio/best[height<=720]' --merge-output-format mp4 -o $outputTemplate
+        }
+        else {
+            $mpdUrl = ([System.Uri](Resolve-Path -LiteralPath $MpdPath).Path).AbsoluteUri
+            & $YtDlpPath --enable-file-urls $mpdUrl -f 'bestvideo[height<=720]+bestaudio/best[height<=720]' --merge-output-format mp4 -o $outputTemplate
+        }
+
         if ($LASTEXITCODE -ne 0) {
             throw "yt-dlp failed with exit code $LASTEXITCODE for $Mp4Path"
         }
@@ -620,13 +683,13 @@ function Invoke-ParallelDownloads {
                 continue
             }
 
-            if (-not (Test-Path -LiteralPath $task.MpdPath)) {
+            if ($task.Kind -ne 'youtube' -and -not (Test-Path -LiteralPath $task.MpdPath)) {
                 Write-Warning "MP4 skipped because $(Split-Path -Leaf $task.MpdPath) does not exist."
                 continue
             }
 
             Write-Host "Starting MP4: $(Split-Path -Leaf $task.Mp4Path)"
-            $job = Start-DownloadJob -YtDlpPath $ytDlp.Source -MpdPath $task.MpdPath -Mp4Path $task.Mp4Path
+            $job = Start-DownloadJob -YtDlpPath $ytDlp.Source -Kind $task.Kind -MpdPath $task.MpdPath -SourceUrl $task.SourceUrl -Mp4Path $task.Mp4Path
             $running += [pscustomobject]@{
                 Job = $job
                 Task = $task
@@ -682,9 +745,38 @@ foreach ($mhtmlFile in $mhtmlFiles) {
     Write-Host "Scanning MHTML: $($mhtmlFile.Name)"
     $mhtmlText = Get-Content -LiteralPath $mhtmlFile.FullName -Raw
     $embedUrls = @(Get-EmbedUrlsFromMhtml $mhtmlText)
+    $youtubeUrls = @(Get-YoutubeEmbedUrlsFromMhtml $mhtmlText)
+
+    if (-not $embedUrls -and -not $youtubeUrls) {
+        Write-Host 'No Epic or YouTube embed URLs found.'
+        continue
+    }
+
+    foreach ($youtubeUrl in $youtubeUrls) {
+        $youtubeId = Get-YoutubeVideoIdFromUrl $youtubeUrl
+        if (-not $youtubeId) {
+            continue
+        }
+
+        $mp4Path = Join-Path $Mp4Dir "$youtubeId.mp4"
+
+        Write-Host ""
+        Write-Host "YouTube: $youtubeId"
+
+        $mp4Key = $mp4Path.ToLowerInvariant()
+        if (-not $queuedMp4Paths.ContainsKey($mp4Key)) {
+            $queuedMp4Paths[$mp4Key] = $true
+            $downloadTasks += [pscustomobject]@{
+                Kind = 'youtube'
+                MpdPath = $null
+                SourceUrl = $youtubeUrl
+                Mp4Path = $mp4Path
+            }
+        }
+    }
 
     if (-not $embedUrls) {
-        Write-Host 'No Epic embed URLs found.'
+        Close-OpenEmbedTabs
         continue
     }
 
@@ -731,7 +823,9 @@ foreach ($mhtmlFile in $mhtmlFiles) {
             if (-not $queuedMp4Paths.ContainsKey($mp4Key)) {
                 $queuedMp4Paths[$mp4Key] = $true
                 $downloadTasks += [pscustomobject]@{
+                    Kind = 'mpd'
                     MpdPath = $mpdPath
+                    SourceUrl = $null
                     Mp4Path = $mp4Path
                 }
             }
@@ -755,3 +849,4 @@ foreach ($entry in $listEntries) {
 
 Write-Host ""
 Write-Host 'Done.'
+pause
