@@ -1394,6 +1394,56 @@ function Add-DownloadedResultToList {
     $ResumeMap.Count = $ResumeMap.UrlMap.Count
 }
 
+function Import-LocalDownloadedFiles {
+    param(
+        [object[]]$Tasks,
+        $ResumeMap
+    )
+
+    $imported = 0
+    foreach ($task in @($Tasks)) {
+        if (-not $task -or [string]::IsNullOrWhiteSpace([string]$task.Url) -or [string]::IsNullOrWhiteSpace([string]$task.FilePath)) {
+            continue
+        }
+
+        $urlKey = ''
+        try {
+            $urlKey = Get-CanonicalUrlKey ([string]$task.Url)
+        }
+        catch {
+        }
+
+        if ($urlKey -and $ResumeMap.UrlMap.ContainsKey($urlKey)) {
+            continue
+        }
+
+        $filePath = [System.IO.Path]::GetFullPath([string]$task.FilePath)
+        if (-not (Test-Path -LiteralPath $filePath -PathType Leaf)) {
+            continue
+        }
+
+        $relativeFile = ConvertTo-RelativeRootPath $filePath
+        $result = [pscustomobject]@{
+            OriginalUrl = [string]$task.Url
+            FinalUrl = [string]$task.Url
+            Title = [string]$task.Title
+            FilePath = $filePath
+            RelativeFile = $relativeFile
+            Saved = $true
+            ChildCount = [int]$task.ChildCount
+            ParentUrl = [string]$task.ParentUrl
+            SourceXml = [string]$task.SourceXml
+        }
+
+        Add-DownloadedResultToList -Result $result -ResumeMap $ResumeMap
+        $imported++
+    }
+
+    if ($imported -gt 0) {
+        Write-Host "Adopsi file MHTML lokal ke list: $imported file"
+    }
+}
+
 function Get-NextTask {
     param(
         [System.Collections.ArrayList]$Queue,
@@ -1640,6 +1690,15 @@ foreach ($linkPath in $linkPaths) {
 }
 Write-Host "Total link dari XML: $($allTasks.Count)"
 
+$seenFiles = @{}
+$downloadedResumeMap = Get-DownloadedResumeMap -Paths $listPaths
+$downloaded = 0
+$started = 0
+
+if ($downloadedResumeMap.Count -gt 0) {
+    Write-Host "Index resume URL terbaca: $($downloadedResumeMap.Count) URL dari $($listPaths.Count) list"
+}
+
 if ($DryRun) {
     Write-Host "DryRun aktif: tidak ada halaman yang didownload."
     if (-not $NoPause) {
@@ -1648,18 +1707,11 @@ if ($DryRun) {
     return
 }
 
+Import-LocalDownloadedFiles -Tasks $allTasks -ResumeMap $downloadedResumeMap
+
 $stack = New-Object System.Collections.ArrayList
 for ($taskIndex = $allTasks.Count - 1; $taskIndex -ge 0; $taskIndex--) {
     [void]$stack.Add($allTasks[$taskIndex])
-}
-
-$seenFiles = @{}
-$downloadedResumeMap = Get-DownloadedResumeMap -Paths $listPaths
-$downloaded = 0
-$started = 0
-
-if ($downloadedResumeMap.Count -gt 0) {
-    Write-Host "Index resume URL terbaca: $($downloadedResumeMap.Count) URL dari $($listPaths.Count) list"
 }
 
 if ($ParallelPages -le 1) {
