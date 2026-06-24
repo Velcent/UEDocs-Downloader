@@ -36,7 +36,8 @@ $script:MainDocumentStatusText = ''
 $script:MainDocumentFailedText = ''
 $script:MainDocumentRequestId = ''
 $script:KnownUrlMapCache = @{}
-$script:ApplicationVersionFallbacks = @('5.7', '5.6', '5.5', '5.4', '5.3')
+$script:UnrealApplicationVersionFallbacks = @('5.7', '5.6', '5.5', '5.4', '5.3')
+$script:MetaHumanApplicationVersionFallbacks = @('5.7', '5.6', '5.0-5.5')
 
 if ($WorkerMode) {
     if ($WorkerBrowserPort -le 0) {
@@ -359,9 +360,16 @@ function Remove-UrlApplicationVersion {
 function Get-PageUrlCandidates {
     param([string]$PageUrl)
 
+    $fallbackVersions = if ($PageUrl -match '(?i)://[^/]+/documentation/metahuman(?:/|$)') {
+        @($script:MetaHumanApplicationVersionFallbacks)
+    }
+    else {
+        @($script:UnrealApplicationVersionFallbacks)
+    }
+
     $seen = @{}
     $candidates = New-Object System.Collections.ArrayList
-    foreach ($candidate in @($PageUrl) + @($script:ApplicationVersionFallbacks | ForEach-Object { Set-UrlApplicationVersion -PageUrl $PageUrl -Version $_ })) {
+    foreach ($candidate in @($PageUrl) + @($fallbackVersions | ForEach-Object { Set-UrlApplicationVersion -PageUrl $PageUrl -Version $_ })) {
         if ([string]::IsNullOrWhiteSpace($candidate)) {
             continue
         }
@@ -378,7 +386,7 @@ function Get-PageUrlCandidates {
     return @($candidates)
 }
 
-function Test-UnrealVersionDocumentationRootUrl {
+function Test-VersionDocumentationRootUrl {
     param([string]$PageUrl)
 
     if ([string]::IsNullOrWhiteSpace($PageUrl)) {
@@ -388,7 +396,10 @@ function Test-UnrealVersionDocumentationRootUrl {
     try {
         $uri = [Uri]$PageUrl
         $path = $uri.AbsolutePath.TrimEnd('/').ToLowerInvariant()
-        return $path -match '/documentation/unreal-engine/unreal-engine-5-\d+-documentation$'
+        return (
+            $path -match '/documentation/unreal-engine/unreal-engine-5-\d+-documentation$' -or
+            $path -eq '/documentation/metahuman/metahuman-documentation'
+        )
     }
     catch {
         return $false
@@ -542,7 +553,7 @@ function Assert-FinalUrlDoesNotPointToKnownDifferentPage {
             return
         }
 
-        if (Test-UnrealVersionDocumentationRootUrl -PageUrl $finalUrl) {
+        if (Test-VersionDocumentationRootUrl -PageUrl $finalUrl) {
             throw "Final URL menuju root dokumentasi versi: task '$originalUrl' selesai di '$finalUrl'"
         }
 
