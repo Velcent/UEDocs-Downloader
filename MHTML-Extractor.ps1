@@ -158,6 +158,26 @@ function Read-MimeHeaders {
     return $headers
 }
 
+function Update-OrAddHeader {
+    param(
+        [string]$HeaderText,
+        [string]$Name,
+        [string]$Value
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Value)) {
+        return $HeaderText
+    }
+
+    $pattern = '(?im)^' + [regex]::Escape($Name) + ':\s*[^\r\n]*(?:\r?\n[ \t][^\r\n]*)*'
+    $replacement = "${Name}: $Value"
+    if ([regex]::IsMatch($HeaderText, $pattern)) {
+        return [regex]::Replace($HeaderText, $pattern, $replacement, 1)
+    }
+
+    return $HeaderText.TrimEnd("`r", "`n") + "`r`n" + $replacement
+}
+
 function Get-MimeBoundary {
     param([string]$ContentType)
 
@@ -297,7 +317,17 @@ function Clear-MhtmlExternalPartBodies {
         )
 
         if ($canClear) {
-            $builder.Append($headerText) | Out-Null
+            $row = $UrlRows[$location]
+            $normalizedEncoding = ''
+            if ($row -and (Test-ObjectProperty -Object $row -Name 'encoding')) {
+                $normalizedEncoding = Normalize-StoredEncoding -Encoding ([string]$row.encoding)
+            }
+            if (-not $normalizedEncoding) {
+                $normalizedEncoding = '8bit'
+            }
+
+            $updatedHeaderText = Update-OrAddHeader -HeaderText $headerText -Name 'Content-Transfer-Encoding' -Value $normalizedEncoding
+            $builder.Append($updatedHeaderText) | Out-Null
             $builder.Append($separator.Value) | Out-Null
             $cleared++
         }
