@@ -1751,8 +1751,27 @@ foreach ($file in $files) {
             $validationError = Test-ImageBytesComplete -Bytes $bytes -ContentType $partContentType -Url $location
             if (-not [string]::IsNullOrWhiteSpace($validationError)) {
                 $stats.InvalidLocalImageParts++
-                Write-Warning "Gambar multipart corrupt setelah decode, skip: $location - $validationError"
-                continue
+                Write-Warning "Gambar multipart corrupt setelah decode, download ulang: $location - $validationError"
+                try {
+                    $assetSocket = Get-AssetSessionSocket -Session $assetSession
+                    if (-not $assetSocket -or $assetSocket.State -ne [System.Net.WebSockets.WebSocketState]::Open) {
+                        if ($assetSession) {
+                            Close-AssetDownloadSession -Session $assetSession
+                        }
+                        $assetSession = New-AssetDownloadSession
+                    }
+
+                    $download = Get-AssetBytesWithBrowser -Session $assetSession -Url $location -Referrer $snapshotLocation
+                    $bytes = [byte[]]$download.Bytes
+                    $partContentType = Get-ContentTypeFromBytesOrUrl -Bytes $bytes -Url $location -ResponseContentType ([string]$download.ContentType)
+                    $storedEncoding = Get-PreferredManifestEncoding -ContentType $partContentType
+                    $stats.DownloadedImgUrls++
+                }
+                catch {
+                    $stats.FailedImgUrls++
+                    Write-Warning "Gagal download ulang gambar multipart corrupt: $location - $($_.Exception.Message)"
+                    continue
+                }
             }
         }
 
