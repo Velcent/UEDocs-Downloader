@@ -388,60 +388,169 @@ function Write-MimeBody {
     }
 }
 
-function Write-RestoredMhtml {
+function Write-BodyFromAssetFile {
     param(
-        [string]$Text,
-        [string]$Boundary,
+        [System.IO.StreamWriter]$Writer,
+        [string]$AssetPath,
+        [string]$Encoding
+    )
+
+    $bytes = [System.IO.File]::ReadAllBytes($AssetPath)
+    if ($Encoding -and $Encoding.ToLowerInvariant() -eq 'base64') {
+        Write-Base64Body -Writer $Writer -Bytes $bytes
+        return
+    }
+
+    if ($bytes.Length -gt 0) {
+        $Writer.Write($Latin1.GetString($bytes))
+        $lastByte = $bytes[$bytes.Length - 1]
+        if ($lastByte -ne 10 -and $lastByte -ne 13) {
+            $Writer.Write("`r`n")
+        }
+    }
+}
+
+function Test-MimeBoundaryLine {
+    param(
+        [string]$Line,
+        [string]$Boundary
+    )
+
+    if ($null -eq $Line) {
+        return $false
+    }
+
+    return [regex]::IsMatch($Line, '^--' + [regex]::Escape($Boundary) + '(--)?[ \t]*$')
+}
+
+function Test-MimeClosingBoundaryLine {
+    param(
+        [string]$Line,
+        [string]$Boundary
+    )
+
+    if ($null -eq $Line) {
+        return $false
+    }
+
+    return [regex]::IsMatch($Line, '^--' + [regex]::Escape($Boundary) + '--[ \t]*$')
+}
+
+function Write-RestoredMhtmlStream {
+    param(
+        [string]$InputPath,
         [System.Collections.Generic.Dictionary[string,object]]$AssetMap,
         [string]$OutputPath
     )
 
-    $pattern = '(?m)^--' + [regex]::Escape($Boundary) + '(?<closing>--)?[ \t]*\r?$'
-    $boundaryMatches = [regex]::Matches($Text, $pattern)
-    if ($boundaryMatches.Count -lt 2) {
-        [System.IO.File]::WriteAllText($OutputPath, $Text, $Latin1)
-        return [pscustomobject]@{
-            Restored = 0
-            Missing = 0
-        }
-    }
-
+    $reader = New-Object System.IO.StreamReader($InputPath, $Latin1, $false)
     $writer = New-Object System.IO.StreamWriter($OutputPath, $false, $Latin1)
+    $writer.NewLine = "`r`n"
     $restored = 0
     $missing = 0
+    $hasBoundary = $false
 
     try {
-        $writer.Write($Text.Substring(0, $boundaryMatches[0].Index))
-
-        for ($i = 0; $i -lt ($boundaryMatches.Count - 1); $i++) {
-            $current = $boundaryMatches[$i]
-            $next = $boundaryMatches[($i + 1)]
-            $writer.Write($current.Value)
-
-            $start = $current.Index + $current.Length
-            if ($start + 1 -lt $Text.Length -and $Text.Substring($start, 2) -eq "`r`n") {
-                $writer.Write("`r`n")
-                $start += 2
-            }
-            elseif ($start -lt $Text.Length -and $Text[$start] -eq "`n") {
-                $writer.Write("`n")
-                $start += 1
+        $rootHeaderLines = New-Object System.Collections.ArrayList
+        while ($true) {
+            $line = $reader.ReadLine()
+            if ($null -eq $line) {
+                break
             }
 
-            $segmentLength = $next.Index - $start
-            $segment = $Text.Substring($start, $segmentLength)
-            $separator = [regex]::Match($segment, "\r?\n\r?\n")
-            if (-not $separator.Success) {
-                $writer.Write($segment)
+            [void]$rootHeaderLines.Add($line)
+            if ($line -eq '') {
+                break
+            }
+        }
+
+        foreach ($line in $rootHeaderLines) {
+            $writer.WriteLine($line)
+        }
+
+        $rootHeaderText = ''
+        if ($rootHeaderLines.Count -gt 0) {
+            $headerOnlyLines = @($rootHeaderLines | Where-Object { $_ -ne '' })
+            $rootHeaderText = ($headerOnlyLines -join "`r`n")
+        }
+
+        $rootHeaders = Read-MimeHeaders -HeaderText $rootHeaderText
+        $boundary = Get-MimeBoundary -ContentType (Get-UnfoldedHeaderValue -Headers $rootHeaders -Name 'Content-Type')
+        if (-not $boundary) {
+            while (($line = $reader.ReadLine()) -ne $null) {
+                $writer.WriteLine($line)
+            }
+
+            return [pscustomobject]@{
+                Restored = 0
+                Missing = 0
+                HasBoundary = $false
+            }
+        }
+
+        $hasBoundary = $true
+        $pendingLine = $null
+        while ($true) {
+            if ($null -ne $pendingLine) {
+                $line = $pendingLine
+                $pendingLine = $null
+            }
+            else {
+                $line = $reader.ReadLine()
+            }
+
+            if ($null -eq $line) {
+                break
+            }
+
+            if (-not (Test-MimeBoundaryLine -Line $line -Boundary $boundary)) {
+                $writer.WriteLine($line)
                 continue
             }
 
-            $headerText = $segment.Substring(0, $separator.Index)
+            $writer.WriteLine($line)
+            if (Test-MimeClosingBoundaryLine -Line $line -Boundary $boundary) {
+                continue
+            }
+
+            $partHeaderLines = New-Object System.Collections.ArrayList
+            while ($true) {
+                $headerLine = $reader.ReadLine()
+                if ($null -eq $headerLine) {
+                    break
+                }
+
+                if ($headerLine -eq '') {
+                    break
+                }
+
+                [void]$partHeaderLines.Add($headerLine)
+            }
+
+            $headerText = ($partHeaderLines -join "`r`n")
             $headers = Read-MimeHeaders -HeaderText $headerText
             $location = Get-UnfoldedHeaderValue -Headers $headers -Name 'Content-Location' -Url
 
             if (-not $location -or -not $AssetMap.ContainsKey($location)) {
-                $writer.Write($segment)
+                foreach ($headerLine in $partHeaderLines) {
+                    $writer.WriteLine($headerLine)
+                }
+                $writer.WriteLine('')
+
+                while ($true) {
+                    $bodyLine = $reader.ReadLine()
+                    if ($null -eq $bodyLine) {
+                        break
+                    }
+
+                    if (Test-MimeBoundaryLine -Line $bodyLine -Boundary $boundary) {
+                        $pendingLine = $bodyLine
+                        break
+                    }
+
+                    $writer.WriteLine($bodyLine)
+                }
+
                 continue
             }
 
@@ -449,8 +558,26 @@ function Write-RestoredMhtml {
             $assetPath = ConvertTo-FullPath -RelativePath ([string]$row.path)
             if (-not (Test-Path -LiteralPath $assetPath)) {
                 Write-Warning "Asset tidak ditemukan untuk $location : $assetPath"
-                $writer.Write($segment)
+                foreach ($headerLine in $partHeaderLines) {
+                    $writer.WriteLine($headerLine)
+                }
+                $writer.WriteLine('')
                 $missing++
+
+                while ($true) {
+                    $bodyLine = $reader.ReadLine()
+                    if ($null -eq $bodyLine) {
+                        break
+                    }
+
+                    if (Test-MimeBoundaryLine -Line $bodyLine -Boundary $boundary) {
+                        $pendingLine = $bodyLine
+                        break
+                    }
+
+                    $writer.WriteLine($bodyLine)
+                }
+
                 continue
             }
 
@@ -466,24 +593,35 @@ function Write-RestoredMhtml {
 
             $updatedHeaderText = Update-OrAddHeader -HeaderText $headerText -Name 'Content-Transfer-Encoding' -Value $encoding
             $updatedHeaderText = Update-OrAddHeader -HeaderText $updatedHeaderText -Name 'Content-Type' -Value $contentType
-            $writer.Write($updatedHeaderText)
-            $writer.Write($separator.Value)
-
-            $bytes = [System.IO.File]::ReadAllBytes($assetPath)
-            Write-MimeBody -Writer $writer -Bytes $bytes -Encoding $encoding
+            foreach ($updatedLine in ([regex]::Split($updatedHeaderText, "\r?\n"))) {
+                $writer.WriteLine($updatedLine)
+            }
+            $writer.WriteLine('')
+            Write-BodyFromAssetFile -Writer $writer -AssetPath $assetPath -Encoding $encoding
             $restored++
-        }
 
-        $last = $boundaryMatches[($boundaryMatches.Count - 1)]
-        $writer.Write($Text.Substring($last.Index))
+            while ($true) {
+                $bodyLine = $reader.ReadLine()
+                if ($null -eq $bodyLine) {
+                    break
+                }
+
+                if (Test-MimeBoundaryLine -Line $bodyLine -Boundary $boundary) {
+                    $pendingLine = $bodyLine
+                    break
+                }
+            }
+        }
     }
     finally {
+        $reader.Dispose()
         $writer.Dispose()
     }
 
     return [pscustomobject]@{
         Restored = $restored
         Missing = $missing
+        HasBoundary = $hasBoundary
     }
 }
 
@@ -511,19 +649,15 @@ foreach ($file in $files) {
     $stats.Files++
     Write-Host "Combining $($file.FullName)"
 
-    $text = [System.IO.File]::ReadAllText($file.FullName, $Latin1)
-    $rootHeaders = Read-MimeHeaders -HeaderText (Get-InitialHeaderText -Text $text)
-    $boundary = Get-MimeBoundary -ContentType (Get-UnfoldedHeaderValue -Headers $rootHeaders -Name 'Content-Type')
-    if (-not $boundary) {
-        Write-Warning "Boundary tidak ditemukan: $($file.FullName)"
-        $stats.SkippedNoBoundary++
-        continue
-    }
-
     $relativePath = Get-RelativePathFromBase -BasePath $inputBasePath -FullPath $file.FullName
     $outputPath = Join-Path $OutputRoot $relativePath
     New-Item -ItemType Directory -Force -Path (Split-Path -Parent $outputPath) | Out-Null
-    $result = Write-RestoredMhtml -Text $text -Boundary $boundary -AssetMap $assetMap -OutputPath $outputPath
+    $result = Write-RestoredMhtmlStream -InputPath $file.FullName -AssetMap $assetMap -OutputPath $outputPath
+
+    if (-not $result.HasBoundary) {
+        Write-Warning "Boundary tidak ditemukan: $($file.FullName)"
+        $stats.SkippedNoBoundary++
+    }
 
     $stats.Written++
     $stats.RestoredParts += $result.Restored
