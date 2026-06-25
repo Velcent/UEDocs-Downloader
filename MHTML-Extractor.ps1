@@ -4,7 +4,7 @@ param(
     [string]$AssetsRoot = '',
     [string]$StrippedMhtmlRoot = '',
     [string]$TsvPath = '',
-    [int]$ImageDownloadAttempts = 3,
+    [int]$ImageDownloadAttempts = 100000,
     [int]$BrowserReadyTimeoutSeconds = 60
 )
 
@@ -1498,6 +1498,7 @@ $stats = [ordered]@{
     FailedImgUrls = 0
     AddedMissingImgParts = 0
     LinkedLocalVideoUrls = 0
+    InvalidLocalImageParts = 0
     SkippedExistingUrls = 0
     SkippedSnapshotParts = 0
     SkippedNonHttpsParts = 0
@@ -1571,6 +1572,15 @@ foreach ($file in $files) {
         catch {
             Write-Warning "Gagal decode $location ($transferEncoding) di $($file.Name): $($_.Exception.Message)"
             continue
+        }
+
+        if ($partContentType -match '(?i)^image/') {
+            $validationError = Test-ImageBytesComplete -Bytes $bytes -ContentType $partContentType -Url $location
+            if (-not [string]::IsNullOrWhiteSpace($validationError)) {
+                $stats.InvalidLocalImageParts++
+                Write-Warning "Gambar multipart corrupt setelah decode, skip: $location - $validationError"
+                continue
+            }
         }
 
         $sha256 = Get-Sha256Hex -Bytes $bytes
@@ -1786,6 +1796,7 @@ Write-Host "Stripped MHTML files : $($stats.StrippedMhtmlFiles)"
 Write-Host "Missing asset refs   : $($stats.MissingImgUrls)"
 Write-Host "Downloaded assets    : $($stats.DownloadedImgUrls)"
 Write-Host "Linked local videos  : $($stats.LinkedLocalVideoUrls)"
+Write-Host "Invalid local images : $($stats.InvalidLocalImageParts)"
 Write-Host "Failed asset URLs    : $($stats.FailedImgUrls)"
 Write-Host "Added asset parts    : $($stats.AddedMissingImgParts)"
 Write-Host "Skipped existing URL : $($stats.SkippedExistingUrls)"
