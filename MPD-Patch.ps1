@@ -125,6 +125,12 @@ function ConvertTo-HtmlAttributeValue {
     return [System.Net.WebUtility]::HtmlEncode($Value)
 }
 
+function Get-Mp4SourceForVideoId {
+    param([string]$VideoId)
+
+    return "$(ConvertTo-HtmlAttributeValue "https://media.local/assets/video/$VideoId.mp4")"
+}
+
 function ConvertTo-CssUrlValue {
     param([string]$Value)
 
@@ -202,7 +208,7 @@ function Get-VideoPlayerHtml {
         [string]$PosterUrl
     )
 
-    $mp4Source = "$(ConvertTo-HtmlAttributeValue "https://media.local/assets/video/$VideoId.mp4")"
+    $mp4Source = Get-Mp4SourceForVideoId $VideoId
     $posterAttribute = ''
 
     if (-not [string]::IsNullOrWhiteSpace($PosterUrl)) {
@@ -304,6 +310,39 @@ function Find-VideoContentLocationIndex {
     return -1
 }
 
+function Patch-YoutubeLinkFallback {
+    param(
+        [string]$MhtmlText,
+        [string]$VideoId
+    )
+
+    $mp4Source = Get-Mp4SourceForVideoId $VideoId
+    $escapedVideoId = [regex]::Escape($VideoId)
+    $watchPattern = 'https?://(?:www\.)?youtube(?:-nocookie)?\.com/watch\?[^"''<>\s\\)]*v(?:=|=3D)' + $escapedVideoId + '[^"''<>\s\\)]*'
+    $embedPattern = 'https?://(?:www\.)?youtube(?:-nocookie)?\.com/(?:embed|shorts|live)/' + $escapedVideoId + '[^"''<>\s\\)]*'
+    $shortUrlPattern = 'https?://youtu\.be/' + $escapedVideoId + '[^"''<>\s\\)]*'
+    $patterns = @($watchPattern, $embedPattern, $shortUrlPattern)
+
+    $patchedText = $MhtmlText
+    $replacementCount = 0
+
+    foreach ($pattern in $patterns) {
+        $urlMatches = [regex]::Matches($patchedText, $pattern, 'IgnoreCase')
+        if ($urlMatches.Count -le 0) {
+            continue
+        }
+
+        $replacementCount += $urlMatches.Count
+        $patchedText = [regex]::Replace($patchedText, $pattern, $mp4Source, 'IgnoreCase')
+    }
+
+    return @{
+        Text = $patchedText
+        Patched = ($replacementCount -gt 0)
+        ReplacementCount = $replacementCount
+    }
+}
+
 function Patch-EmbedPart {
     param(
         [string]$MhtmlText,
@@ -314,6 +353,14 @@ function Patch-EmbedPart {
 
     $contentLocationIndex = Find-VideoContentLocationIndex -MhtmlText $MhtmlText -EmbedUrl $EmbedUrl -VideoId $VideoId -Kind $Kind
     if ($contentLocationIndex -lt 0) {
+        if ($Kind -eq 'youtube') {
+            $fallback = Patch-YoutubeLinkFallback -MhtmlText $MhtmlText -VideoId $VideoId
+            if ($fallback.Patched) {
+                Write-Host "Embed URL not found; patched YouTube link instead: $EmbedUrl"
+                return $fallback
+            }
+        }
+
         Write-Warning "Embed URL not found in MHTML: $EmbedUrl"
         return @{
             Text = $MhtmlText
