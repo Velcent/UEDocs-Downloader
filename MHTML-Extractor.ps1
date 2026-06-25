@@ -1600,6 +1600,40 @@ function Import-ExistingUrlMap {
     return $map
 }
 
+function Write-ManifestFile {
+    param(
+        [System.Collections.Generic.List[object]]$Rows,
+        [string]$ManifestPath
+    )
+
+    $tsvLines = New-Object System.Collections.Generic.List[string]
+    $tsvLines.Add("link`tpath`ttype`tencoding`tsha256`tsize_bytes") | Out-Null
+
+    foreach ($row in ($Rows | Sort-Object link, path)) {
+        $rowType = if ((Test-ObjectProperty -Object $row -Name 'type') -and -not [string]::IsNullOrWhiteSpace([string]$row.type)) {
+            [string]$row.type
+        }
+        else {
+            Get-ContentTypeForManifestRow -Row $row
+        }
+
+        $tsvLines.Add((
+            (ConvertTo-TsvValue $row.link),
+            (ConvertTo-TsvValue $row.path),
+            (ConvertTo-TsvValue $rowType),
+            (ConvertTo-TsvValue $row.encoding),
+            (ConvertTo-TsvValue $row.sha256),
+            (ConvertTo-TsvValue ([string]$row.size_bytes))
+        ) -join "`t") | Out-Null
+    }
+
+    if (Test-Path -LiteralPath $ManifestPath) {
+        Copy-Item -LiteralPath $ManifestPath -Destination ($ManifestPath + '.bak') -Force
+    }
+
+    [System.IO.File]::WriteAllLines($ManifestPath, $tsvLines, $Utf8NoBom)
+}
+
 New-Item -ItemType Directory -Force -Path $BinRoot | Out-Null
 New-Item -ItemType Directory -Force -Path $AssetsVideoRoot | Out-Null
 New-Item -ItemType Directory -Force -Path $StrippedMhtmlRoot | Out-Null
@@ -1636,6 +1670,10 @@ $stats = [ordered]@{
 }
 
 $assetSession = $null
+
+if (-not (Test-Path -LiteralPath $TsvPath)) {
+    Write-ManifestFile -Rows $rows -ManifestPath $TsvPath
+}
 
 foreach ($file in $files) {
     $stats.Files++
@@ -1876,36 +1914,13 @@ foreach ($file in $files) {
         $stats.AddedMissingImgParts += $clearedResult.Added
         $stats.StrippedMhtmlFiles++
     }
+
+    Write-ManifestFile -Rows $rows -ManifestPath $TsvPath
 }
 
 Close-AssetDownloadSession -Session $assetSession
 Close-EdgeBrowser
-
-$tsvLines = New-Object System.Collections.Generic.List[string]
-$tsvLines.Add("link`tpath`ttype`tencoding`tsha256`tsize_bytes") | Out-Null
-foreach ($row in ($rows | Sort-Object link, path)) {
-    $rowType = if ((Test-ObjectProperty -Object $row -Name 'type') -and -not [string]::IsNullOrWhiteSpace([string]$row.type)) {
-        [string]$row.type
-    }
-    else {
-        Get-ContentTypeForManifestRow -Row $row
-    }
-
-    $tsvLines.Add((
-        (ConvertTo-TsvValue $row.link),
-        (ConvertTo-TsvValue $row.path),
-        (ConvertTo-TsvValue $rowType),
-        (ConvertTo-TsvValue $row.encoding),
-        (ConvertTo-TsvValue $row.sha256),
-        (ConvertTo-TsvValue ([string]$row.size_bytes))
-    ) -join "`t") | Out-Null
-}
-
-if (Test-Path -LiteralPath $TsvPath) {
-    Copy-Item -LiteralPath $TsvPath -Destination ($TsvPath + '.bak') -Force
-}
-
-[System.IO.File]::WriteAllLines($TsvPath, $tsvLines, $Utf8NoBom)
+Write-ManifestFile -Rows $rows -ManifestPath $TsvPath
 
 Write-Host ''
 Write-Host "Done."
