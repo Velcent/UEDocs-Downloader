@@ -1168,9 +1168,9 @@ function Close-EdgeBrowser {
             }
         }
 
-        foreach ($pid in ($toStop | Sort-Object -Descending)) {
+        foreach ($processId in ($toStop | Sort-Object -Descending)) {
             try {
-                Stop-Process -Id $pid -Force -ErrorAction SilentlyContinue
+                Stop-Process -Id $processId -Force -ErrorAction SilentlyContinue
             }
             catch {
             }
@@ -1628,10 +1628,65 @@ function Write-ManifestFile {
     }
 
     if (Test-Path -LiteralPath $ManifestPath) {
-        Copy-Item -LiteralPath $ManifestPath -Destination ($ManifestPath + '.bak') -Force
+        $existingLines = [System.IO.File]::ReadAllLines($ManifestPath)
+        $changed = $existingLines.Count -ne $tsvLines.Count
+        if (-not $changed) {
+            for ($i = 0; $i -lt $tsvLines.Count; $i++) {
+                if ($existingLines[$i] -cne $tsvLines[$i]) {
+                    $changed = $true
+                    break
+                }
+            }
+        }
+
+        if (-not $changed) {
+            return
+        }
+
     }
 
     [System.IO.File]::WriteAllLines($ManifestPath, $tsvLines, $Utf8NoBom)
+    Copy-Item -LiteralPath $ManifestPath -Destination ($ManifestPath + '.bak') -Force
+}
+
+function Save-ManifestCache {
+    param(
+        [System.Collections.Generic.Dictionary[string,object]]$UrlRows,
+        [string]$ManifestPath
+    )
+
+    $manifestRows = New-Object System.Collections.Generic.List[object]
+    foreach ($row in $UrlRows.Values) {
+        $manifestRows.Add($row) | Out-Null
+    }
+
+    Write-ManifestFile -Rows $manifestRows -ManifestPath $ManifestPath
+}
+
+function Add-ManifestRow {
+    param(
+        [object]$Row,
+        [System.Collections.Generic.Dictionary[string,object]]$UrlRows,
+        [System.Collections.Generic.Dictionary[string,bool]]$SeenRows,
+        [System.Collections.Generic.List[object]]$Rows,
+        [string]$ManifestPath,
+        [switch]$SaveNow
+    )
+
+    if (-not $Row -or -not (Test-ObjectProperty -Object $Row -Name 'link') -or [string]::IsNullOrWhiteSpace([string]$Row.link)) {
+        return
+    }
+
+    $link = [string]$Row.link
+    $UrlRows[$link] = $Row
+    if (-not $SeenRows.ContainsKey($link)) {
+        $SeenRows[$link] = $true
+        $Rows.Add($Row) | Out-Null
+    }
+
+    if ($SaveNow) {
+        Save-ManifestCache -UrlRows $UrlRows -ManifestPath $ManifestPath
+    }
 }
 
 New-Item -ItemType Directory -Force -Path $BinRoot | Out-Null
@@ -1671,8 +1726,9 @@ $stats = [ordered]@{
 
 $assetSession = $null
 
+try {
 if (-not (Test-Path -LiteralPath $TsvPath)) {
-    Write-ManifestFile -Rows $rows -ManifestPath $TsvPath
+    Save-ManifestCache -UrlRows $urlToRow -ManifestPath $TsvPath
 }
 
 foreach ($file in $files) {
@@ -1709,11 +1765,7 @@ foreach ($file in $files) {
         }
 
         if ($urlToRow.ContainsKey($location)) {
-            if (-not $seenRows.ContainsKey($location)) {
-                $seenRows[$location] = $true
-                $rows.Add($urlToRow[$location]) | Out-Null
-            }
-
+            Add-ManifestRow -Row $urlToRow[$location] -UrlRows $urlToRow -SeenRows $seenRows -Rows $rows -ManifestPath $TsvPath
             $stats.SkippedExistingUrls++
             continue
         }
@@ -1804,9 +1856,7 @@ foreach ($file in $files) {
             sha256 = $sha256
             size_bytes = $size
         }
-        $urlToRow[$location] = $newRow
-        $seenRows[$location] = $true
-        $rows.Add($newRow) | Out-Null
+        Add-ManifestRow -Row $newRow -UrlRows $urlToRow -SeenRows $seenRows -Rows $rows -ManifestPath $TsvPath -SaveNow
     }
 
     $missingImgParts = New-Object System.Collections.Generic.List[object]
@@ -1853,10 +1903,7 @@ foreach ($file in $files) {
         elseif ($urlToRow.ContainsKey($assetLink)) {
             $imgRow = $urlToRow[$assetLink]
             $contentType = Get-ContentTypeForManifestRow -Row $imgRow
-            if (-not $seenRows.ContainsKey($assetLink)) {
-                $seenRows[$assetLink] = $true
-                $rows.Add($imgRow) | Out-Null
-            }
+            Add-ManifestRow -Row $imgRow -UrlRows $urlToRow -SeenRows $seenRows -Rows $rows -ManifestPath $TsvPath
             $stats.SkippedExistingUrls++
         }
         else {
@@ -1901,9 +1948,7 @@ foreach ($file in $files) {
                     sha256 = $sha256
                     size_bytes = $size
                 }
-                $urlToRow[$assetLink] = $imgRow
-                $seenRows[$assetLink] = $true
-                $rows.Add($imgRow) | Out-Null
+                Add-ManifestRow -Row $imgRow -UrlRows $urlToRow -SeenRows $seenRows -Rows $rows -ManifestPath $TsvPath -SaveNow
                 $stats.DownloadedImgUrls++
             }
             catch {
@@ -1934,12 +1979,15 @@ foreach ($file in $files) {
         $stats.StrippedMhtmlFiles++
     }
 
-    Write-ManifestFile -Rows $rows -ManifestPath $TsvPath
+    Save-ManifestCache -UrlRows $urlToRow -ManifestPath $TsvPath
 }
 
-Close-AssetDownloadSession -Session $assetSession
-Close-EdgeBrowser
-Write-ManifestFile -Rows $rows -ManifestPath $TsvPath
+}
+finally {
+    Close-AssetDownloadSession -Session $assetSession
+    Close-EdgeBrowser
+    Save-ManifestCache -UrlRows $urlToRow -ManifestPath $TsvPath
+}
 
 Write-Host ''
 Write-Host "Done."
