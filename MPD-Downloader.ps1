@@ -652,15 +652,38 @@ function Start-DownloadJob {
         $outputTemplate = Join-Path (Split-Path -Parent $Mp4Path) "$([System.IO.Path]::GetFileNameWithoutExtension($Mp4Path)).%(ext)s"
 
         if ($Kind -eq 'youtube') {
-            & $YtDlpPath $SourceUrl -f 'bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=720]+bestaudio/best[height<=720]' --merge-output-format mp4 -o $outputTemplate
+            $ytDlpOutput = & $YtDlpPath $SourceUrl -f 'bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=720]+bestaudio/best[height<=720]' --merge-output-format mp4 -o $outputTemplate 2>&1
         }
         else {
             $mpdUrl = ([System.Uri](Resolve-Path -LiteralPath $MpdPath).Path).AbsoluteUri
-            & $YtDlpPath --enable-file-urls $mpdUrl -f 'bestvideo[height<=720]+bestaudio/best[height<=720]' --merge-output-format mp4 -o $outputTemplate
+            $ytDlpOutput = & $YtDlpPath --enable-file-urls $mpdUrl -f 'bestvideo[height<=720]+bestaudio/best[height<=720]' --merge-output-format mp4 -o $outputTemplate 2>&1
         }
 
-        if ($LASTEXITCODE -ne 0) {
-            throw "yt-dlp failed with exit code $LASTEXITCODE for $Mp4Path"
+        $exitCode = $LASTEXITCODE
+        if ($exitCode -ne 0) {
+            $outputText = ($ytDlpOutput | ForEach-Object { $_.ToString() }) -join "`n"
+            if ($Kind -eq 'youtube' -and $outputText -match 'ERROR:\s+\[youtube\]\s+[A-Za-z0-9_-]{11}:\s+Video unavailable') {
+                return [pscustomobject]@{
+                    Status = 'Skipped'
+                    Reason = 'YouTube video unavailable'
+                    ExitCode = $exitCode
+                    Output = $outputText
+                }
+            }
+
+            return [pscustomobject]@{
+                Status = 'Failed'
+                Reason = "yt-dlp failed with exit code $exitCode for $Mp4Path"
+                ExitCode = $exitCode
+                Output = $outputText
+            }
+        }
+
+        return [pscustomobject]@{
+            Status = 'Succeeded'
+            Reason = $null
+            ExitCode = 0
+            Output = $null
         }
     }
 }
@@ -723,14 +746,22 @@ function Invoke-ParallelDownloads {
 
         $completedJob = Wait-Job -Job ($running.Job) -Any
         $completedTask = ($running | Where-Object { $_.Job.Id -eq $completedJob.Id } | Select-Object -First 1).Task
+        $downloadResult = $null
         try {
-            Receive-Job -Job $completedJob -ErrorAction Stop
+            $downloadResult = Receive-Job -Job $completedJob -ErrorAction Stop | Select-Object -Last 1
         }
         catch {
             Write-Warning $_.Exception.Message
         }
 
-        if ($completedJob.State -eq 'Failed') {
+        if ($downloadResult -and $downloadResult.Status -eq 'Skipped') {
+            Write-Warning "YouTube skipped: $(Split-Path -Leaf $completedTask.Mp4Path). $($downloadResult.Reason)"
+        }
+        elseif ($completedJob.State -eq 'Failed' -or ($downloadResult -and $downloadResult.Status -eq 'Failed')) {
+            if ($downloadResult -and $downloadResult.Reason) {
+                Write-Warning $downloadResult.Reason
+            }
+
             if ((Test-Path -LiteralPath $completedTask.Mp4Path) -and (Get-Item -LiteralPath $completedTask.Mp4Path).Length -gt 0) {
                 Write-Host "Finished MP4 despite warning: $(Split-Path -Leaf $completedTask.Mp4Path)"
             }
@@ -765,7 +796,8 @@ function Invoke-ParallelDownloads {
 $listHeader = "mhtml_file`tembed_html`tvideo_size"
 Set-Content -LiteralPath $ListPath -Value $listHeader -Encoding UTF8
 Sync-ListBackup -Path $ListPath
-$downloadTasks = @()
+$epicDownloadTasks = @()
+$youtubeDownloadTasks = @()
 $listEntries = @()
 $queuedMp4Paths = @{}
 $mhtmlRoot = Join-Path $Root 'mhtml'
@@ -807,7 +839,7 @@ foreach ($mhtmlFile in $mhtmlFiles) {
         $mp4Key = $mp4Path.ToLowerInvariant()
         if (-not $queuedMp4Paths.ContainsKey($mp4Key)) {
             $queuedMp4Paths[$mp4Key] = $true
-            $downloadTasks += [pscustomobject]@{
+            $youtubeDownloadTasks += [pscustomobject]@{
                 Kind = 'youtube'
                 MpdPath = $null
                 SourceUrl = $youtubeUrl
@@ -869,7 +901,7 @@ foreach ($mhtmlFile in $mhtmlFiles) {
             $mp4Key = $mp4Path.ToLowerInvariant()
             if (-not $queuedMp4Paths.ContainsKey($mp4Key)) {
                 $queuedMp4Paths[$mp4Key] = $true
-                $downloadTasks += [pscustomobject]@{
+                $epicDownloadTasks += [pscustomobject]@{
                     Kind = 'mpd'
                     MpdPath = $mpdPath
                     SourceUrl = $null
@@ -888,7 +920,8 @@ foreach ($mhtmlFile in $mhtmlFiles) {
     }
 }
 
-Invoke-ParallelDownloads -Tasks $downloadTasks -MaxParallel $ParallelDownloads -RetryLimit $DownloadRetries
+Invoke-ParallelDownloads -Tasks $epicDownloadTasks -MaxParallel $ParallelDownloads -RetryLimit $DownloadRetries
+Invoke-ParallelDownloads -Tasks $youtubeDownloadTasks -MaxParallel $ParallelDownloads -RetryLimit $DownloadRetries
 
 foreach ($entry in $listEntries) {
     Add-MpdListEntry -MhtmlPath $entry.MhtmlPath -EmbedUrl $entry.EmbedUrl -Mp4Path $entry.Mp4Path
