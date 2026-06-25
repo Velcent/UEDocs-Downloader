@@ -158,6 +158,44 @@ function Get-PosterUrlFromEmbedBody {
     return $null
 }
 
+function Get-PosterUrlFromLocalEmbedFile {
+    param([string]$VideoId)
+
+    if ([string]::IsNullOrWhiteSpace($VideoId)) {
+        return $null
+    }
+
+    $embedPath = Join-Path $Root "video\embed\$VideoId.html"
+    if (-not (Test-Path -LiteralPath $embedPath)) {
+        return $null
+    }
+
+    $embedText = [System.IO.File]::ReadAllText($embedPath)
+    $patterns = @(
+        'const\s+posterUrl\s*=\s*`\$\{document\.location\.origin\}(?<path>/community/api/cms/image/[^`"]+)',
+        'const\s+posterUrl\s*=\s*["''](?<path>/community/api/cms/image/[^"'']+)["'']',
+        'background-image:\s*url\((?:&quot;|"|''|\\")?(?<url>https://dev\.epicgames\.com/community/api/cms/image/[^"''\)\s\\]+)',
+        'background-image:\s*url\((?:&quot;|"|''|\\")?(?<path>/community/api/cms/image/[^"''\)\s\\]+)'
+    )
+
+    foreach ($pattern in $patterns) {
+        $match = [regex]::Match($embedText, $pattern, 'IgnoreCase')
+        if (-not $match.Success) {
+            continue
+        }
+
+        if ($match.Groups['url'].Success) {
+            return $match.Groups['url'].Value
+        }
+
+        if ($match.Groups['path'].Success) {
+            return "https://dev.epicgames.com$($match.Groups['path'].Value)"
+        }
+    }
+
+    return $null
+}
+
 function Get-VideoPlayerHtml {
     param(
         [string]$VideoId,
@@ -315,6 +353,9 @@ function Patch-EmbedPart {
     $headers = $MhtmlText.Substring($boundaryIndex, $bodyStart - $boundaryIndex)
     $oldBody = $MhtmlText.Substring($bodyStart, $nextBoundaryIndex - $bodyStart)
     $posterUrl = Get-PosterUrlFromEmbedBody $oldBody
+    if ([string]::IsNullOrWhiteSpace($posterUrl) -and $Kind -eq 'epic') {
+        $posterUrl = Get-PosterUrlFromLocalEmbedFile $VideoId
+    }
     $html = Get-VideoPlayerHtml -VideoId $VideoId -PosterUrl $posterUrl
     $lineEnding = Get-LineEnding $MhtmlText
 
