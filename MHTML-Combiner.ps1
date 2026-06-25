@@ -318,7 +318,7 @@ function Restore-MhtmlBodies {
             continue
         }
 
-        $encoding = if ($PreserveEncoding -and $row.encoding) { [string]$row.encoding } else { 'base64' }
+        $encoding = if ($row.encoding) { [string]$row.encoding } else { 'base64' }
         if (-not $encoding) {
             $encoding = 'base64'
         }
@@ -454,7 +454,7 @@ function Write-RestoredMhtml {
                 continue
             }
 
-            $encoding = if ($PreserveEncoding -and $row.encoding) { [string]$row.encoding } else { 'base64' }
+            $encoding = if ($row.encoding) { [string]$row.encoding } else { 'base64' }
             if (-not $encoding) {
                 $encoding = 'base64'
             }
