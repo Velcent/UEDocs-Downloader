@@ -1,7 +1,9 @@
-Get-ChildItem -Path .\mhtml -Filter *.mhtml -Recurse | ForEach-Object {
-    $content = Get-Content $_.FullName -Raw
+Get-ChildItem -LiteralPath .\mhtml -Filter *.mhtml -Recurse -File | ForEach-Object {
+    $path = $_.FullName
+    $content = Get-Content -LiteralPath $path -Raw -ErrorAction Stop
     $content = $content -replace "=`r`n(?!`r`n)", ""
     $content = $content -replace "<!---->", ""
+    $content = $content -replace "<iframe src", "<iframe allowfullscreen src"
     $content = $content -replace '
     (?sx)
     <div id=3D"top"></div>
@@ -13,5 +15,5 @@ Get-ChildItem -Path .\mhtml -Filter *.mhtml -Recurse | ForEach-Object {
     |<hot-toast-container.*?</hot-toast-container>
     |<site-nav.*?</site-nav>
     |<site-footer.*?</site-footer>', ''
-    Set-Content $_.FullName $content
+    Set-Content -LiteralPath $path -Value $content -ErrorAction Stop
 }
