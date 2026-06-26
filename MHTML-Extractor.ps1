@@ -2172,12 +2172,15 @@ function Invoke-MhtmlFilesParallel {
     }
 }
 
+Write-Host "Menyiapkan folder output..."
 New-Item -ItemType Directory -Force -Path $BinRoot | Out-Null
 New-Item -ItemType Directory -Force -Path $AssetsVideoRoot | Out-Null
 New-Item -ItemType Directory -Force -Path $StrippedMhtmlRoot | Out-Null
 New-Item -ItemType Directory -Force -Path (Split-Path -Parent $TsvPath) | Out-Null
 
+Write-Host "Scan input MHTML: $InputPath"
 $allFiles = @(Get-InputMhtmlFiles -Path $InputPath)
+Write-Host "Input MHTML ditemukan: $($allFiles.Count)"
 $inputItem = Get-Item -LiteralPath $InputPath
 if ($inputItem.PSIsContainer) {
     $inputBasePath = $inputItem.FullName
@@ -2186,8 +2189,12 @@ else {
     $inputBasePath = $inputItem.DirectoryName
 }
 
+Write-Host "Load manifest hash map: $TsvPath"
 $hashToPath = Import-ExistingHashMap -ManifestPath $TsvPath
+Write-Host "Hash map siap        : $($hashToPath.Count) item"
+Write-Host "Load manifest URL map : $TsvPath"
 $urlToRow = Import-ExistingUrlMap -ManifestPath $TsvPath
+Write-Host "URL map siap         : $($urlToRow.Count) item"
 $rows = New-Object System.Collections.Generic.List[object]
 $seenRows = New-Object 'System.Collections.Generic.Dictionary[string,bool]'
 $stats = [ordered]@{
@@ -2211,6 +2218,7 @@ $stats = [ordered]@{
     SkippedNonHttpsParts = 0
 }
 
+Write-Host "Cek output MHTML existing..."
 $files = New-Object System.Collections.Generic.List[System.IO.FileInfo]
 foreach ($file in $allFiles) {
     $outputMhtmlPath = Get-OutputMhtmlPath -File $file -InputBasePath $inputBasePath -OutputRoot $StrippedMhtmlRoot
@@ -2253,7 +2261,9 @@ try {
             }
         }
         else {
+            Write-Host "Menyiapkan Edge untuk worker parallel..."
             Ensure-Edge
+            Write-Host "Menyiapkan runspace worker parallel..."
             $functionDefinitions = Get-ScriptFunctionDefinitions
             $context = @{
                 AssetsRoot = $AssetsRoot
