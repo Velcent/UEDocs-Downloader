@@ -1782,6 +1782,14 @@ function Get-AssetBytesWithDownloadFallback {
         return (ConvertTo-AssetDownloadResult -Bytes $bytes -ContentType $contentType -FinalUrl $Url -ExpectedLength ([Int64]$bytes.LongLength) -OriginalUrl $Url)
     }
     finally {
+        try {
+            if ($socket -and $socket.State -eq [System.Net.WebSockets.WebSocketState]::Open) {
+                [void](Invoke-CdpCommand -Socket $socket -Method 'Page.navigate' -Params @{ url = 'about:blank' })
+            }
+        }
+        catch {
+        }
+
         Remove-AssetDownloadTempDirectory -DownloadRoot $downloadRoot -DownloadPath $downloadPath
     }
 }
