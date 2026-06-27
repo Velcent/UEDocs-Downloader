@@ -13,7 +13,7 @@ if (-not $InputPath) {
 }
 
 if (-not $OutputPath) {
-    $OutputPath = Join-Path $PSScriptRoot 'mhtml-check-valid-invalid.tsv'
+    $OutputPath = Join-Path $PSScriptRoot 'mhtml-invalid.tsv'
 }
 
 if (-not (Test-Path -LiteralPath $InputPath)) {

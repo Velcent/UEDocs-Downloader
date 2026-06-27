@@ -26,7 +26,7 @@ $PageLoadTimeoutSeconds = [Math]::Max(1, $PageLoadTimeoutSeconds)
 $MaxLoadAttempts = [Math]::Max(1, $MaxLoadAttempts)
 $ParallelPages = [Math]::Min(30, [Math]::Max(1, $ParallelPages))
 
-$MinimumMhtmlBytes = 650KB
+$MinimumMhtmlBytes = 680KB
 $MhtmlRoot = [System.IO.Path]::GetFullPath($MhtmlRoot)
 $script:BrowserPort = if ($WorkerMode) { $WorkerBrowserPort } else { $null }
 $script:BrowserProfileDir = Join-Path $MhtmlRoot '.edge-profile'
