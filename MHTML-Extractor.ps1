@@ -1609,14 +1609,37 @@ function Wait-DownloadedAssetFile {
     $lastFile = $null
     $lastLength = -1
     $stableCount = 0
+    $lastPartialFile = $null
+    $lastPartialLength = -1
+    $partialStableCount = 0
 
     while ((Get-Date) -lt $deadline) {
         $partialFiles = @(Get-ChildItem -LiteralPath $DownloadPath -File -ErrorAction SilentlyContinue | Where-Object {
             $_.Name -match '\.(crdownload|tmp)$'
-        })
+        } | Sort-Object LastWriteTime -Descending)
         $files = @(Get-ChildItem -LiteralPath $DownloadPath -File -ErrorAction SilentlyContinue | Where-Object {
             $_.Name -notmatch '\.(crdownload|tmp)$'
         } | Sort-Object LastWriteTime -Descending)
+
+        if ($partialFiles.Count -gt 0) {
+            $partialFile = $partialFiles[0]
+            if ($lastPartialFile -and $lastPartialFile.FullName -eq $partialFile.FullName -and $lastPartialLength -eq $partialFile.Length) {
+                $partialStableCount++
+                if ($partialStableCount -ge 20) {
+                    throw "Download temp macet/interrupted: $($partialFile.Name) ($($partialFile.Length) bytes)"
+                }
+            }
+            else {
+                $lastPartialFile = $partialFile
+                $lastPartialLength = $partialFile.Length
+                $partialStableCount = 0
+            }
+        }
+        else {
+            $lastPartialFile = $null
+            $lastPartialLength = -1
+            $partialStableCount = 0
+        }
 
         if ($files.Count -gt 0 -and $partialFiles.Count -eq 0) {
             $file = $files[0]
@@ -1636,7 +1659,7 @@ function Wait-DownloadedAssetFile {
         Start-Sleep -Milliseconds 250
     }
 
-    return $null
+    throw "Timeout menunggu download temp selesai."
 }
 
 function Remove-AssetDownloadTempDirectory {
