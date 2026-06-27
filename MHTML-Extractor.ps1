@@ -1302,6 +1302,7 @@ function New-AssetDownloadSession {
     return [pscustomobject]@{
         Socket = $socket
         TargetId = [string]$target.id
+        DownloadRoot = Join-Path $AssetsRoot ".edge-downloads-$PID"
     }
 }
 
@@ -1327,6 +1328,18 @@ function Get-AssetSessionTargetId {
     }
 
     return ''
+}
+
+function Get-AssetSessionDownloadRoot {
+    param($Session)
+
+    foreach ($item in @($Session)) {
+        if ($item -and (Test-ObjectProperty -Object $item -Name 'DownloadRoot')) {
+            return [string]$item.DownloadRoot
+        }
+    }
+
+    return (Join-Path $AssetsRoot ".edge-downloads-$PID")
 }
 
 function Close-AssetDownloadSession {
@@ -1379,40 +1392,66 @@ JSON.stringify({
     throw "Timeout menunggu complete: $Url"
 }
 
-function Get-AssetBytesWithBrowser {
+function Get-AssetFetchContextUrl {
     param(
-        $Session,
         [string]$Url,
         [string]$Referrer = ''
     )
 
-    Write-Host "Download img lewat Edge: $Url"
-    $socket = Get-AssetSessionSocket -Session $Session
-    if (-not $socket) {
-        throw 'Session browser tidak punya socket aktif.'
+    if (-not [string]::IsNullOrWhiteSpace($Referrer) -and [Uri]::IsWellFormedUriString($Referrer, [UriKind]::Absolute)) {
+        return $Referrer
     }
 
-    $lastError = ''
-    for ($attempt = 1; $attempt -le $ImageDownloadAttempts; $attempt++) {
-        try {
-            if ($attempt -eq 1) {
-                $params = @{ url = $Url }
-                if (-not [string]::IsNullOrWhiteSpace($Referrer)) {
-                    $params.referrer = $Referrer
-                }
-                [void](Invoke-CdpCommand -Socket $socket -Method 'Page.navigate' -Params $params)
-            }
-            else {
-                Write-Warning "Reload ulang img gagal: $Url"
-                [void](Invoke-CdpCommand -Socket $socket -Method 'Page.reload' -Params @{ ignoreCache = $true })
-            }
+    try {
+        $uri = [Uri]$Url
+        return $uri.GetLeftPart([System.UriPartial]::Authority) + '/'
+    }
+    catch {
+        return 'about:blank'
+    }
+}
 
-            [void](Wait-BrowserPageComplete -Socket $socket -Url $Url)
+function ConvertTo-AssetDownloadResult {
+    param(
+        [byte[]]$Bytes,
+        [string]$ContentType,
+        [string]$FinalUrl,
+        [Int64]$ExpectedLength,
+        [string]$OriginalUrl
+    )
 
-            $script = @'
+    $validationError = Test-ImageBytesComplete -Bytes $Bytes -ContentType $ContentType -Url $OriginalUrl -ExpectedLength $ExpectedLength
+    if (-not [string]::IsNullOrWhiteSpace($validationError)) {
+        throw $validationError
+    }
+
+    return [pscustomobject]@{
+        Bytes = $Bytes
+        ContentType = $ContentType
+        ContentLength = $ExpectedLength
+        FinalUrl = $FinalUrl
+    }
+}
+
+function Invoke-FetchAssetFromCurrentPage {
+    param(
+        [System.Net.WebSockets.ClientWebSocket]$Socket,
+        [string]$Url,
+        [string]$Referrer = ''
+    )
+
+    $urlJson = ConvertTo-Json -InputObject $Url -Compress
+    $referrerJson = ConvertTo-Json -InputObject $Referrer -Compress
+    $script = @"
 (async () => {
     try {
-        const response = await fetch(location.href, { cache: 'reload', credentials: 'include' });
+        const targetUrl = $urlJson;
+        const referrer = $referrerJson;
+        const init = { cache: 'reload', credentials: 'include' };
+        if (referrer) {
+            init.referrer = referrer;
+        }
+        const response = await fetch(targetUrl, init);
         if (!response.ok) {
             return JSON.stringify({ ok: false, status: response.status, statusText: response.statusText || '' });
         }
@@ -1452,7 +1491,7 @@ function Get-AssetBytesWithBrowser {
         return JSON.stringify({
             ok: true,
             status: response.status,
-            finalUrl: location.href,
+            finalUrl: response.url || targetUrl,
             contentType,
             contentLength,
             base64: btoa(binary)
@@ -1461,35 +1500,210 @@ function Get-AssetBytesWithBrowser {
         return JSON.stringify({ ok: false, error: String(error && error.message ? error.message : error) });
     }
 })()
-'@
-            $json = Invoke-PageEval -Socket $socket -Expression $script
-            $data = $json | ConvertFrom-Json
-            if (-not $data.ok) {
-                if ((Test-ObjectProperty -Object $data -Name 'error') -and $data.error) {
-                    throw [string]$data.error
+"@
+
+    $json = Invoke-PageEval -Socket $Socket -Expression $script
+    $data = $json | ConvertFrom-Json
+    if (-not $data.ok) {
+        if ((Test-ObjectProperty -Object $data -Name 'error') -and $data.error) {
+            throw [string]$data.error
+        }
+        $status = if (Test-ObjectProperty -Object $data -Name 'status') { [string]$data.status } else { '' }
+        $statusText = if (Test-ObjectProperty -Object $data -Name 'statusText') { [string]$data.statusText } else { '' }
+        throw "HTTP $status $statusText"
+    }
+
+    $bytes = [Convert]::FromBase64String([string]$data.base64)
+    $expectedLength = -1
+    if ((Test-ObjectProperty -Object $data -Name 'contentLength') -and -not [string]::IsNullOrWhiteSpace([string]$data.contentLength)) {
+        [Int64]::TryParse([string]$data.contentLength, [ref]$expectedLength) | Out-Null
+    }
+
+    return (ConvertTo-AssetDownloadResult -Bytes $bytes -ContentType ([string]$data.contentType) -FinalUrl ([string]$data.finalUrl) -ExpectedLength $expectedLength -OriginalUrl $Url)
+}
+
+function Get-AssetBytesWithFetchContext {
+    param(
+        [System.Net.WebSockets.ClientWebSocket]$Socket,
+        [string]$Url,
+        [string]$Referrer = ''
+    )
+
+    $contextUrl = Get-AssetFetchContextUrl -Url $Url -Referrer $Referrer
+    if ($contextUrl -ne 'about:blank') {
+        [void](Invoke-CdpCommand -Socket $Socket -Method 'Page.navigate' -Params @{ url = $contextUrl })
+        [void](Wait-BrowserPageComplete -Socket $Socket -Url $contextUrl)
+    }
+
+    return (Invoke-FetchAssetFromCurrentPage -Socket $Socket -Url $Url -Referrer $Referrer)
+}
+
+function Set-EdgeDownloadBehavior {
+    param(
+        [System.Net.WebSockets.ClientWebSocket]$Socket,
+        [string]$DownloadPath
+    )
+
+    New-Item -ItemType Directory -Force -Path $DownloadPath | Out-Null
+    $params = @{
+        behavior = 'allow'
+        downloadPath = $DownloadPath
+        eventsEnabled = $true
+    }
+
+    try {
+        [void](Invoke-CdpCommand -Socket $Socket -Method 'Browser.setDownloadBehavior' -Params $params)
+        return
+    }
+    catch {
+    }
+
+    [void](Invoke-CdpCommand -Socket $Socket -Method 'Page.setDownloadBehavior' -Params @{
+        behavior = 'allow'
+        downloadPath = $DownloadPath
+    })
+}
+
+function Wait-DownloadedAssetFile {
+    param([string]$DownloadPath)
+
+    $deadline = (Get-Date).AddSeconds($BrowserReadyTimeoutSeconds)
+    $lastFile = $null
+    $lastLength = -1
+    $stableCount = 0
+
+    while ((Get-Date) -lt $deadline) {
+        $partialFiles = @(Get-ChildItem -LiteralPath $DownloadPath -File -ErrorAction SilentlyContinue | Where-Object {
+            $_.Name -match '\.(crdownload|tmp)$'
+        })
+        $files = @(Get-ChildItem -LiteralPath $DownloadPath -File -ErrorAction SilentlyContinue | Where-Object {
+            $_.Name -notmatch '\.(crdownload|tmp)$'
+        } | Sort-Object LastWriteTime -Descending)
+
+        if ($files.Count -gt 0 -and $partialFiles.Count -eq 0) {
+            $file = $files[0]
+            if ($lastFile -and $lastFile.FullName -eq $file.FullName -and $lastLength -eq $file.Length) {
+                $stableCount++
+                if ($stableCount -ge 2) {
+                    return $file
                 }
-                $status = if (Test-ObjectProperty -Object $data -Name 'status') { [string]$data.status } else { '' }
-                $statusText = if (Test-ObjectProperty -Object $data -Name 'statusText') { [string]$data.statusText } else { '' }
-                throw "HTTP $status $statusText"
+            }
+            else {
+                $lastFile = $file
+                $lastLength = $file.Length
+                $stableCount = 0
+            }
+        }
+
+        Start-Sleep -Milliseconds 250
+    }
+
+    return $null
+}
+
+function Remove-AssetDownloadTempDirectory {
+    param(
+        [string]$DownloadRoot,
+        [string]$DownloadPath
+    )
+
+    try {
+        $trimChars = [char[]]@('\', '/')
+        $rootFull = [System.IO.Path]::GetFullPath($DownloadRoot).TrimEnd($trimChars) + [System.IO.Path]::DirectorySeparatorChar
+        $pathFull = [System.IO.Path]::GetFullPath($DownloadPath).TrimEnd($trimChars) + [System.IO.Path]::DirectorySeparatorChar
+        if ($pathFull.StartsWith($rootFull, [System.StringComparison]::OrdinalIgnoreCase) -and (Test-Path -LiteralPath $DownloadPath)) {
+            Remove-Item -LiteralPath $DownloadPath -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+    catch {
+    }
+}
+
+function Get-AssetBytesWithDownloadFallback {
+    param(
+        $Session,
+        [string]$Url,
+        [string]$Referrer = ''
+    )
+
+    $socket = Get-AssetSessionSocket -Session $Session
+    $downloadRoot = Get-AssetSessionDownloadRoot -Session $Session
+    $downloadPath = Join-Path $downloadRoot ([guid]::NewGuid().ToString('n'))
+
+    try {
+        Set-EdgeDownloadBehavior -Socket $socket -DownloadPath $downloadPath
+
+        $params = @{ url = $Url }
+        if (-not [string]::IsNullOrWhiteSpace($Referrer)) {
+            $params.referrer = $Referrer
+        }
+        $nav = Invoke-CdpCommand -Socket $socket -Method 'Page.navigate' -Params $params
+
+        $isDownload = $false
+        if ((Test-ObjectProperty -Object $nav -Name 'result') -and (Test-ObjectProperty -Object $nav.result -Name 'isDownload')) {
+            $isDownload = [bool]$nav.result.isDownload
+        }
+
+        if (-not $isDownload) {
+            try {
+                [void](Wait-BrowserPageComplete -Socket $socket -Url $Url)
+                return (Invoke-FetchAssetFromCurrentPage -Socket $socket -Url $Url -Referrer $Referrer)
+            }
+            catch {
+                $downloadedAfterRender = Wait-DownloadedAssetFile -DownloadPath $downloadPath
+                if (-not $downloadedAfterRender) {
+                    throw
+                }
+
+                $bytesAfterRender = [System.IO.File]::ReadAllBytes($downloadedAfterRender.FullName)
+                $contentTypeAfterRender = Get-ContentTypeFromBytesOrUrl -Bytes $bytesAfterRender -Url $Url
+                return (ConvertTo-AssetDownloadResult -Bytes $bytesAfterRender -ContentType $contentTypeAfterRender -FinalUrl $Url -ExpectedLength ([Int64]$bytesAfterRender.LongLength) -OriginalUrl $Url)
+            }
+        }
+
+        $downloaded = Wait-DownloadedAssetFile -DownloadPath $downloadPath
+        if (-not $downloaded) {
+            throw "Download temp tidak muncul: $Url"
+        }
+
+        $bytes = [System.IO.File]::ReadAllBytes($downloaded.FullName)
+        $contentType = Get-ContentTypeFromBytesOrUrl -Bytes $bytes -Url $Url
+        return (ConvertTo-AssetDownloadResult -Bytes $bytes -ContentType $contentType -FinalUrl $Url -ExpectedLength ([Int64]$bytes.LongLength) -OriginalUrl $Url)
+    }
+    finally {
+        Remove-AssetDownloadTempDirectory -DownloadRoot $downloadRoot -DownloadPath $downloadPath
+    }
+}
+
+function Get-AssetBytesWithBrowser {
+    param(
+        $Session,
+        [string]$Url,
+        [string]$Referrer = ''
+    )
+
+    Write-Host "Ambil asset lewat Edge: $Url"
+    $socket = Get-AssetSessionSocket -Session $Session
+    if (-not $socket) {
+        throw 'Session browser tidak punya socket aktif.'
+    }
+
+    $lastError = ''
+    for ($attempt = 1; $attempt -le $ImageDownloadAttempts; $attempt++) {
+        try {
+            if ($attempt -gt 1) {
+                Write-Warning "Reload ulang img gagal: $Url"
             }
 
-            $bytes = [Convert]::FromBase64String([string]$data.base64)
-            $expectedLength = -1
-            if ((Test-ObjectProperty -Object $data -Name 'contentLength') -and -not [string]::IsNullOrWhiteSpace([string]$data.contentLength)) {
-                [Int64]::TryParse([string]$data.contentLength, [ref]$expectedLength) | Out-Null
+            try {
+                return (Get-AssetBytesWithFetchContext -Socket $socket -Url $Url -Referrer $Referrer)
+            }
+            catch {
+                $fetchError = $_.Exception.Message
+                Write-Warning "Fetch asset gagal, coba fallback download behavior: $Url - $fetchError"
             }
 
-            $validationError = Test-ImageBytesComplete -Bytes $bytes -ContentType ([string]$data.contentType) -Url $Url -ExpectedLength $expectedLength
-            if (-not [string]::IsNullOrWhiteSpace($validationError)) {
-                throw $validationError
-            }
-
-            return [pscustomobject]@{
-                Bytes = $bytes
-                ContentType = [string]$data.contentType
-                ContentLength = $expectedLength
-                FinalUrl = [string]$data.finalUrl
-            }
+            return (Get-AssetBytesWithDownloadFallback -Session $Session -Url $Url -Referrer $Referrer)
         }
         catch {
             $lastError = $_.Exception.Message
