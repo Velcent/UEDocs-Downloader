@@ -2117,15 +2117,40 @@ function Get-AssetBytesWithSharedSlot {
 
     [void]$Shared.AssetSemaphore.Wait()
     try {
-        $assetSocket = Get-AssetSessionSocket -Session $Session.Value
-        if (-not $assetSocket -or $assetSocket.State -ne [System.Net.WebSockets.WebSocketState]::Open) {
-            if ($Session.Value) {
-                Close-AssetDownloadSession -Session $Session.Value
+        $lastError = ''
+        for ($attempt = 1; $attempt -le $ImageDownloadAttempts; $attempt++) {
+            $assetSocket = Get-AssetSessionSocket -Session $Session.Value
+            if (-not $assetSocket -or $assetSocket.State -ne [System.Net.WebSockets.WebSocketState]::Open) {
+                if ($Session.Value) {
+                    Close-AssetDownloadSession -Session $Session.Value
+                }
+                $Session.Value = New-AssetDownloadSession
+                $assetSocket = Get-AssetSessionSocket -Session $Session.Value
             }
-            $Session.Value = New-AssetDownloadSession
+
+            try {
+                return (Get-AssetBytesWithBrowser -Session $Session.Value -Url $Url -Referrer $Referrer)
+            }
+            catch {
+                $lastError = $_.Exception.Message
+                $socketAfterError = Get-AssetSessionSocket -Session $Session.Value
+                if ($socketAfterError -and $socketAfterError.State -eq [System.Net.WebSockets.WebSocketState]::Open) {
+                    throw
+                }
+
+                Write-Warning "Session Edge asset mati, buat session baru dan retry: $Url - $lastError"
+                if ($Session.Value) {
+                    Close-AssetDownloadSession -Session $Session.Value
+                }
+                $Session.Value = $null
+
+                if ($attempt -ge $ImageDownloadAttempts) {
+                    break
+                }
+            }
         }
 
-        return (Get-AssetBytesWithBrowser -Session $Session.Value -Url $Url -Referrer $Referrer)
+        throw "Download gagal setelah recreate session: $Url ($lastError)"
     }
     finally {
         [void]$Shared.AssetSemaphore.Release()
@@ -2223,19 +2248,44 @@ function Process-MhtmlFile {
             }
 
             if ([string]::IsNullOrEmpty($part.Body)) {
-                Write-Warning "Body kosong dan URL belum ada di manifest, skip: $location"
-                $fileHasAssetFailure = $true
-                continue
-            }
-
-            try {
-                $bytes = Decode-MimeBody -Body $part.Body -Encoding $transferEncoding
-            }
+                Write-Warning "Body kosong dan URL belum ada di manifest, download ulang: $location"
+                try {
+                    $sessionRef = if ($AssetSessionRef) { $AssetSessionRef } else { [ref]$assetSession }
+                    $download = Get-AssetBytesWithSharedSlot -Shared $Shared -Session $sessionRef -Url $location -Referrer $snapshotLocation
+                    $bytes = [byte[]]$download.Bytes
+                    $partContentType = Get-ContentTypeFromBytesOrUrl -Bytes $bytes -Url $location -ResponseContentType ([string]$download.ContentType)
+                    $storedEncoding = Get-PreferredManifestEncoding -ContentType $partContentType
+                    Add-SharedStat -Shared $Shared -Name 'DownloadedImgUrls'
+                }
                 catch {
-                    Write-Warning "Gagal decode $location ($transferEncoding) di $($File.Name): $($_.Exception.Message)"
+                    Add-SharedStat -Shared $Shared -Name 'FailedImgUrls'
+                    Write-Warning "Gagal download ulang body kosong: $location - $($_.Exception.Message)"
                     $fileHasAssetFailure = $true
                     continue
                 }
+            }
+            else {
+                try {
+                    $bytes = Decode-MimeBody -Body $part.Body -Encoding $transferEncoding
+                }
+                catch {
+                    Write-Warning "Gagal decode $location ($transferEncoding) di $($File.Name), download ulang: $($_.Exception.Message)"
+                    try {
+                        $sessionRef = if ($AssetSessionRef) { $AssetSessionRef } else { [ref]$assetSession }
+                        $download = Get-AssetBytesWithSharedSlot -Shared $Shared -Session $sessionRef -Url $location -Referrer $snapshotLocation
+                        $bytes = [byte[]]$download.Bytes
+                        $partContentType = Get-ContentTypeFromBytesOrUrl -Bytes $bytes -Url $location -ResponseContentType ([string]$download.ContentType)
+                        $storedEncoding = Get-PreferredManifestEncoding -ContentType $partContentType
+                        Add-SharedStat -Shared $Shared -Name 'DownloadedImgUrls'
+                    }
+                    catch {
+                        Add-SharedStat -Shared $Shared -Name 'FailedImgUrls'
+                        Write-Warning "Gagal download ulang setelah decode gagal: $location - $($_.Exception.Message)"
+                        $fileHasAssetFailure = $true
+                        continue
+                    }
+                }
+            }
 
             if ($partContentType -match '(?i)^image/') {
                 $validationError = Test-ImageBytesComplete -Bytes $bytes -ContentType $partContentType -Url $location
