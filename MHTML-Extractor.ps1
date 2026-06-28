@@ -7,8 +7,8 @@ param(
     [int]$ImageDownloadAttempts = 20,
     [int]$BrowserReadyTimeoutSeconds = 60,
     [int]$DownloadStallTimeoutSeconds = 120,
-    [int]$FileParallelism = 5,
-    [int]$AssetParallelism = 5,
+    [int]$FileParallelism = 1,
+    [int]$AssetParallelism = 1,
     [switch]$OverwriteExistingOutput
 )
 
@@ -510,8 +510,20 @@ function Test-ImageBytesComplete {
             }
         }
         '^image/jpeg$' {
-            if ($Bytes.Length -lt 2 -or $Bytes[$Bytes.Length - 2] -ne 0xff -or $Bytes[$Bytes.Length - 1] -ne 0xd9) {
-                return 'JPEG tidak punya marker akhir FFD9'
+            if ($Bytes.Length -lt 2) {
+                return 'JPEG terlalu kecil'
+            }
+
+            $hasEoiMarker = $false
+            for ($i = $Bytes.Length - 2; $i -ge 0; $i--) {
+                if ($Bytes[$i] -eq 0xff -and $Bytes[$i + 1] -eq 0xd9) {
+                    $hasEoiMarker = $true
+                    break
+                }
+            }
+
+            if (-not $hasEoiMarker) {
+                return 'JPEG tidak punya marker EOI FFD9'
             }
         }
         '^image/gif$' {
