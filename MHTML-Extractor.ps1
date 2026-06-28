@@ -6,8 +6,8 @@ param(
     [string]$TsvPath = '',
     [string]$ErrorTsvPath = '',
     [int]$ImageDownloadAttempts = 20,
-    [int]$BrowserReadyTimeoutSeconds = 120,
-    [int]$DownloadStallTimeoutSeconds = 60,
+    [int]$BrowserReadyTimeoutSeconds = 60,
+    [int]$DownloadStallTimeoutSeconds = 20,
     [int]$FileParallelism = 5,
     [int]$AssetParallelism = 5,
     [switch]$OverwriteExistingOutput
@@ -1490,6 +1490,7 @@ function Close-SharedAssetSessionPool {
     }
 
     $closedTargets = @{}
+    $downloadRoots = @{}
     if ($Shared.ContainsKey('AssetSessions') -and $Shared.AssetSessions) {
         foreach ($session in @($Shared.AssetSessions)) {
             $targetId = Get-AssetSessionTargetId -Session $session
@@ -1499,6 +1500,11 @@ function Close-SharedAssetSessionPool {
 
             if ($targetId) {
                 $closedTargets[$targetId] = $true
+            }
+
+            $downloadRoot = Get-AssetSessionDownloadRoot -Session $session
+            if (-not [string]::IsNullOrWhiteSpace($downloadRoot)) {
+                $downloadRoots[$downloadRoot] = $true
             }
 
             Close-AssetDownloadSession -Session $session
@@ -1516,6 +1522,10 @@ function Close-SharedAssetSessionPool {
 
     if ($Shared.ContainsKey('AssetSessions')) {
         $Shared.AssetSessions = $null
+    }
+
+    foreach ($downloadRoot in $downloadRoots.Keys) {
+        Remove-AssetDownloadRootDirectory -DownloadRoot $downloadRoot
     }
 }
 
@@ -1763,22 +1773,21 @@ function Set-EdgeDownloadBehavior {
     )
 
     New-Item -ItemType Directory -Force -Path $DownloadPath | Out-Null
-    $params = @{
-        behavior = 'allow'
-        downloadPath = $DownloadPath
-        eventsEnabled = $true
-    }
 
     try {
-        [void](Invoke-CdpCommand -Socket $Socket -Method 'Browser.setDownloadBehavior' -Params $params)
+        [void](Invoke-CdpCommand -Socket $Socket -Method 'Page.setDownloadBehavior' -Params @{
+            behavior = 'allow'
+            downloadPath = $DownloadPath
+        })
         return
     }
     catch {
     }
 
-    [void](Invoke-CdpCommand -Socket $Socket -Method 'Page.setDownloadBehavior' -Params @{
+    [void](Invoke-CdpCommand -Socket $Socket -Method 'Browser.setDownloadBehavior' -Params @{
         behavior = 'allow'
         downloadPath = $DownloadPath
+        eventsEnabled = $true
     })
 }
 
@@ -1840,7 +1849,7 @@ function Wait-DownloadedAssetFile {
         Start-Sleep -Milliseconds 250
     }
 
-    throw "Timeout menunggu download temp selesai."
+    throw "Timeout menunggu download temp selesai setelah $BrowserReadyTimeoutSeconds detik. DownloadStallTimeoutSeconds=$DownloadStallTimeoutSeconds detik hanya aktif kalau file .crdownload/.tmp sudah muncul lalu berhenti bertambah."
 }
 
 function Test-DownloadTempHasFiles {
@@ -1867,6 +1876,25 @@ function Remove-AssetDownloadTempDirectory {
         $pathFull = [System.IO.Path]::GetFullPath($DownloadPath).TrimEnd($trimChars) + [System.IO.Path]::DirectorySeparatorChar
         if ($pathFull.StartsWith($rootFull, [System.StringComparison]::OrdinalIgnoreCase) -and (Test-Path -LiteralPath $DownloadPath)) {
             Remove-Item -LiteralPath $DownloadPath -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+    catch {
+    }
+}
+
+function Remove-AssetDownloadRootDirectory {
+    param([string]$DownloadRoot)
+
+    if ([string]::IsNullOrWhiteSpace($DownloadRoot)) {
+        return
+    }
+
+    try {
+        $trimChars = [char[]]@('\', '/')
+        $assetsFull = [System.IO.Path]::GetFullPath($AssetsRoot).TrimEnd($trimChars) + [System.IO.Path]::DirectorySeparatorChar
+        $rootFull = [System.IO.Path]::GetFullPath($DownloadRoot).TrimEnd($trimChars) + [System.IO.Path]::DirectorySeparatorChar
+        if ($rootFull.StartsWith($assetsFull, [System.StringComparison]::OrdinalIgnoreCase) -and (Test-Path -LiteralPath $DownloadRoot)) {
+            Remove-Item -LiteralPath $DownloadRoot -Recurse -Force -ErrorAction SilentlyContinue
         }
     }
     catch {
@@ -2509,6 +2537,277 @@ function Get-AssetBytesWithSharedSlot {
     }
 }
 
+function Receive-RunspaceStreams {
+    param(
+        [object]$Task,
+        [string]$Prefix = ''
+    )
+
+    if (-not $Task -or -not $Task.PowerShell) {
+        return
+    }
+
+    $streamPrefix = ''
+    if (-not [string]::IsNullOrWhiteSpace($Prefix)) {
+        $streamPrefix = "[$Prefix] "
+    }
+    elseif ((Test-ObjectProperty -Object $Task -Name 'Prefix') -and -not [string]::IsNullOrWhiteSpace([string]$Task.Prefix)) {
+        $streamPrefix = "[$($Task.Prefix)] "
+    }
+
+    while ($Task.InformationIndex -lt $Task.PowerShell.Streams.Information.Count) {
+        $record = $Task.PowerShell.Streams.Information[$Task.InformationIndex]
+        $message = if ($record -and $record.MessageData) { [string]$record.MessageData } else { [string]$record }
+        if (-not [string]::IsNullOrWhiteSpace($message)) {
+            Write-Host "$streamPrefix$message"
+        }
+        $Task.InformationIndex++
+    }
+
+    while ($Task.WarningIndex -lt $Task.PowerShell.Streams.Warning.Count) {
+        $record = $Task.PowerShell.Streams.Warning[$Task.WarningIndex]
+        $message = if ($record -and (Test-ObjectProperty -Object $record -Name 'Message')) { [string]$record.Message } else { [string]$record }
+        if (-not [string]::IsNullOrWhiteSpace($message)) {
+            Write-Warning "$streamPrefix$message"
+        }
+        $Task.WarningIndex++
+    }
+
+    while ($Task.ErrorIndex -lt $Task.PowerShell.Streams.Error.Count) {
+        $record = $Task.PowerShell.Streams.Error[$Task.ErrorIndex]
+        $message = if ($record) { [string]$record } else { '' }
+        if (-not [string]::IsNullOrWhiteSpace($message)) {
+            Write-Warning "${streamPrefix}ERROR: $message"
+        }
+        $Task.ErrorIndex++
+    }
+}
+
+function Wait-RunspaceTasksWithLiveOutput {
+    param(
+        [System.Collections.Generic.List[object]]$Tasks,
+        [int]$PollMilliseconds = 250
+    )
+
+    if (-not $Tasks -or $Tasks.Count -eq 0) {
+        return
+    }
+
+    do {
+        $running = $false
+        foreach ($task in $Tasks) {
+            Receive-RunspaceStreams -Task $task
+            if ($task.Handle -and -not $task.Handle.IsCompleted) {
+                $running = $true
+            }
+        }
+
+        if ($running) {
+            Start-Sleep -Milliseconds $PollMilliseconds
+        }
+    } while ($running)
+
+    foreach ($task in $Tasks) {
+        Receive-RunspaceStreams -Task $task
+    }
+}
+
+function Invoke-MissingAssetDownloadsParallel {
+    param(
+        [object[]]$Requests,
+        [hashtable]$Shared,
+        [int]$ThrottleLimit
+    )
+
+    if (-not $Requests -or $Requests.Count -eq 0) {
+        return @()
+    }
+
+    if ($ThrottleLimit -le 1 -or $Requests.Count -le 1) {
+        $results = New-Object System.Collections.Generic.List[object]
+        foreach ($request in @($Requests)) {
+            $assetLink = [string]$request.link
+            try {
+                $imgRow = Get-ExistingManifestRowFromShared -Shared $Shared -Link $assetLink -MarkSeen
+                if ($imgRow) {
+                    $contentType = Get-ContentTypeForManifestRow -Row $imgRow
+                    Add-SharedStat -Shared $Shared -Name 'SkippedExistingUrls'
+                }
+                else {
+                    $assetSession = $null
+                    $download = Get-AssetBytesWithSharedSlot -Shared $Shared -Session ([ref]$assetSession) -Url $assetLink -Referrer ([string]$request.referrer)
+                    $bytes = [byte[]]$download.Bytes
+                    $contentType = Get-ContentTypeFromBytesOrUrl -Bytes $bytes -Url $assetLink -ResponseContentType ([string]$download.ContentType)
+                    $manifestEncoding = Get-PreferredManifestEncoding -ContentType $contentType
+                    $imgRow = Register-AssetBytesInShared -Shared $Shared -Link $assetLink -Bytes $bytes -ContentType $contentType -Encoding $manifestEncoding
+                    Add-SharedStat -Shared $Shared -Name 'DownloadedImgUrls'
+                }
+
+                $results.Add([pscustomobject]@{
+                    ok = $true
+                    link = $assetLink
+                    content_type = $contentType
+                    encoding = if ($imgRow -and $imgRow.encoding) { Normalize-StoredEncoding -Encoding ([string]$imgRow.encoding) } else { Get-PreferredManifestEncoding -ContentType $contentType }
+                    error = ''
+                }) | Out-Null
+            }
+            catch {
+                Add-SharedStat -Shared $Shared -Name 'FailedImgUrls'
+                Write-Warning "Gagal download asset tanpa multipart: $assetLink - $($_.Exception.Message)"
+                Add-MhtmlErrorFromShared -Shared $Shared -MhtmlPath ([string]$request.mhtml_path) -AssetUrl $assetLink -Reason 'missing_asset_download_failed' -Detail $_.Exception.Message
+                $results.Add([pscustomobject]@{
+                    ok = $false
+                    link = $assetLink
+                    content_type = ''
+                    encoding = ''
+                    error = $_.Exception.Message
+                }) | Out-Null
+            }
+        }
+
+        return $results.ToArray()
+    }
+
+    $functionDefinitions = [string]$Shared.FunctionDefinitions
+    $context = $Shared.WorkerContext
+    if ([string]::IsNullOrWhiteSpace($functionDefinitions) -or -not $context) {
+        return Invoke-MissingAssetDownloadsParallel -Requests $Requests -Shared $Shared -ThrottleLimit 1
+    }
+
+    $poolSize = [Math]::Min($ThrottleLimit, $Requests.Count)
+    $pool = [runspacefactory]::CreateRunspacePool(1, $poolSize)
+    $pool.ApartmentState = 'MTA'
+    $pool.Open()
+    $tasks = New-Object System.Collections.Generic.List[object]
+
+    $workerScript = {
+        param(
+            [string]$Definitions,
+            [object]$Request,
+            [hashtable]$WorkerShared,
+            [hashtable]$WorkerContext
+        )
+
+        Set-StrictMode -Version Latest
+        $ErrorActionPreference = 'Stop'
+        $ProgressPreference = 'SilentlyContinue'
+        Invoke-Expression $Definitions
+
+        $script:BrowserPort = if ($WorkerContext.BrowserPort) { [int]$WorkerContext.BrowserPort } else { $null }
+        $script:BrowserProcessId = $null
+        $script:CdpCommandId = 0
+        $script:BrowserProfileDir = [string]$WorkerContext.BrowserProfileDir
+        $script:BrowserReadyTimeoutSeconds = [int]$WorkerContext.BrowserReadyTimeoutSeconds
+
+        $Latin1 = [System.Text.Encoding]::GetEncoding(28591)
+        $Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+        $ImageDownloadAttempts = [int]$WorkerContext.ImageDownloadAttempts
+        $BrowserReadyTimeoutSeconds = [int]$WorkerContext.BrowserReadyTimeoutSeconds
+        $DownloadStallTimeoutSeconds = [int]$WorkerContext.DownloadStallTimeoutSeconds
+        $AssetsRoot = [string]$WorkerContext.AssetsRoot
+        $BinRoot = [string]$WorkerContext.BinRoot
+        $AssetsVideoRoot = [string]$WorkerContext.AssetsVideoRoot
+        $VideoMp4Root = [string]$WorkerContext.VideoMp4Root
+        $ScriptRootFull = [string]$WorkerContext.ScriptRootFull
+
+        $assetLink = [string]$Request.link
+        try {
+            $imgRow = Get-ExistingManifestRowFromShared -Shared $WorkerShared -Link $assetLink -MarkSeen
+            if ($imgRow) {
+                $contentType = Get-ContentTypeForManifestRow -Row $imgRow
+                Add-SharedStat -Shared $WorkerShared -Name 'SkippedExistingUrls'
+            }
+            else {
+                $assetSession = $null
+                $download = Get-AssetBytesWithSharedSlot -Shared $WorkerShared -Session ([ref]$assetSession) -Url $assetLink -Referrer ([string]$Request.referrer)
+                $bytes = [byte[]]$download.Bytes
+                $contentType = Get-ContentTypeFromBytesOrUrl -Bytes $bytes -Url $assetLink -ResponseContentType ([string]$download.ContentType)
+                $manifestEncoding = Get-PreferredManifestEncoding -ContentType $contentType
+                $imgRow = Register-AssetBytesInShared -Shared $WorkerShared -Link $assetLink -Bytes $bytes -ContentType $contentType -Encoding $manifestEncoding
+                Add-SharedStat -Shared $WorkerShared -Name 'DownloadedImgUrls'
+            }
+
+            return [pscustomobject]@{
+                ok = $true
+                link = $assetLink
+                content_type = $contentType
+                encoding = if ($imgRow -and $imgRow.encoding) { Normalize-StoredEncoding -Encoding ([string]$imgRow.encoding) } else { Get-PreferredManifestEncoding -ContentType $contentType }
+                error = ''
+            }
+        }
+        catch {
+            Add-SharedStat -Shared $WorkerShared -Name 'FailedImgUrls'
+            Write-Warning "Gagal download asset tanpa multipart: $assetLink - $($_.Exception.Message)"
+            Add-MhtmlErrorFromShared -Shared $WorkerShared -MhtmlPath ([string]$Request.mhtml_path) -AssetUrl $assetLink -Reason 'missing_asset_download_failed' -Detail $_.Exception.Message
+            return [pscustomobject]@{
+                ok = $false
+                link = $assetLink
+                content_type = ''
+                encoding = ''
+                error = $_.Exception.Message
+            }
+        }
+    }
+
+    try {
+        foreach ($request in @($Requests)) {
+            $ps = [powershell]::Create()
+            $ps.RunspacePool = $pool
+            [void]$ps.AddScript($workerScript)
+            [void]$ps.AddArgument($functionDefinitions)
+            [void]$ps.AddArgument($request)
+            [void]$ps.AddArgument($Shared)
+            [void]$ps.AddArgument($context)
+            $tasks.Add([pscustomobject]@{
+                PowerShell = $ps
+                Handle = $ps.BeginInvoke()
+                Link = [string]$request.link
+                Prefix = "asset"
+                InformationIndex = 0
+                WarningIndex = 0
+                ErrorIndex = 0
+            }) | Out-Null
+        }
+
+        Wait-RunspaceTasksWithLiveOutput -Tasks $tasks
+
+        $results = New-Object System.Collections.Generic.List[object]
+        foreach ($task in $tasks) {
+            try {
+                Receive-RunspaceStreams -Task $task
+                foreach ($result in @($task.PowerShell.EndInvoke($task.Handle))) {
+                    $results.Add($result) | Out-Null
+                }
+                Receive-RunspaceStreams -Task $task
+            }
+            catch {
+                Receive-RunspaceStreams -Task $task
+                Add-SharedStat -Shared $Shared -Name 'FailedImgUrls'
+                Write-Warning "Worker download asset gagal: $($task.Link) - $($_.Exception.Message)"
+                $results.Add([pscustomobject]@{
+                    ok = $false
+                    link = [string]$task.Link
+                    content_type = ''
+                    encoding = ''
+                    error = $_.Exception.Message
+                }) | Out-Null
+            }
+        }
+
+        return $results.ToArray()
+    }
+    finally {
+        foreach ($task in $tasks) {
+            if ($task.PowerShell) {
+                $task.PowerShell.Dispose()
+            }
+        }
+
+        $pool.Close()
+        $pool.Dispose()
+    }
+}
+
 function Clear-MhtmlWithSharedManifest {
     param(
         [hashtable]$Shared,
@@ -2673,6 +2972,7 @@ function Process-MhtmlFile {
         }
 
         $missingImgParts = New-Object System.Collections.Generic.List[object]
+        $pendingAssetDownloads = New-Object System.Collections.Generic.List[object]
         foreach ($assetRef in Get-MissingAssetRefsFromMhtml -Parts $parts -SnapshotLocation $snapshotLocation -PartLocations $filePartLocations) {
             $assetLink = [string]$assetRef.link
             if (-not $assetLink -or $filePartLocations.ContainsKey($assetLink)) {
@@ -2724,22 +3024,12 @@ function Process-MhtmlFile {
                     Add-SharedStat -Shared $Shared -Name 'SkippedExistingUrls'
                 }
                 else {
-                    try {
-                        $sessionRef = if ($AssetSessionRef) { $AssetSessionRef } else { [ref]$assetSession }
-                        $download = Get-AssetBytesWithSharedSlot -Shared $Shared -Session $sessionRef -Url $assetLink -Referrer $snapshotLocation
-                        $bytes = [byte[]]$download.Bytes
-                        $contentType = Get-ContentTypeFromBytesOrUrl -Bytes $bytes -Url $assetLink -ResponseContentType ([string]$download.ContentType)
-                        $manifestEncoding = Get-PreferredManifestEncoding -ContentType $contentType
-                        $imgRow = Register-AssetBytesInShared -Shared $Shared -Link $assetLink -Bytes $bytes -ContentType $contentType -Encoding $manifestEncoding
-                        Add-SharedStat -Shared $Shared -Name 'DownloadedImgUrls'
-                    }
-                    catch {
-                        Add-SharedStat -Shared $Shared -Name 'FailedImgUrls'
-                        Write-Warning "Gagal download asset tanpa multipart: $assetLink - $($_.Exception.Message)"
-                        Add-MhtmlErrorFromShared -Shared $Shared -MhtmlPath $File.FullName -AssetUrl $assetLink -Reason 'missing_asset_download_failed' -Detail $_.Exception.Message
-                        $fileHasAssetFailure = $true
-                        continue
-                    }
+                    $pendingAssetDownloads.Add([pscustomobject]@{
+                        link = $assetLink
+                        referrer = $snapshotLocation
+                        mhtml_path = $File.FullName
+                    }) | Out-Null
+                    continue
                 }
             }
 
@@ -2748,6 +3038,28 @@ function Process-MhtmlFile {
                     link = $assetLink
                     content_type = $contentType
                     encoding = if ($imgRow -and $imgRow.encoding) { Normalize-StoredEncoding -Encoding ([string]$imgRow.encoding) } else { Get-PreferredManifestEncoding -ContentType $contentType }
+                }) | Out-Null
+                $filePartLocations[$assetLink] = $true
+            }
+        }
+
+        if ($pendingAssetDownloads.Count -gt 0) {
+            Write-Host "Download asset paralel untuk $($File.Name): $($pendingAssetDownloads.Count) URL"
+            $downloadResults = @(Invoke-MissingAssetDownloadsParallel -Requests ([object[]]$pendingAssetDownloads.ToArray()) -Shared $Shared -ThrottleLimit ([int]$Shared.AssetParallelism))
+            foreach ($downloadResult in $downloadResults) {
+                if (-not $downloadResult.ok) {
+                    $fileHasAssetFailure = $true
+                    continue
+                }
+
+                $assetLink = [string]$downloadResult.link
+                $contentType = [string]$downloadResult.content_type
+                $encoding = if ($downloadResult.encoding) { [string]$downloadResult.encoding } else { Get-PreferredManifestEncoding -ContentType $contentType }
+
+                $missingImgParts.Add([pscustomobject]@{
+                    link = $assetLink
+                    content_type = $contentType
+                    encoding = $encoding
                 }) | Out-Null
                 $filePartLocations[$assetLink] = $true
             }
@@ -2810,7 +3122,7 @@ function Invoke-MhtmlFilesParallel {
     $workerScript = {
         param(
             [string]$Definitions,
-            [string[]]$FilePaths,
+            [object]$WorkerFileQueue,
             [string]$WorkerInputBasePath,
             [hashtable]$WorkerShared,
             [hashtable]$WorkerContext,
@@ -2839,35 +3151,34 @@ function Invoke-MhtmlFilesParallel {
         $VideoMp4Root = [string]$WorkerContext.VideoMp4Root
         $ScriptRootFull = [string]$WorkerContext.ScriptRootFull
 
-        foreach ($filePath in $FilePaths) {
+        $processed = New-Object System.Collections.Generic.List[string]
+        while ($true) {
+            $filePath = ''
+            if (-not $WorkerFileQueue.TryDequeue([ref]$filePath)) {
+                break
+            }
+
             $file = Get-Item -LiteralPath $filePath
             Process-MhtmlFile -File $file -InputBasePath $WorkerInputBasePath -Shared $WorkerShared -OverwriteExistingOutput:([bool]$WorkerOverwriteExistingOutput)
+            $processed.Add($filePath) | Out-Null
         }
 
-        return ($FilePaths -join "`n")
+        return ($processed.ToArray() -join "`n")
     }
 
     try {
         $workerCount = [Math]::Min($ThrottleLimit, $Files.Count)
-        $chunks = New-Object System.Collections.Generic.List[object]
-        for ($i = 0; $i -lt $workerCount; $i++) {
-            $chunks.Add((New-Object 'System.Collections.Generic.List[string]')) | Out-Null
+        $fileQueue = [System.Collections.Concurrent.ConcurrentQueue[string]]::new()
+        foreach ($file in $Files) {
+            $fileQueue.Enqueue($file.FullName)
         }
 
-        for ($i = 0; $i -lt $Files.Count; $i++) {
-            $chunks[$i % $workerCount].Add($Files[$i].FullName) | Out-Null
-        }
-
-        foreach ($chunk in $chunks) {
-            if ($chunk.Count -eq 0) {
-                continue
-            }
-
+        for ($workerIndex = 1; $workerIndex -le $workerCount; $workerIndex++) {
             $ps = [powershell]::Create()
             $ps.RunspacePool = $pool
             [void]$ps.AddScript($workerScript)
             [void]$ps.AddArgument($FunctionDefinitions)
-            [void]$ps.AddArgument([string[]]$chunk.ToArray())
+            [void]$ps.AddArgument($fileQueue)
             [void]$ps.AddArgument($InputBasePath)
             [void]$ps.AddArgument($Shared)
             [void]$ps.AddArgument($Context)
@@ -2875,16 +3186,25 @@ function Invoke-MhtmlFilesParallel {
             $tasks.Add([pscustomobject]@{
                 PowerShell = $ps
                 Handle = $ps.BeginInvoke()
-                File = "$($chunk.Count) file(s)"
+                File = "worker $workerIndex"
+                Prefix = "file-$workerIndex"
+                InformationIndex = 0
+                WarningIndex = 0
+                ErrorIndex = 0
             }) | Out-Null
         }
+
+        Wait-RunspaceTasksWithLiveOutput -Tasks $tasks
 
         $errors = New-Object System.Collections.Generic.List[string]
         foreach ($task in $tasks) {
             try {
+                Receive-RunspaceStreams -Task $task
                 [void]$task.PowerShell.EndInvoke($task.Handle)
+                Receive-RunspaceStreams -Task $task
             }
             catch {
+                Receive-RunspaceStreams -Task $task
                 $errors.Add("$($task.File): $($_.Exception.Message)") | Out-Null
             }
         }
@@ -2971,6 +3291,9 @@ $shared = [hashtable]::Synchronized(@{
     AssetSemaphore = [System.Threading.SemaphoreSlim]::new($AssetParallelism, $AssetParallelism)
     AssetSessionPool = $null
     AssetSessions = $null
+    AssetParallelism = $AssetParallelism
+    FunctionDefinitions = ''
+    WorkerContext = $null
     Stats = $stats
     HashToPath = $hashToPath
     UrlToRow = $urlToRow
@@ -2993,8 +3316,26 @@ try {
     Write-Host "Asset parallelism    : $AssetParallelism"
 
     if ($files.Count -gt 0) {
+        $functionDefinitions = Get-ScriptFunctionDefinitions
+        $shared.FunctionDefinitions = $functionDefinitions
+
         Write-Host "Menyiapkan $AssetParallelism tab asset worker permanen..."
         Initialize-SharedAssetSessionPool -Shared $shared -Count $AssetParallelism
+
+        $context = @{
+            AssetsRoot = $AssetsRoot
+            BinRoot = $BinRoot
+            AssetsVideoRoot = $AssetsVideoRoot
+            VideoMp4Root = $VideoMp4Root
+            ScriptRootFull = $ScriptRootFull
+            BrowserPort = $script:BrowserPort
+            BrowserProfileDir = $script:BrowserProfileDir
+            ImageDownloadAttempts = $ImageDownloadAttempts
+            BrowserReadyTimeoutSeconds = $BrowserReadyTimeoutSeconds
+            DownloadStallTimeoutSeconds = $DownloadStallTimeoutSeconds
+            ErrorTsvPath = $ErrorTsvPath
+        }
+        $shared.WorkerContext = $context
 
         if ($FileParallelism -le 1) {
             foreach ($file in $files) {
@@ -3003,21 +3344,6 @@ try {
         }
         else {
             Write-Host "Menyiapkan runspace worker parallel..."
-            $functionDefinitions = Get-ScriptFunctionDefinitions
-            $context = @{
-                AssetsRoot = $AssetsRoot
-                BinRoot = $BinRoot
-                AssetsVideoRoot = $AssetsVideoRoot
-                VideoMp4Root = $VideoMp4Root
-                ScriptRootFull = $ScriptRootFull
-                BrowserPort = $script:BrowserPort
-                BrowserProfileDir = $script:BrowserProfileDir
-                ImageDownloadAttempts = $ImageDownloadAttempts
-                BrowserReadyTimeoutSeconds = $BrowserReadyTimeoutSeconds
-                DownloadStallTimeoutSeconds = $DownloadStallTimeoutSeconds
-                ErrorTsvPath = $ErrorTsvPath
-            }
-
             Invoke-MhtmlFilesParallel -Files ([System.IO.FileInfo[]]$files.ToArray()) -InputBasePath $inputBasePath -Shared $shared -ThrottleLimit $FileParallelism -FunctionDefinitions $functionDefinitions -Context $context -OverwriteExistingOutput:$OverwriteExistingOutput
         }
     }
