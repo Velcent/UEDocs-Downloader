@@ -7,9 +7,9 @@ param(
     [string]$ErrorTsvPath = '',
     [int]$ImageDownloadAttempts = 20,
     [int]$BrowserReadyTimeoutSeconds = 60,
-    [int]$DownloadStallTimeoutSeconds = 120,
+    [int]$DownloadStallTimeoutSeconds = 3,
     [int]$FileParallelism = 1,
-    [int]$AssetParallelism = 1,
+    [int]$AssetParallelism = 5,
     [switch]$OverwriteExistingOutput
 )
 
@@ -21,7 +21,7 @@ $Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 $ProgressPreference = 'SilentlyContinue'
 $ImageDownloadAttempts = [Math]::Max(1, $ImageDownloadAttempts)
 $BrowserReadyTimeoutSeconds = [Math]::Max(5, $BrowserReadyTimeoutSeconds)
-$DownloadStallTimeoutSeconds = [Math]::Max(10, $DownloadStallTimeoutSeconds)
+$DownloadStallTimeoutSeconds = [Math]::Max(1, $DownloadStallTimeoutSeconds)
 $FileParallelism = [Math]::Max(1, $FileParallelism)
 $AssetParallelism = [Math]::Max(1, $AssetParallelism)
 $script:BrowserPort = $null
