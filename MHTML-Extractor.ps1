@@ -6,6 +6,7 @@ param(
     [string]$TsvPath = '',
     [int]$ImageDownloadAttempts = 20,
     [int]$BrowserReadyTimeoutSeconds = 60,
+    [int]$DownloadStallTimeoutSeconds = 120,
     [int]$FileParallelism = 5,
     [int]$AssetParallelism = 5,
     [switch]$OverwriteExistingOutput
@@ -19,6 +20,7 @@ $Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 $ProgressPreference = 'SilentlyContinue'
 $ImageDownloadAttempts = [Math]::Max(1, $ImageDownloadAttempts)
 $BrowserReadyTimeoutSeconds = [Math]::Max(5, $BrowserReadyTimeoutSeconds)
+$DownloadStallTimeoutSeconds = [Math]::Max(10, $DownloadStallTimeoutSeconds)
 $FileParallelism = [Math]::Max(1, $FileParallelism)
 $AssetParallelism = [Math]::Max(1, $AssetParallelism)
 $script:BrowserPort = $null
@@ -1632,7 +1634,7 @@ function Wait-DownloadedAssetFile {
     $stableCount = 0
     $lastPartialFile = $null
     $lastPartialLength = -1
-    $partialStableCount = 0
+    $lastPartialProgressAt = Get-Date
 
     while ((Get-Date) -lt $deadline) {
         $partialFiles = @(Get-ChildItem -LiteralPath $DownloadPath -File -ErrorAction SilentlyContinue | Where-Object {
@@ -1645,21 +1647,22 @@ function Wait-DownloadedAssetFile {
         if ($partialFiles.Count -gt 0) {
             $partialFile = $partialFiles[0]
             if ($lastPartialFile -and $lastPartialFile.FullName -eq $partialFile.FullName -and $lastPartialLength -eq $partialFile.Length) {
-                $partialStableCount++
-                if ($partialStableCount -ge 20) {
-                    throw "Download temp macet/interrupted: $($partialFile.Name) ($($partialFile.Length) bytes)"
+                $stalledFor = ((Get-Date) - $lastPartialProgressAt).TotalSeconds
+                if ($stalledFor -ge $DownloadStallTimeoutSeconds) {
+                    throw "Download temp macet/interrupted selama $([int]$stalledFor) detik: $($partialFile.Name) ($($partialFile.Length) bytes)"
                 }
             }
             else {
                 $lastPartialFile = $partialFile
                 $lastPartialLength = $partialFile.Length
-                $partialStableCount = 0
+                $lastPartialProgressAt = Get-Date
+                $deadline = (Get-Date).AddSeconds($BrowserReadyTimeoutSeconds)
             }
         }
         else {
             $lastPartialFile = $null
             $lastPartialLength = -1
-            $partialStableCount = 0
+            $lastPartialProgressAt = Get-Date
         }
 
         if ($files.Count -gt 0 -and $partialFiles.Count -eq 0) {
@@ -2552,6 +2555,7 @@ function Invoke-MhtmlFilesParallel {
         $Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
         $ImageDownloadAttempts = [int]$WorkerContext.ImageDownloadAttempts
         $BrowserReadyTimeoutSeconds = [int]$WorkerContext.BrowserReadyTimeoutSeconds
+        $DownloadStallTimeoutSeconds = [int]$WorkerContext.DownloadStallTimeoutSeconds
         $AssetsRoot = [string]$WorkerContext.AssetsRoot
         $BinRoot = [string]$WorkerContext.BinRoot
         $AssetsVideoRoot = [string]$WorkerContext.AssetsVideoRoot
@@ -2740,6 +2744,7 @@ try {
                 BrowserProfileDir = $script:BrowserProfileDir
                 ImageDownloadAttempts = $ImageDownloadAttempts
                 BrowserReadyTimeoutSeconds = $BrowserReadyTimeoutSeconds
+                DownloadStallTimeoutSeconds = $DownloadStallTimeoutSeconds
             }
 
             Invoke-MhtmlFilesParallel -Files ([System.IO.FileInfo[]]$files.ToArray()) -InputBasePath $inputBasePath -Shared $shared -ThrottleLimit $FileParallelism -FunctionDefinitions $functionDefinitions -Context $context -OverwriteExistingOutput:$OverwriteExistingOutput
