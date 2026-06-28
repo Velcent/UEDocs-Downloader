@@ -8,8 +8,8 @@ param(
     [int]$ImageDownloadAttempts = 20,
     [int]$BrowserReadyTimeoutSeconds = 60,
     [int]$DownloadStallTimeoutSeconds = 20,
-    [int]$FileParallelism = 5,
-    [int]$AssetParallelism = 5,
+    [int]$FileParallelism = 10,
+    [int]$AssetParallelism = 10,
     [switch]$OverwriteExistingOutput
 )
 
@@ -1286,6 +1286,113 @@ function Close-DevToolsPage {
     }
 }
 
+function Get-BrowserWebSocketUrl {
+    Ensure-Edge
+    $version = Invoke-RestMethod -Uri "http://127.0.0.1:$($script:BrowserPort)/json/version" -ErrorAction Stop
+    if (-not $version.webSocketDebuggerUrl) {
+        throw 'Browser WebSocket DevTools URL tidak ditemukan.'
+    }
+
+    return [string]$version.webSocketDebuggerUrl
+}
+
+function New-BrowserCdpSocket {
+    $socket = [System.Net.WebSockets.ClientWebSocket]::new()
+    [void]$socket.ConnectAsync([Uri](Get-BrowserWebSocketUrl), [Threading.CancellationToken]::None).GetAwaiter().GetResult()
+    return $socket
+}
+
+function Get-DevToolsTargetById {
+    param([string]$TargetId)
+
+    $deadline = (Get-Date).AddSeconds(10)
+    while ((Get-Date) -lt $deadline) {
+        try {
+            foreach ($target in @(Invoke-RestMethod -Uri "http://127.0.0.1:$($script:BrowserPort)/json/list" -ErrorAction Stop)) {
+                if ([string]$target.id -eq $TargetId) {
+                    return $target
+                }
+            }
+        }
+        catch {
+        }
+
+        Start-Sleep -Milliseconds 100
+    }
+
+    return [pscustomobject]@{
+        id = $TargetId
+        webSocketDebuggerUrl = "ws://127.0.0.1:$($script:BrowserPort)/devtools/page/$TargetId"
+    }
+}
+
+function New-IsolatedDevToolsTarget {
+    param([string]$OpenUrl)
+
+    $browserSocket = New-BrowserCdpSocket
+    $browserContextId = ''
+    try {
+        $contextResponse = Invoke-CdpCommand -Socket $browserSocket -Method 'Target.createBrowserContext' -Params @{
+            disposeOnDetach = $false
+        }
+        $browserContextId = [string]$contextResponse.result.browserContextId
+
+        $targetResponse = Invoke-CdpCommand -Socket $browserSocket -Method 'Target.createTarget' -Params @{
+            url = $OpenUrl
+            browserContextId = $browserContextId
+        }
+        $targetId = [string]$targetResponse.result.targetId
+        $target = Get-DevToolsTargetById -TargetId $targetId
+
+        return [pscustomobject]@{
+            id = $targetId
+            webSocketDebuggerUrl = [string]$target.webSocketDebuggerUrl
+            browserContextId = $browserContextId
+        }
+    }
+    catch {
+        if (-not [string]::IsNullOrWhiteSpace($browserContextId)) {
+            try {
+                [void](Invoke-CdpCommand -Socket $browserSocket -Method 'Target.disposeBrowserContext' -Params @{
+                    browserContextId = $browserContextId
+                })
+            }
+            catch {
+            }
+        }
+
+        throw
+    }
+    finally {
+        if ($browserSocket -and $browserSocket -is [System.Net.WebSockets.ClientWebSocket]) {
+            $browserSocket.Dispose()
+        }
+    }
+}
+
+function Dispose-BrowserContext {
+    param([string]$BrowserContextId)
+
+    if ([string]::IsNullOrWhiteSpace($BrowserContextId)) {
+        return
+    }
+
+    $browserSocket = $null
+    try {
+        $browserSocket = New-BrowserCdpSocket
+        [void](Invoke-CdpCommand -Socket $browserSocket -Method 'Target.disposeBrowserContext' -Params @{
+            browserContextId = $BrowserContextId
+        })
+    }
+    catch {
+    }
+    finally {
+        if ($browserSocket -and $browserSocket -is [System.Net.WebSockets.ClientWebSocket]) {
+            $browserSocket.Dispose()
+        }
+    }
+}
+
 function Receive-WebSocketText {
     param([System.Net.WebSockets.ClientWebSocket]$Socket)
 
@@ -1361,9 +1468,18 @@ function Invoke-PageEval {
 }
 
 function New-AssetDownloadSession {
-    $target = Open-DevToolsUrl -OpenUrl 'about:blank'
+    $target = $null
+    try {
+        $target = New-IsolatedDevToolsTarget -OpenUrl 'about:blank'
+    }
+    catch {
+        Write-Warning "Gagal buat isolated browser context, fallback ke tab normal: $($_.Exception.Message)"
+        $target = Open-DevToolsUrl -OpenUrl 'about:blank'
+    }
+
+    $browserContextId = if (Test-ObjectProperty -Object $target -Name 'browserContextId') { [string]$target.browserContextId } else { '' }
     $socket = [System.Net.WebSockets.ClientWebSocket]::new()
-    $socket.ConnectAsync([Uri]$target.webSocketDebuggerUrl, [Threading.CancellationToken]::None).GetAwaiter().GetResult()
+    [void]$socket.ConnectAsync([Uri]$target.webSocketDebuggerUrl, [Threading.CancellationToken]::None).GetAwaiter().GetResult()
 
     [void](Invoke-CdpCommand -Socket $socket -Method 'Page.enable')
     [void](Invoke-CdpCommand -Socket $socket -Method 'Runtime.enable')
@@ -1375,6 +1491,7 @@ function New-AssetDownloadSession {
     return [pscustomobject]@{
         Socket = $socket
         TargetId = [string]$target.id
+        BrowserContextId = $browserContextId
         DownloadRoot = Join-Path $AssetsRoot ".edge-downloads-$PID"
     }
 }
@@ -1397,6 +1514,18 @@ function Get-AssetSessionTargetId {
     foreach ($item in @($Session)) {
         if ($item -and (Test-ObjectProperty -Object $item -Name 'TargetId')) {
             return [string]$item.TargetId
+        }
+    }
+
+    return ''
+}
+
+function Get-AssetSessionBrowserContextId {
+    param($Session)
+
+    foreach ($item in @($Session)) {
+        if ($item -and (Test-ObjectProperty -Object $item -Name 'BrowserContextId')) {
+            return [string]$item.BrowserContextId
         }
     }
 
@@ -1432,6 +1561,7 @@ function Close-AssetDownloadSession {
     }
 
     Close-DevToolsPage -TargetId (Get-AssetSessionTargetId -Session $Session)
+    Dispose-BrowserContext -BrowserContextId (Get-AssetSessionBrowserContextId -Session $Session)
 }
 
 function Initialize-SharedAssetSessionPool {
@@ -1769,7 +1899,8 @@ function Get-AssetBytesFromNetworkBody {
 function Set-EdgeDownloadBehavior {
     param(
         [System.Net.WebSockets.ClientWebSocket]$Socket,
-        [string]$DownloadPath
+        [string]$DownloadPath,
+        [string]$BrowserContextId = ''
     )
 
     New-Item -ItemType Directory -Force -Path $DownloadPath | Out-Null
@@ -1782,6 +1913,25 @@ function Set-EdgeDownloadBehavior {
         return
     }
     catch {
+    }
+
+    $params = @{
+        behavior = 'allow'
+        downloadPath = $DownloadPath
+        eventsEnabled = $true
+    }
+    if (-not [string]::IsNullOrWhiteSpace($BrowserContextId)) {
+        $params.browserContextId = $BrowserContextId
+    }
+
+    try {
+        [void](Invoke-CdpCommand -Socket $Socket -Method 'Browser.setDownloadBehavior' -Params $params)
+        return
+    }
+    catch {
+        if ([string]::IsNullOrWhiteSpace($BrowserContextId)) {
+            throw
+        }
     }
 
     [void](Invoke-CdpCommand -Socket $Socket -Method 'Browser.setDownloadBehavior' -Params @{
@@ -1909,11 +2059,12 @@ function Get-AssetBytesWithDownloadFallback {
     )
 
     $socket = Get-AssetSessionSocket -Session $Session
+    $browserContextId = Get-AssetSessionBrowserContextId -Session $Session
     $downloadRoot = Get-AssetSessionDownloadRoot -Session $Session
     $downloadPath = Join-Path $downloadRoot ([guid]::NewGuid().ToString('n'))
 
     try {
-        Set-EdgeDownloadBehavior -Socket $socket -DownloadPath $downloadPath
+        Set-EdgeDownloadBehavior -Socket $socket -DownloadPath $downloadPath -BrowserContextId $browserContextId
 
         $params = @{ url = $Url }
         if (-not [string]::IsNullOrWhiteSpace($Referrer)) {
@@ -1949,6 +2100,7 @@ function Get-AssetBytesWithDownloadFallback {
                     throw "Asset terbuka inline tapi body CDP gagal dibaca: $networkBodyError"
                 }
 
+                Write-Host "Tunggu file download Edge: $downloadPath"
                 $downloadedAfterRender = Wait-DownloadedAssetFile -DownloadPath $downloadPath
                 if (-not $downloadedAfterRender) {
                     throw
@@ -1960,6 +2112,7 @@ function Get-AssetBytesWithDownloadFallback {
             }
         }
 
+        Write-Host "Tunggu file download Edge: $downloadPath"
         $downloaded = Wait-DownloadedAssetFile -DownloadPath $downloadPath
         if (-not $downloaded) {
             throw "Download temp tidak muncul: $Url"
