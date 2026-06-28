@@ -381,7 +381,9 @@ function Clear-MhtmlExternalPartBodies {
                 $normalizedEncoding = '8bit'
             }
 
-            $updatedHeaderText = Update-OrAddHeader -HeaderText $headerText -Name 'Content-Transfer-Encoding' -Value $normalizedEncoding
+            $normalizedContentType = Get-ContentTypeForManifestRow -Row $row
+            $updatedHeaderText = Update-OrAddHeader -HeaderText $headerText -Name 'Content-Type' -Value $normalizedContentType
+            $updatedHeaderText = Update-OrAddHeader -HeaderText $updatedHeaderText -Name 'Content-Transfer-Encoding' -Value $normalizedEncoding
             $builder.Append($updatedHeaderText) | Out-Null
             $builder.Append($separator.Value) | Out-Null
             $cleared++
@@ -483,7 +485,10 @@ function Get-ContentTypeFromBytesOrUrl {
     )
 
     if (-not [string]::IsNullOrWhiteSpace($ResponseContentType)) {
-        return (($ResponseContentType -split ';', 2)[0]).Trim()
+        $responseType = (($ResponseContentType -split ';', 2)[0]).Trim()
+        if ($responseType -notmatch '(?i)^application/octet-?stream$') {
+            return $responseType
+        }
     }
 
     if ($Bytes -and $Bytes.Length -ge 12) {
@@ -623,7 +628,10 @@ function Get-ContentTypeForManifestRow {
     }
 
     if ((Test-ObjectProperty -Object $Row -Name 'type') -and -not [string]::IsNullOrWhiteSpace([string]$Row.type)) {
-        return [string]$Row.type
+        $rowType = (([string]$Row.type -split ';', 2)[0]).Trim()
+        if ($rowType -notmatch '(?i)^application/octet-?stream$') {
+            return $rowType
+        }
     }
 
     try {
@@ -1466,14 +1474,15 @@ function ConvertTo-AssetDownloadResult {
         [string]$OriginalUrl
     )
 
-    $validationError = Test-ImageBytesComplete -Bytes $Bytes -ContentType $ContentType -Url $OriginalUrl -ExpectedLength $ExpectedLength
+    $normalizedContentType = Get-ContentTypeFromBytesOrUrl -Bytes $Bytes -Url $OriginalUrl -ResponseContentType $ContentType
+    $validationError = Test-ImageBytesComplete -Bytes $Bytes -ContentType $normalizedContentType -Url $OriginalUrl -ExpectedLength $ExpectedLength
     if (-not [string]::IsNullOrWhiteSpace($validationError)) {
         throw $validationError
     }
 
     return [pscustomobject]@{
         Bytes = $Bytes
-        ContentType = $ContentType
+        ContentType = $normalizedContentType
         ContentLength = $ExpectedLength
         FinalUrl = $FinalUrl
     }
@@ -2015,7 +2024,8 @@ function Write-ManifestFile {
 
     foreach ($row in ($Rows | Sort-Object link, path)) {
         $rowType = if ((Test-ObjectProperty -Object $row -Name 'type') -and -not [string]::IsNullOrWhiteSpace([string]$row.type)) {
-            [string]$row.type
+            $rawType = (([string]$row.type -split ';', 2)[0]).Trim()
+            if ($rawType -notmatch '(?i)^application/octet-?stream$') { $rawType } else { Get-ContentTypeForManifestRow -Row $row }
         }
         else {
             Get-ContentTypeForManifestRow -Row $row
@@ -2057,7 +2067,8 @@ function ConvertTo-ManifestTsvLine {
     param([object]$Row)
 
     $rowType = if ((Test-ObjectProperty -Object $Row -Name 'type') -and -not [string]::IsNullOrWhiteSpace([string]$Row.type)) {
-        [string]$Row.type
+        $rawType = (([string]$Row.type -split ';', 2)[0]).Trim()
+        if ($rawType -notmatch '(?i)^application/octet-?stream$') { $rawType } else { Get-ContentTypeForManifestRow -Row $Row }
     }
     else {
         Get-ContentTypeForManifestRow -Row $Row
@@ -2480,6 +2491,9 @@ function Process-MhtmlFile {
                     }
                 }
             }
+
+            $partContentType = Get-ContentTypeFromBytesOrUrl -Bytes $bytes -Url $location -ResponseContentType $partContentType
+            $storedEncoding = Get-PreferredManifestEncoding -ContentType $partContentType
 
             if ($partContentType -match '(?i)^image/') {
                 $validationError = Test-ImageBytesComplete -Bytes $bytes -ContentType $partContentType -Url $location
