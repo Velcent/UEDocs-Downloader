@@ -54,16 +54,18 @@ function Invoke-OptimiztFile {
 
     $arguments.Add('-o') | Out-Null
     $arguments.Add($TargetDirectory) | Out-Null
-    $arguments.Add($File.DirectoryName) | Out-Null
-    $arguments.Add($File.Name) | Out-Null
+    $arguments.Add($File.FullName) | Out-Null
 
     if ($WhatIf) {
         Write-Host "WHATIF optimizt $($arguments -join ' ')"
         return 0
     }
 
-    & optimizt @arguments
-    return $LASTEXITCODE
+    & optimizt @arguments | ForEach-Object {
+        Write-Host $_
+    }
+
+    return [int]$global:LASTEXITCODE
 }
 
 $optimiztCommand = Get-Command 'optimizt' -ErrorAction SilentlyContinue
