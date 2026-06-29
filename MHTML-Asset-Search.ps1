@@ -3,6 +3,7 @@ param(
     [Parameter(Mandatory = $true, Position = 0)]
     [string]$Url,
     [string]$MhtmlRoot = '',
+    [string]$AssetBinRoot = '',
     [string]$OutputPath = ''
 )
 
@@ -13,6 +14,10 @@ $Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
 
 if (-not $MhtmlRoot) {
     $MhtmlRoot = Join-Path $PSScriptRoot 'assets\mhtml'
+}
+
+if (-not $AssetBinRoot) {
+    $AssetBinRoot = Join-Path $PSScriptRoot 'assets\bin'
 }
 
 if (-not $OutputPath) {
@@ -89,18 +94,48 @@ function Find-UrlInText {
     return ''
 }
 
+function Get-SearchFiles {
+    param(
+        [string]$MhtmlPath,
+        [string]$BinPath
+    )
+
+    $items = New-Object System.Collections.Generic.List[object]
+
+    foreach ($file in @(Get-ChildItem -LiteralPath $MhtmlPath -Filter *.mhtml -File -Recurse | Sort-Object FullName)) {
+        $items.Add([pscustomobject]@{
+            File = $file
+            BasePath = $MhtmlPath
+            Prefix = ''
+        }) | Out-Null
+    }
+
+    if (Test-Path -LiteralPath $BinPath) {
+        foreach ($file in @(Get-ChildItem -LiteralPath $BinPath -Filter *.html -File -Recurse | Sort-Object FullName)) {
+            $items.Add([pscustomobject]@{
+                File = $file
+                BasePath = $BinPath
+                Prefix = 'assets/bin/'
+            }) | Out-Null
+        }
+    }
+
+    return $items.ToArray()
+}
+
 if (-not (Test-Path -LiteralPath $MhtmlRoot)) {
     throw "Folder MHTML tidak ditemukan: $MhtmlRoot"
 }
 
 $variants = @(Get-UrlVariants -Value $Url)
 $results = New-Object System.Collections.Generic.List[object]
-$files = @(Get-ChildItem -LiteralPath $MhtmlRoot -Filter *.mhtml -File -Recurse | Sort-Object FullName)
+$files = @(Get-SearchFiles -MhtmlPath $MhtmlRoot -BinPath $AssetBinRoot)
 $total = $files.Count
 $index = 0
 
-foreach ($file in $files) {
+foreach ($item in $files) {
     $index++
+    $file = $item.File
     if ($index -eq 1 -or $index % 100 -eq 0 -or $index -eq $total) {
         Write-Host ("Scan {0}/{1}: {2}" -f $index, $total, $file.Name)
     }
@@ -110,7 +145,11 @@ foreach ($file in $files) {
         continue
     }
 
-    $relativePath = Get-RelativePathFromBase -BasePath $MhtmlRoot -FullPath $file.FullName
+    $relativePath = (Get-RelativePathFromBase -BasePath $item.BasePath -FullPath $file.FullName)
+    if ($item.Prefix) {
+        $relativePath = $item.Prefix + ($relativePath -replace '\\', '/')
+    }
+
     $results.Add([pscustomobject]@{
         file = ($relativePath -replace '\\', '/')
         match_kind = $matchKind
