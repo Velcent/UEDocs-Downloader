@@ -170,3 +170,4 @@ Write-Host "Skipped existing      : $skippedExisting"
 Write-Host "Skipped no output     : $skippedNoOutput"
 Write-Host "Failed                : $failed"
 Write-Host "Output folder         : $OutputRoot"
+pause
