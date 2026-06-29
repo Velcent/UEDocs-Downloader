@@ -74,6 +74,80 @@ function ConvertTo-NewEntityName {
     return $builder.ToString()
 }
 
+function ConvertTo-SafeSegment {
+    param(
+        [string]$Value,
+        [int]$MaxLength = 90
+    )
+
+    $text = [System.Net.WebUtility]::HtmlDecode([string]$Value)
+    try {
+        $text = [System.Uri]::UnescapeDataString($text)
+    }
+    catch {
+    }
+
+    $text = ($text -replace '\s+', ' ').Trim()
+    $invalidChars = [System.Collections.Generic.HashSet[int]]::new()
+    foreach ($char in [System.IO.Path]::GetInvalidFileNameChars()) {
+        [void]$invalidChars.Add([int][char]$char)
+    }
+
+    $builder = [System.Text.StringBuilder]::new()
+    foreach ($char in $text.ToCharArray()) {
+        $code = [int][char]$char
+        if ($invalidChars.Contains($code) -or $code -lt 32 -or $char -eq ';') {
+            [void]$builder.Append("&#$code`_")
+        }
+        else {
+            [void]$builder.Append($char)
+        }
+    }
+
+    $text = $builder.ToString().Trim(' ', '.')
+    if ([string]::IsNullOrWhiteSpace($text)) {
+        $text = '_'
+    }
+
+    if ($text -match '^(?i:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])$') {
+        $text = "_$text"
+    }
+
+    if ($text.Length -gt $MaxLength) {
+        $sha1 = [System.Security.Cryptography.SHA1]::Create()
+        try {
+            $bytes = [System.Text.Encoding]::UTF8.GetBytes($text)
+            $hash = (($sha1.ComputeHash($bytes) | ForEach-Object { $_.ToString('x2') }) -join '').Substring(0, 8)
+            $prefixLength = [Math]::Max(1, $MaxLength - 9)
+            $text = "$($text.Substring(0, $prefixLength).TrimEnd(' ', '.'))-$hash"
+        }
+        finally {
+            $sha1.Dispose()
+        }
+    }
+
+    return $text
+}
+
+function ConvertTo-NewEntityPathValue {
+    param([string]$PathValue)
+
+    if ([string]::IsNullOrEmpty($PathValue)) {
+        return $PathValue
+    }
+
+    $parts = [regex]::Split($PathValue, '([\\/])')
+    for ($i = 0; $i -lt $parts.Count; $i++) {
+        if ($parts[$i] -eq '\' -or $parts[$i] -eq '/') {
+            continue
+        }
+
+        $parts[$i] = ConvertTo-NewEntityName -Name $parts[$i]
+    }
+
+    return ($parts -join '')
+}
+
 function Get-RelativePathFromBase {
     param(
         [string]$BasePath,
@@ -103,87 +177,97 @@ function ConvertTo-TsvValue {
     return ([string]$Value -replace "`t", ' ' -replace "\r?\n", ' ').Trim()
 }
 
-function Add-Replacement {
-    param(
-        [System.Collections.Generic.List[object]]$Replacements,
-        [hashtable]$Seen,
-        [string]$OldValue,
-        [string]$NewValue
-    )
-
-    if ([string]::IsNullOrEmpty($OldValue) -or $OldValue -eq $NewValue) {
-        return
-    }
-
-    $key = $OldValue
-    if ($Seen.ContainsKey($key)) {
-        return
-    }
-
-    $Seen[$key] = $true
-    $Replacements.Add([pscustomobject]@{
-        OldValue = $OldValue
-        NewValue = $NewValue
-    }) | Out-Null
-}
-
-function Get-PathReplacements {
-    param([object[]]$Renames)
-
-    $replacements = [System.Collections.Generic.List[object]]::new()
-    $seen = @{}
-    $scriptRootFull = [System.IO.Path]::GetFullPath($PSScriptRoot)
-
-    foreach ($rename in $Renames) {
-        $oldFull = [string]$rename.OldPath
-        $newFull = [string]$rename.NewPath
-        $oldRelativeToRoot = Get-RelativePathFromBase -BasePath $scriptRootFull -FullPath $oldFull
-        $newRelativeToRoot = Get-RelativePathFromBase -BasePath $scriptRootFull -FullPath $newFull
-        $oldRelativeToInput = Get-RelativePathFromBase -BasePath $InputPath -FullPath $oldFull
-        $newRelativeToInput = Get-RelativePathFromBase -BasePath $InputPath -FullPath $newFull
-
-        Add-Replacement -Replacements $replacements -Seen $seen -OldValue $oldFull -NewValue $newFull
-        Add-Replacement -Replacements $replacements -Seen $seen -OldValue ($oldFull -replace '\\', '/') -NewValue ($newFull -replace '\\', '/')
-        Add-Replacement -Replacements $replacements -Seen $seen -OldValue $oldRelativeToRoot -NewValue $newRelativeToRoot
-        Add-Replacement -Replacements $replacements -Seen $seen -OldValue ($oldRelativeToRoot -replace '\\', '/') -NewValue ($newRelativeToRoot -replace '\\', '/')
-        Add-Replacement -Replacements $replacements -Seen $seen -OldValue $oldRelativeToInput -NewValue $newRelativeToInput
-        Add-Replacement -Replacements $replacements -Seen $seen -OldValue ($oldRelativeToInput -replace '\\', '/') -NewValue ($newRelativeToInput -replace '\\', '/')
-    }
-
-    return @($replacements | Sort-Object { ([string]$_.OldValue).Length } -Descending)
-}
-
-function Update-TsvReferences {
-    param([object[]]$Renames)
-
-    if ($Renames.Count -eq 0 -or $NoTsvUpdate) {
+function Update-TsvFiles {
+    if ($NoTsvUpdate) {
         return 0
     }
 
-    $replacements = @(Get-PathReplacements -Renames $Renames)
-    if ($replacements.Count -eq 0) {
-        return 0
-    }
-
-    $updatedCount = 0
+    $updatedFileCount = 0
     $entityFixPath = [System.IO.Path]::GetFullPath((Join-Path $InputPath 'entity-fix.tsv'))
     $tsvFiles = @(Get-ChildItem -LiteralPath $InputPath -File -Filter '*.tsv' |
         Where-Object { -not ([System.IO.Path]::GetFullPath($_.FullName)).Equals($entityFixPath, [System.StringComparison]::OrdinalIgnoreCase) } |
         Sort-Object FullName)
 
     foreach ($tsv in $tsvFiles) {
-        $text = [System.IO.File]::ReadAllText($tsv.FullName)
-        $updated = $text
-
-        foreach ($replacement in $replacements) {
-            $updated = $updated.Replace([string]$replacement.OldValue, [string]$replacement.NewValue)
-        }
-
-        if ($updated -eq $text) {
+        $lines = [System.Collections.Generic.List[string]]::new()
+        $lines.AddRange([string[]](Get-Content -LiteralPath $tsv.FullName))
+        if ($lines.Count -eq 0) {
             continue
         }
 
-        $updatedCount++
+        $header = [string]$lines[0]
+        $columns = $header -split "`t"
+        $fileIndex = [Array]::IndexOf($columns, 'file')
+        $titleIndex = [Array]::IndexOf($columns, 'title')
+        $saveFolderIndex = [Array]::IndexOf($columns, 'save_folder')
+        $childFolderIndex = [Array]::IndexOf($columns, 'child_folder')
+
+        $isListTsv = ($fileIndex -ge 0 -and $titleIndex -ge 0)
+        $isLinkTsv = ($saveFolderIndex -ge 0 -and $childFolderIndex -ge 0)
+        if (-not $isListTsv -and -not $isLinkTsv) {
+            continue
+        }
+
+        $newLines = [System.Collections.Generic.List[string]]::new()
+        $newLines.Add($header) | Out-Null
+        $changedRows = 0
+
+        foreach ($line in @($lines | Select-Object -Skip 1)) {
+            if ([string]::IsNullOrEmpty($line)) {
+                $newLines.Add($line) | Out-Null
+                continue
+            }
+
+            $parts = [string]$line -split "`t", $columns.Count
+            if ($parts.Count -lt $columns.Count) {
+                $newLines.Add($line) | Out-Null
+                continue
+            }
+
+            $oldLine = ($parts -join "`t")
+
+            if ($isLinkTsv) {
+                foreach ($index in @($saveFolderIndex, $childFolderIndex)) {
+                    if ($index -ge 0 -and $index -lt $parts.Count) {
+                        $parts[$index] = ConvertTo-NewEntityPathValue -PathValue ([string]$parts[$index])
+                    }
+                }
+            }
+
+            if ($isListTsv -and -not [string]::IsNullOrWhiteSpace([string]$parts[$titleIndex]) -and -not [string]::IsNullOrWhiteSpace([string]$parts[$fileIndex])) {
+                $fileValue = [string]$parts[$fileIndex]
+                $directory = ''
+                $separator = '\'
+                $lastSlash = [Math]::Max($fileValue.LastIndexOf('\'), $fileValue.LastIndexOf('/'))
+                if ($lastSlash -ge 0) {
+                    $directory = $fileValue.Substring(0, $lastSlash)
+                    $separator = $fileValue.Substring($lastSlash, 1)
+                }
+
+                $directory = ConvertTo-NewEntityPathValue -PathValue $directory
+                $newFileName = "$(ConvertTo-SafeSegment -Value ([string]$parts[$titleIndex]) -MaxLength 120).mhtml"
+                if ($directory) {
+                    $parts[$fileIndex] = "$directory$separator$newFileName"
+                }
+                else {
+                    $parts[$fileIndex] = $newFileName
+                }
+            }
+
+            $newLine = ($parts -join "`t")
+            if ($newLine -ne $oldLine) {
+                $changedRows++
+            }
+
+            $newLines.Add($newLine) | Out-Null
+        }
+
+        if ($changedRows -eq 0) {
+            continue
+        }
+
+        $updatedFileCount++
+        Write-Host "Update TSV siap: $($tsv.FullName) ($changedRows row)"
         if ($WhatIf) {
             Write-Host "DRY RUN: update TSV $($tsv.FullName)"
             continue
@@ -194,11 +278,11 @@ function Update-TsvReferences {
             Write-Host "Backup TSV: $backupPath"
         }
 
-        [System.IO.File]::WriteAllText($tsv.FullName, $updated, [System.Text.UTF8Encoding]::new($false))
+        [System.IO.File]::WriteAllLines($tsv.FullName, $newLines, [System.Text.UTF8Encoding]::new($false))
         Write-Host "Update TSV: $($tsv.FullName)"
     }
 
-    return $updatedCount
+    return $updatedFileCount
 }
 
 function Write-RenameLog {
@@ -207,105 +291,145 @@ function Write-RenameLog {
     $logPath = Join-Path $InputPath 'entity-fix.tsv'
     $scriptRootFull = [System.IO.Path]::GetFullPath($PSScriptRoot)
     $lines = [System.Collections.Generic.List[string]]::new()
-    $lines.Add("old_file`tnew_file") | Out-Null
+    $lines.Add("type`told_path`tnew_path") | Out-Null
 
     foreach ($rename in $Renames) {
         $oldRelative = Get-RelativePathFromBase -BasePath $scriptRootFull -FullPath ([string]$rename.OldPath)
         $newRelative = Get-RelativePathFromBase -BasePath $scriptRootFull -FullPath ([string]$rename.NewPath)
-        $lines.Add(("{0}`t{1}" -f (ConvertTo-TsvValue $oldRelative), (ConvertTo-TsvValue $newRelative))) | Out-Null
+        $lines.Add(("{0}`t{1}`t{2}" -f (ConvertTo-TsvValue ([string]$rename.Kind)), (ConvertTo-TsvValue $oldRelative), (ConvertTo-TsvValue $newRelative))) | Out-Null
     }
 
     [System.IO.File]::WriteAllLines($logPath, $lines, [System.Text.UTF8Encoding]::new($false))
     return $logPath
 }
 
+function Add-RenameCandidate {
+    param(
+        [System.Collections.Generic.List[object]]$Candidates,
+        [string]$Kind,
+        [string]$OldPath,
+        [string]$ParentPath,
+        [string]$OldName,
+        [string]$NewName
+    )
+
+    if ($NewName -eq $OldName) {
+        return
+    }
+
+    $newPath = Join-Path $ParentPath $NewName
+    $Candidates.Add([pscustomobject]@{
+        Kind = $Kind
+        OldPath = $OldPath
+        NewPath = $newPath
+        OldName = $OldName
+        NewName = $NewName
+    }) | Out-Null
+}
+
+function Resolve-RenameCandidates {
+    param(
+        [object[]]$Candidates,
+        [string]$PathType
+    )
+
+    $result = [pscustomobject]@{
+        Renames = [System.Collections.Generic.List[object]]::new()
+        Skipped = 0
+    }
+
+    $targetGroups = @($Candidates | Group-Object { ([System.IO.Path]::GetFullPath([string]$_.NewPath)).ToLowerInvariant() })
+    $blockedTargets = @{}
+    foreach ($group in $targetGroups) {
+        if ($group.Count -gt 1) {
+            $blockedTargets[$group.Name] = "target dipakai oleh $($group.Count) item"
+        }
+    }
+
+    foreach ($candidate in $Candidates) {
+        $oldFull = [System.IO.Path]::GetFullPath([string]$candidate.OldPath)
+        $newFull = [System.IO.Path]::GetFullPath([string]$candidate.NewPath)
+        $newKey = $newFull.ToLowerInvariant()
+
+        if ($blockedTargets.ContainsKey($newKey)) {
+            $result.Skipped++
+            Write-Warning "Skip collision: $($candidate.OldPath) -> $($candidate.NewPath) ($($blockedTargets[$newKey]))"
+            continue
+        }
+
+        if ((Test-Path -LiteralPath $newFull -PathType $PathType) -and -not $oldFull.Equals($newFull, [System.StringComparison]::OrdinalIgnoreCase)) {
+            $result.Skipped++
+            Write-Warning "Skip target sudah ada: $($candidate.OldPath) -> $newFull"
+            continue
+        }
+
+        $result.Renames.Add($candidate) | Out-Null
+    }
+
+    return $result
+}
+
 $files = @(Get-ChildItem -LiteralPath $InputPath -Recurse -File -Filter '*.mhtml' | Sort-Object FullName)
-$candidates = [System.Collections.Generic.List[object]]::new()
+$directories = @(Get-ChildItem -LiteralPath $InputPath -Recurse -Directory | Sort-Object { $_.FullName.Length } -Descending)
+$fileCandidates = [System.Collections.Generic.List[object]]::new()
+$directoryCandidates = [System.Collections.Generic.List[object]]::new()
 
 foreach ($file in $files) {
     $baseName = [System.IO.Path]::GetFileNameWithoutExtension($file.Name)
     $newBaseName = ConvertTo-NewEntityName -Name $baseName
-    if ($newBaseName -eq $baseName) {
-        continue
-    }
-
-    $newPath = Join-Path $file.DirectoryName "$newBaseName$($file.Extension)"
-    $candidates.Add([pscustomobject]@{
-        OldPath = $file.FullName
-        NewPath = $newPath
-        OldName = $file.Name
-        NewName = [System.IO.Path]::GetFileName($newPath)
-    }) | Out-Null
+    Add-RenameCandidate -Candidates $fileCandidates -Kind 'file' -OldPath $file.FullName -ParentPath $file.DirectoryName -OldName $file.Name -NewName "$newBaseName$($file.Extension)"
 }
 
-if ($candidates.Count -eq 0) {
-    Write-Host "Tidak ada nama file .mhtml yang perlu diperbaiki di $InputPath"
-    exit 0
+foreach ($directory in $directories) {
+    $newName = ConvertTo-NewEntityName -Name $directory.Name
+    Add-RenameCandidate -Candidates $directoryCandidates -Kind 'folder' -OldPath $directory.FullName -ParentPath $directory.Parent.FullName -OldName $directory.Name -NewName $newName
 }
 
-$targetGroups = $candidates | Group-Object { ([System.IO.Path]::GetFullPath([string]$_.NewPath)).ToLowerInvariant() }
-$blockedTargets = @{}
-foreach ($group in $targetGroups) {
-    if ($group.Count -gt 1) {
-        $blockedTargets[$group.Name] = "target dipakai oleh $($group.Count) file"
-    }
-}
-
+$fileResult = Resolve-RenameCandidates -Candidates ([object[]]$fileCandidates.ToArray()) -PathType Leaf
+$directoryResult = Resolve-RenameCandidates -Candidates ([object[]]$directoryCandidates.ToArray()) -PathType Container
 $renames = [System.Collections.Generic.List[object]]::new()
-$skipped = 0
+$renames.AddRange([object[]]$fileResult.Renames.ToArray())
+$renames.AddRange([object[]]$directoryResult.Renames.ToArray())
+$skipped = $fileResult.Skipped + $directoryResult.Skipped
 
-foreach ($candidate in $candidates) {
-    $oldFull = [System.IO.Path]::GetFullPath([string]$candidate.OldPath)
-    $newFull = [System.IO.Path]::GetFullPath([string]$candidate.NewPath)
-    $newKey = $newFull.ToLowerInvariant()
-
-    if ($blockedTargets.ContainsKey($newKey)) {
-        $skipped++
-        Write-Warning "Skip collision: $($candidate.OldPath) -> $($candidate.NewPath) ($($blockedTargets[$newKey]))"
-        continue
-    }
-
-    if ((Test-Path -LiteralPath $newFull -PathType Leaf) -and -not $oldFull.Equals($newFull, [System.StringComparison]::OrdinalIgnoreCase)) {
-        $skipped++
-        Write-Warning "Skip target sudah ada: $($candidate.OldPath) -> $newFull"
-        continue
-    }
-
-    $renames.Add($candidate) | Out-Null
+if ($fileCandidates.Count -eq 0 -and $directoryCandidates.Count -eq 0) {
+    Write-Host "Tidak ada nama file/folder yang perlu diperbaiki di $InputPath"
 }
 
-if ($renames.Count -eq 0) {
-    Write-Host "Tidak ada file yang aman untuk direname. Skip: $skipped"
-    exit 1
+if ($renames.Count -eq 0 -and ($fileCandidates.Count + $directoryCandidates.Count) -gt 0) {
+    Write-Host "Tidak ada item yang aman untuk direname. Skip: $skipped"
 }
 
 Write-Host "File .mhtml ditemukan       : $($files.Count)"
-Write-Host "Perlu rename                : $($candidates.Count)"
+Write-Host "Folder ditemukan           : $($directories.Count)"
+Write-Host "File perlu rename           : $($fileCandidates.Count)"
+Write-Host "Folder perlu rename         : $($directoryCandidates.Count)"
 Write-Host "Aman rename                 : $($renames.Count)"
 Write-Host "Skip                        : $skipped"
 Write-Host ''
 
 foreach ($rename in $renames) {
+    Write-Host "Rename $($rename.Kind) siap: $($rename.OldPath) -> $($rename.NewName)"
     if ($WhatIf) {
         Write-Host "DRY RUN: $($rename.OldPath) -> $($rename.NewName)"
         continue
     }
 
     Rename-Item -LiteralPath ([string]$rename.OldPath) -NewName ([string]$rename.NewName)
-    Write-Host "Rename: $($rename.OldName) -> $($rename.NewName)"
+    Write-Host "Rename $($rename.Kind): $($rename.OldName) -> $($rename.NewName)"
 }
 
-$updatedTsvCount = Update-TsvReferences -Renames ([object[]]$renames.ToArray())
+$updatedTsvCount = Update-TsvFiles
 $logPath = ''
-if (-not $WhatIf) {
+if (-not $WhatIf -and $renames.Count -gt 0) {
     $logPath = Write-RenameLog -Renames ([object[]]$renames.ToArray())
     Write-Host "Output list: $logPath"
 }
 
 Write-Host ''
 if ($WhatIf) {
-    Write-Host "Dry run selesai. File akan direname: $($renames.Count). TSV akan diupdate: $updatedTsvCount. Output list tidak ditulis saat WhatIf."
+    Write-Host "Dry run selesai. Item akan direname: $($renames.Count). TSV akan diupdate: $updatedTsvCount. Output list tidak ditulis saat WhatIf."
 }
 else {
-    Write-Host "Selesai. File direname: $($renames.Count). TSV diupdate: $updatedTsvCount."
+    Write-Host "Selesai. Item direname: $($renames.Count). TSV diupdate: $updatedTsvCount."
 }
