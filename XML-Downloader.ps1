@@ -391,10 +391,14 @@ function Handle-CdpEvent {
 
         $resourceType = [string]$Message.params.resourceType
         $requestUrl = [string]$Message.params.request.url
+        $isEmbedUrl = $requestUrl -match '(?i)(youtube\.com/embed|player\.vimeo\.com|embed|iframe)'
         $shouldBlock = -not $LoadImages -and (
             $resourceType -eq 'Image' -or
+            $resourceType -eq 'Media' -or
+            (($resourceType -eq 'Document' -or $resourceType -eq 'Other') -and $isEmbedUrl) -or
             $requestUrl -match '(?i)/community/api/(learning|documentation|user_profiles)/image/' -or
-            $requestUrl -match '(?i)[?&]resizing_type='
+            $requestUrl -match '(?i)[?&]resizing_type=' -or
+            $isEmbedUrl
         )
 
         $method = if ($shouldBlock) { 'Fetch.failRequest' } else { 'Fetch.continueRequest' }
@@ -921,6 +925,21 @@ function New-LearningPageSession {
                 @{
                     urlPattern = '*'
                     resourceType = 'Image'
+                    requestStage = 'Request'
+                },
+                @{
+                    urlPattern = '*'
+                    resourceType = 'Document'
+                    requestStage = 'Request'
+                },
+                @{
+                    urlPattern = '*'
+                    resourceType = 'Media'
+                    requestStage = 'Request'
+                },
+                @{
+                    urlPattern = '*'
+                    resourceType = 'Other'
                     requestStage = 'Request'
                 }
             )
@@ -2489,6 +2508,9 @@ function Invoke-LearningTargetScan {
         }
 
         $added = Add-LearningUniqueItems -ItemsByKey $itemsByKey -PageResults $pageResults
+        if ([string]$Target.Key -eq 'LearnUE' -and $itemsByKey.Count -gt $totalResults) {
+            $totalResults = $itemsByKey.Count
+        }
         Write-Host "Unique $($Target.Key): $($itemsByKey.Count)/$totalResults link (+$added)"
 
         if ($MaxPages -gt 0) {
@@ -2561,7 +2583,7 @@ if ($BuildLearn) {
         }
 
         $missingTimestampCount = @($cache.Items | Where-Object { -not (Test-LearningItemHasTimestamp -Item $_) }).Count
-        $cacheHasAllLinks = $cache.Items.Count -gt 0 -and [int]$target.TotalResults -gt 0 -and $cache.Items.Count -ge [int]$target.TotalResults
+        $cacheHasAllLinks = [string]$target.Key -ne 'LearnUE' -and $cache.Items.Count -gt 0 -and [int]$target.TotalResults -gt 0 -and $cache.Items.Count -ge [int]$target.TotalResults
         if ($cacheHasAllLinks) {
             Write-Host ""
             Write-Host "Cache $($target.Key) sudah memenuhi total link ($($cache.Items.Count)/$($target.TotalResults)); skip scan page list."
