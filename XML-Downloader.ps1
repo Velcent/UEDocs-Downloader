@@ -991,10 +991,12 @@ function Get-LearningDetailDataInSession {
             }
         }
         catch {
-            if ($attempt -ge $MaxLoadAttempts) {
+            $errorMessage = $_.Exception.Message
+            $isRetryable = $errorMessage -match '(?i)\b(HTTP\s*429|429|too many requests|rate limit|Network error|ERR_|Timeout load)\b'
+            if (-not $isRetryable -or $attempt -ge $MaxLoadAttempts) {
                 throw
             }
-            Write-Warning $_.Exception.Message
+            Write-Warning "$errorMessage Reload detail learning: $PageUrl"
         }
     }
 
