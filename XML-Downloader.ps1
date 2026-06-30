@@ -553,6 +553,95 @@ function Get-DocumentationSnapshotExpression {
 '@
 }
 
+function Get-LearningDetailSnapshotExpression {
+    return @'
+(() => {
+  const normalize = (value) => (value || '').replace(/\s+/g, ' ').trim();
+  const toUrl = (value) => {
+    if (!value) return '';
+    try {
+      const url = new URL(value, document.baseURI);
+      if (!/^https?:$/i.test(url.protocol)) return '';
+      url.hash = '';
+      return url.href;
+    } catch (_) {
+      return '';
+    }
+  };
+  const parseStepNumber = (value) => {
+    const match = normalize(value).match(/\d+/);
+    return match ? Number(match[0]) : Number.MAX_SAFE_INTEGER;
+  };
+  const getPublishedTime = () => {
+    const meta = document.querySelector('div.content-item-header-meta');
+    const times = meta ? Array.from(meta.querySelectorAll('time[datetime], time')) : [];
+    const candidates = times.filter((time) => {
+      const text = normalize(time.parentElement?.textContent || time.closest('li, div, span')?.textContent || '');
+      return !/last\s+updated\s*:/i.test(text);
+    });
+    const time = candidates[0] || times[0] || null;
+    const datetime = time ? (time.getAttribute('datetime') || time.dateTime || normalize(time.textContent || '')) : '';
+    const timestamp = datetime ? Date.parse(datetime) : 0;
+    return {
+      publishedAt: datetime || '',
+      publishedTimestamp: Number.isFinite(timestamp) ? timestamp : 0
+    };
+  };
+  const uniqueChildren = (children) => {
+    const seen = new Set();
+    return children.filter((child) => {
+      if (!child || !child.url || seen.has(child.url)) return false;
+      seen.add(child.url);
+      return true;
+    });
+  };
+  const readCourseChildren = () => {
+    const nav = document.querySelector('nav-course');
+    const list = nav?.querySelector('ul.course-steps-list');
+    if (!list) return [];
+    const anchors = Array.from(list.querySelectorAll('li.course-steps-link a[href], li .course-steps-link a[href], a.course-steps-link[href], li a[href]'));
+    return uniqueChildren(anchors.map((anchor, index) => ({
+      title: normalize(anchor.textContent || anchor.getAttribute('aria-label') || anchor.getAttribute('title') || ''),
+      url: toUrl(anchor.getAttribute('href')),
+      order: index + 1
+    }))).filter((child) => child.title && child.url);
+  };
+  const readLearningPathChildren = () => {
+    if (!document.querySelector('h2.learning-path-title')) return [];
+    const anchors = Array.from(document.querySelectorAll('a.list-item-link[href]'));
+    return uniqueChildren(anchors.map((anchor, index) => {
+      const stepNumber = parseStepNumber(anchor.querySelector('.list-item-step-number')?.textContent || '');
+      const title = normalize(anchor.querySelector('.list-item-step-title')?.textContent || anchor.textContent || anchor.getAttribute('aria-label') || '');
+      return {
+        title,
+        url: toUrl(anchor.getAttribute('href')),
+        order: Number.isFinite(stepNumber) ? stepNumber : index + 1
+      };
+    }).sort((a, b) => a.order - b.order)).filter((child) => child.title && child.url);
+  };
+
+  const h1 = document.querySelector('h1');
+  const published = getPublishedTime();
+  const courseChildren = readCourseChildren();
+  const pathChildren = readLearningPathChildren();
+  const children = courseChildren.length > 0 ? courseChildren : pathChildren;
+
+  return JSON.stringify({
+    href: location.href,
+    readyState: document.readyState,
+    title: document.title || '',
+    h1: normalize(h1?.textContent || ''),
+    publishedAt: published.publishedAt,
+    publishedTimestamp: published.publishedTimestamp,
+    hasContentMeta: !!document.querySelector('div.content-item-header-meta'),
+    hasCourseOutline: courseChildren.length > 0,
+    hasLearningPath: !!document.querySelector('h2.learning-path-title'),
+    children
+  });
+})()
+'@
+}
+
 function Get-DocumentationExpandExpression {
     param([int]$MaxClicks = 500)
 
@@ -673,7 +762,13 @@ function ConvertTo-PageUrl {
         [int]$Page
     )
 
-    return "$($RootUrl.TrimEnd('/'))/page/$Page"
+    return "$($RootUrl.TrimEnd('/'))/page/$Page`?sort_by=first_published_at"
+}
+
+function ConvertTo-LearningRootUrl {
+    param([string]$RootUrl)
+
+    return "$($RootUrl.TrimEnd('/'))?sort_by=first_published_at"
 }
 
 function Get-CanonicalUrlKey {
@@ -795,6 +890,144 @@ function Get-LearningPageData {
     finally {
         Close-LearningPageSession -Session $session
     }
+}
+
+function Wait-LearningDetailPageReady {
+    param(
+        [System.Net.WebSockets.ClientWebSocket]$Socket,
+        [string]$PageUrl,
+        [int]$Attempt
+    )
+
+    $deadline = (Get-Date).AddSeconds($PageLoadTimeoutSeconds)
+    $stableSince = $null
+    $lastData = $null
+
+    while ((Get-Date) -lt $deadline) {
+        Start-Sleep -Seconds $BrowserPollSeconds
+
+        $json = Invoke-PageEval -Socket $Socket -Expression (Get-LearningDetailSnapshotExpression)
+        $data = $json | ConvertFrom-Json
+        $lastData = $data
+
+        $hasPageData = -not [string]::IsNullOrWhiteSpace([string]$data.h1) -or
+            $data.hasContentMeta -or
+            @($data.children).Count -gt 0
+
+        if ($data.readyState -eq 'complete' -and $hasPageData) {
+            if (-not $stableSince) {
+                $stableSince = Get-Date
+            }
+
+            if (((Get-Date) - $stableSince).TotalSeconds -ge $PageIdleSeconds) {
+                return $data
+            }
+        }
+        else {
+            $stableSince = $null
+        }
+    }
+
+    $title = if ($lastData) { [string]$lastData.title } else { '' }
+    $h1 = if ($lastData) { [string]$lastData.h1 } else { '' }
+    throw "Timeout load learning detail attempt #${Attempt}: $PageUrl title='$title' h1='$h1'"
+}
+
+function Get-LearningDetailDataInSession {
+    param(
+        [System.Net.WebSockets.ClientWebSocket]$Socket,
+        [string]$PageUrl
+    )
+
+    Write-Host "Buka detail learning: $PageUrl"
+    for ($attempt = 1; $attempt -le $MaxLoadAttempts; $attempt++) {
+        Reset-NetworkState
+        if ($attempt -gt 1) {
+            Write-Warning "Navigasi ulang ke URL detail learning error: $PageUrl"
+        }
+
+        $navigateResponse = Invoke-CdpCommand -Socket $Socket -Method 'Page.navigate' -Params @{ url = $PageUrl }
+        Update-NetworkStateFromNavigateResult -Response $navigateResponse
+
+        try {
+            $data = Wait-LearningDetailPageReady -Socket $Socket -PageUrl $PageUrl -Attempt $attempt
+            Assert-PageLoadOk -Data $data
+            return [pscustomobject]@{
+                PageUrl = $PageUrl
+                FinalUrl = [string]$data.href
+                Title = [string]$data.h1
+                PublishedAt = [string]$data.publishedAt
+                PublishedTimestamp = [double]$data.publishedTimestamp
+                Children = @($data.children)
+            }
+        }
+        catch {
+            if ($attempt -ge $MaxLoadAttempts) {
+                throw
+            }
+            Write-Warning $_.Exception.Message
+        }
+    }
+
+    throw "Gagal membaca halaman detail learning: $PageUrl"
+}
+
+function Invoke-LearningDetailScan {
+    param([object[]]$Items)
+
+    $session = $null
+    $enriched = New-Object System.Collections.ArrayList
+    $seenFinalUrls = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+
+    try {
+        $session = New-LearningPageSession
+        $index = 0
+        foreach ($item in @($Items)) {
+            $index++
+            $originalUrl = [string]$item.url
+            if ([string]::IsNullOrWhiteSpace($originalUrl)) {
+                continue
+            }
+
+            Write-Host "Detail $index/$($Items.Count): $originalUrl"
+            $detail = $null
+            try {
+                $detail = Get-LearningDetailDataInSession -Socket $session.Socket -PageUrl $originalUrl
+            }
+            catch {
+                Write-Warning "Gagal detail: $originalUrl - $($_.Exception.Message)"
+            }
+
+            $finalUrl = if ($detail -and -not [string]::IsNullOrWhiteSpace([string]$detail.FinalUrl)) { [string]$detail.FinalUrl } else { $originalUrl }
+            $key = Get-CanonicalUrlKey -PageUrl $finalUrl
+            if ($seenFinalUrls.Contains($key)) {
+                continue
+            }
+            [void]$seenFinalUrls.Add($key)
+
+            $title = ConvertTo-SafeText ([string]$item.title)
+            if ($detail -and -not [string]::IsNullOrWhiteSpace([string]$detail.Title)) {
+                $title = ConvertTo-SafeText ([string]$detail.Title)
+            }
+            if ([string]::IsNullOrWhiteSpace($title)) {
+                $title = $finalUrl
+            }
+
+            [void]$enriched.Add([pscustomobject]@{
+                title = $title
+                url = $finalUrl
+                html = [string]$item.html
+                publishedAt = if ($detail) { [string]$detail.PublishedAt } else { '' }
+                publishedTimestamp = if ($detail) { [double]$detail.PublishedTimestamp } else { 0 }
+                children = if ($detail) { @($detail.Children) } else { @() }
+            })
+        }
+    }
+    finally {
+        Close-LearningPageSession -Session $session
+    }
+
+    return @($enriched | Sort-Object @{ Expression = { [double]$_.publishedTimestamp }; Descending = $true }, @{ Expression = { [string]$_.title }; Ascending = $true })
 }
 
 function Wait-DocumentationPageReady {
@@ -1195,8 +1428,31 @@ function ConvertTo-LearningXml {
 
         $href = ConvertTo-XmlAttributeValue ([string]$item.url)
         $label = ConvertTo-XmlAttributeValue $title
+        $children = @($item.children)
+        $linkClass = if ($children.Count -gt 0) { 'contents-table-link is-parent' } else { 'contents-table-link' }
         [void]$lines.Add("`t<li class=""contents-table-item"">")
-        [void]$lines.Add("`t`t<div class=""contents-table-el""><a class=""contents-table-link"" href=""$href"">$label</a></div>")
+        [void]$lines.Add("`t`t<div class=""contents-table-el""><a class=""$linkClass"" href=""$href"">$label</a></div>")
+        if ($children.Count -gt 0) {
+            [void]$lines.Add("`t`t<ul class=""contents-table-list"">")
+            foreach ($child in $children) {
+                $childUrl = [string]$child.url
+                if ([string]::IsNullOrWhiteSpace($childUrl)) {
+                    continue
+                }
+
+                $childTitle = ConvertTo-SafeText ([string]$child.title)
+                if ([string]::IsNullOrWhiteSpace($childTitle)) {
+                    $childTitle = $childUrl
+                }
+
+                $childHref = ConvertTo-XmlAttributeValue $childUrl
+                $childLabel = ConvertTo-XmlAttributeValue $childTitle
+                [void]$lines.Add("`t`t`t<li class=""contents-table-item"">")
+                [void]$lines.Add("`t`t`t`t<div class=""contents-table-el""><a class=""contents-table-link"" href=""$childHref"">$childLabel</a></div>")
+                [void]$lines.Add("`t`t`t</li>")
+            }
+            [void]$lines.Add("`t`t</ul>")
+        }
         [void]$lines.Add("`t</li>")
     }
 
@@ -1498,8 +1754,9 @@ function Invoke-LearningTargetScan {
 if ($BuildLearn) {
     foreach ($target in $LearningTargets) {
         Write-Host ""
-        Write-Host "Baca root: $($target.RootUrl)"
-        $rootData = Get-LearningPageData -PageUrl $target.RootUrl
+        $learningRootUrl = ConvertTo-LearningRootUrl -RootUrl $target.RootUrl
+        Write-Host "Baca root: $learningRootUrl"
+        $rootData = Get-LearningPageData -PageUrl $learningRootUrl
         $totalPages = [Math]::Max(1, [int]$rootData.TotalPages)
         if ($MaxPages -gt 0) {
             $totalPages = [Math]::Min($totalPages, $MaxPages)
@@ -1534,7 +1791,7 @@ if ($DryRun) {
 if ($BuildLearn) {
     foreach ($target in $LearningTargets) {
         $scanResult = Invoke-LearningTargetScan -Target $target
-        $items = @($scanResult.Items)
+        $items = @(Invoke-LearningDetailScan -Items @($scanResult.Items))
         $xmlLines = ConvertTo-LearningXml -Target $target -Items $items
         $listXmlLines = ConvertTo-LearningListXml -Items $items
         Set-Content -LiteralPath $target.OutputPath -Value $xmlLines -Encoding UTF8
