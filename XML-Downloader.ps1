@@ -401,11 +401,13 @@ function Get-LearningSnapshotExpression {
   if (pagination) {
     pagination.querySelectorAll('a[href], button, [aria-label]').forEach((el) => {
       const label = normalize(el.getAttribute('aria-label') || el.textContent || '');
-      const href = el.getAttribute('href') || '';
-      const labelMatch = label.match(/\b(\d+)\b/g);
-      if (labelMatch) labelMatch.forEach((value) => pageNumbers.push(Number(value)));
-      const fromHref = pageNumberFromHref(href);
-      if (fromHref) pageNumbers.push(fromHref);
+      const lowerLabel = label.toLowerCase();
+      if (/\b(next|previous|prev|first|last)\b/.test(lowerLabel)) return;
+
+      const exactMatch = label.match(/^\s*(?:page\s*)?(\d+)\s*$/i);
+      const pageLabelMatch = label.match(/\bpage\s+(\d+)\b/i);
+      const value = exactMatch ? exactMatch[1] : (pageLabelMatch ? pageLabelMatch[1] : '');
+      if (value) pageNumbers.push(Number(value));
     });
   }
 
