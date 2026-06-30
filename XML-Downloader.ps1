@@ -716,7 +716,7 @@ function Wait-LearningPageReady {
         $data = $json | ConvertFrom-Json
         $lastData = $data
 
-        $hasPageData = $data.hasLearningList -or $data.itemCount -gt 0 -or $data.hasPagination
+        $hasPageData = $data.itemCount -gt 0
         if (-not $data.isLoading -and $hasPageData) {
             if (-not $stableSince) {
                 $stableSince = Get-Date
@@ -996,6 +996,7 @@ function Invoke-LearningDetailScan {
             }
             catch {
                 Write-Warning "Gagal detail: $originalUrl - $($_.Exception.Message)"
+                continue
             }
 
             $finalUrl = if ($detail -and -not [string]::IsNullOrWhiteSpace([string]$detail.FinalUrl)) { [string]$detail.FinalUrl } else { $originalUrl }
@@ -1016,6 +1017,7 @@ function Invoke-LearningDetailScan {
             [void]$enriched.Add([pscustomobject]@{
                 title = $title
                 url = $finalUrl
+                originalUrl = $originalUrl
                 html = [string]$item.html
                 publishedAt = if ($detail) { [string]$detail.PublishedAt } else { '' }
                 publishedTimestamp = if ($detail) { [double]$detail.PublishedTimestamp } else { 0 }
@@ -1476,6 +1478,250 @@ function ConvertTo-LearningListXml {
     return [string[]]$lines.ToArray()
 }
 
+function ConvertTo-AbsoluteLearningUrl {
+    param([string]$Url)
+
+    if ([string]::IsNullOrWhiteSpace($Url)) {
+        return ''
+    }
+
+    try {
+        $uri = [Uri]::new([Uri]'https://dev.epicgames.com', $Url)
+        return $uri.AbsoluteUri
+    }
+    catch {
+        return $Url
+    }
+}
+
+function Get-LearningUrlFromListHtml {
+    param([string]$Html)
+
+    if ([string]::IsNullOrWhiteSpace($Html)) {
+        return ''
+    }
+
+    $matches = [regex]::Matches($Html, '<a\b[^>]*\bhref="([^"]+)"', [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
+    foreach ($match in $matches) {
+        $href = [System.Net.WebUtility]::HtmlDecode([string]$match.Groups[1].Value)
+        if ($href -match '(?i)(?:^https://dev\.epicgames\.com)?/community/learning/') {
+            return ConvertTo-AbsoluteLearningUrl -Url $href
+        }
+    }
+
+    return ''
+}
+
+function Get-LearningListCacheItems {
+    param([string]$Path)
+
+    $items = New-Object System.Collections.ArrayList
+    if ([string]::IsNullOrWhiteSpace($Path) -or -not (Test-Path -LiteralPath $Path)) {
+        return @()
+    }
+
+    foreach ($line in Get-Content -LiteralPath $Path) {
+        $html = [string]$line
+        if ([string]::IsNullOrWhiteSpace($html)) {
+            continue
+        }
+
+        $url = Get-LearningUrlFromListHtml -Html $html
+        if ([string]::IsNullOrWhiteSpace($url)) {
+            continue
+        }
+
+        [void]$items.Add([pscustomobject]@{
+            url = $url
+            html = $html
+        })
+    }
+
+    return @($items)
+}
+
+function ConvertFrom-LearningXmlLi {
+    param($Li)
+
+    $anchor = $Li.SelectSingleNode("./div[contains(concat(' ', normalize-space(@class), ' '), ' contents-table-el ')]/a")
+    if (-not $anchor) {
+        return $null
+    }
+
+    $children = New-Object System.Collections.ArrayList
+    foreach ($childLi in @($Li.SelectNodes("./ul[contains(concat(' ', normalize-space(@class), ' '), ' contents-table-list ')]/li"))) {
+        $childAnchor = $childLi.SelectSingleNode("./div[contains(concat(' ', normalize-space(@class), ' '), ' contents-table-el ')]/a")
+        if (-not $childAnchor) {
+            continue
+        }
+
+        [void]$children.Add([pscustomobject]@{
+            title = ConvertTo-SafeText ([string]$childAnchor.InnerText)
+            url = [string]$childAnchor.GetAttribute('href')
+        })
+    }
+
+    return [pscustomobject]@{
+        title = ConvertTo-SafeText ([string]$anchor.InnerText)
+        url = [string]$anchor.GetAttribute('href')
+        originalUrl = ''
+        html = ''
+        publishedAt = ''
+        publishedTimestamp = 0
+        children = @($children)
+    }
+}
+
+function Get-LearningXmlCacheItems {
+    param([string]$Path)
+
+    if ([string]::IsNullOrWhiteSpace($Path) -or -not (Test-Path -LiteralPath $Path)) {
+        return @()
+    }
+
+    try {
+        $content = Get-Content -LiteralPath $Path -Raw
+        if ([string]::IsNullOrWhiteSpace($content)) {
+            return @()
+        }
+
+        [xml]$xml = "<root>$content</root>"
+        $items = New-Object System.Collections.ArrayList
+        foreach ($li in @($xml.SelectNodes("/root/ul[contains(concat(' ', normalize-space(@class), ' '), ' contents-table-list ')]/li"))) {
+            $item = ConvertFrom-LearningXmlLi -Li $li
+            if ($item) {
+                [void]$items.Add($item)
+            }
+        }
+
+        return @($items)
+    }
+    catch {
+        Write-Warning "Gagal membaca cache XML learning: $Path - $($_.Exception.Message)"
+        return @()
+    }
+}
+
+function Get-LearningCache {
+    param($Target)
+
+    $xmlItems = @(Get-LearningXmlCacheItems -Path ([string]$Target.OutputPath))
+    $listItems = @(Get-LearningListCacheItems -Path ([string]$Target.ListOutputPath))
+    $byOriginal = @{}
+    $byFinal = @{}
+
+    for ($index = 0; $index -lt $xmlItems.Count; $index++) {
+        $item = $xmlItems[$index]
+        if ($index -lt $listItems.Count) {
+            $item.originalUrl = [string]$listItems[$index].url
+            $item.html = [string]$listItems[$index].html
+        }
+
+        if (-not [string]::IsNullOrWhiteSpace([string]$item.originalUrl)) {
+            $byOriginal[(Get-CanonicalUrlKey -PageUrl ([string]$item.originalUrl))] = $item
+        }
+        if (-not [string]::IsNullOrWhiteSpace([string]$item.url)) {
+            $byFinal[(Get-CanonicalUrlKey -PageUrl ([string]$item.url))] = $item
+        }
+    }
+
+    return [pscustomobject]@{
+        Items = $xmlItems
+        ListItems = $listItems
+        ByOriginal = $byOriginal
+        ByFinal = $byFinal
+    }
+}
+
+function Merge-LearningScanWithCache {
+    param(
+        [object[]]$ScannedItems,
+        $Cache
+    )
+
+    $newItems = New-Object System.Collections.ArrayList
+    $newByOriginal = @{}
+    $merged = New-Object System.Collections.ArrayList
+    $usedFinalKeys = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+
+    foreach ($item in @($ScannedItems)) {
+        $url = [string]$item.url
+        if ([string]::IsNullOrWhiteSpace($url)) {
+            continue
+        }
+
+        $key = Get-CanonicalUrlKey -PageUrl $url
+        $cached = $null
+        if ($Cache.ByOriginal.ContainsKey($key)) {
+            $cached = $Cache.ByOriginal[$key]
+        }
+        elseif ($Cache.ByFinal.ContainsKey($key)) {
+            $cached = $Cache.ByFinal[$key]
+        }
+
+        if ($cached) {
+            continue
+        }
+
+        [void]$newItems.Add($item)
+    }
+
+    if ($newItems.Count -gt 0) {
+        Write-Host "Detail scan link baru: $($newItems.Count)"
+        $newEnrichedItems = @(Invoke-LearningDetailScan -Items @($newItems))
+        foreach ($item in @($newEnrichedItems)) {
+            $originalUrl = [string]$item.originalUrl
+            if (-not [string]::IsNullOrWhiteSpace($originalUrl)) {
+                $newByOriginal[(Get-CanonicalUrlKey -PageUrl $originalUrl)] = $item
+            }
+            if (-not [string]::IsNullOrWhiteSpace([string]$item.url)) {
+                $newByOriginal[(Get-CanonicalUrlKey -PageUrl ([string]$item.url))] = $item
+            }
+        }
+    }
+    else {
+        Write-Host "Tidak ada link baru untuk detail scan."
+    }
+
+    foreach ($item in @($ScannedItems)) {
+        $key = Get-CanonicalUrlKey -PageUrl ([string]$item.url)
+        $enriched = $null
+        if ($Cache.ByOriginal.ContainsKey($key)) {
+            $enriched = $Cache.ByOriginal[$key]
+        }
+        elseif ($Cache.ByFinal.ContainsKey($key)) {
+            $enriched = $Cache.ByFinal[$key]
+        }
+        elseif ($newByOriginal.ContainsKey($key)) {
+            $enriched = $newByOriginal[$key]
+        }
+
+        if (-not $enriched) {
+            continue
+        }
+
+        if ([string]::IsNullOrWhiteSpace([string]$enriched.html)) {
+            $enriched.html = [string]$item.html
+        }
+        if ([string]::IsNullOrWhiteSpace([string]$enriched.originalUrl)) {
+            $enriched.originalUrl = [string]$item.url
+        }
+
+        $finalKey = Get-CanonicalUrlKey -PageUrl ([string]$enriched.url)
+        if ($usedFinalKeys.Contains($finalKey)) {
+            continue
+        }
+
+        [void]$merged.Add($enriched)
+        [void]$usedFinalKeys.Add($finalKey)
+    }
+
+    return [pscustomobject]@{
+        Items = @($merged)
+        NewCount = $newItems.Count
+    }
+}
+
 function Add-DocumentationXmlItems {
     param(
         [System.Collections.ArrayList]$Lines,
@@ -1791,12 +2037,17 @@ if ($DryRun) {
 if ($BuildLearn) {
     foreach ($target in $LearningTargets) {
         $scanResult = Invoke-LearningTargetScan -Target $target
-        $items = @(Invoke-LearningDetailScan -Items @($scanResult.Items))
+        $cache = Get-LearningCache -Target $target
+        if ($cache.Items.Count -gt 0) {
+            Write-Host "Cache $($target.Key): $($cache.Items.Count) item XML, $($cache.ListItems.Count) item list"
+        }
+        $mergeResult = Merge-LearningScanWithCache -ScannedItems @($scanResult.Items) -Cache $cache
+        $items = @($mergeResult.Items)
         $xmlLines = ConvertTo-LearningXml -Target $target -Items $items
         $listXmlLines = ConvertTo-LearningListXml -Items $items
         Set-Content -LiteralPath $target.OutputPath -Value $xmlLines -Encoding UTF8
         Set-Content -LiteralPath $target.ListOutputPath -Value $listXmlLines -Encoding UTF8
-        Write-Host "Tulis XML: $(ConvertTo-RelativeRootPath $target.OutputPath) ($($items.Count)/$($scanResult.TotalResults) link unik, $($scanResult.Passes) pass)"
+        Write-Host "Tulis XML: $(ConvertTo-RelativeRootPath $target.OutputPath) ($($items.Count)/$($scanResult.TotalResults) link unik, $($mergeResult.NewCount) link baru, $($scanResult.Passes) pass)"
         Write-Host "Tulis XML list: $(ConvertTo-RelativeRootPath $target.ListOutputPath) ($($listXmlLines.Count) li unik)"
     }
 }
