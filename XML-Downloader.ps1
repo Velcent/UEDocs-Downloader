@@ -920,6 +920,7 @@ function New-LearningPageSession {
             patterns = @(
                 @{
                     urlPattern = '*'
+                    resourceType = 'Image'
                     requestStage = 'Request'
                 }
             )
@@ -1563,23 +1564,33 @@ function Start-LearningWorkerJob {
             [bool]$LoadImages
         )
 
-        $arguments = @(
-            '-WorkerMode',
-            '-WorkerTaskKind', $TaskKind,
-            '-WorkerBrowserPort', $BrowserPort,
-            '-WorkerId', $Id,
-            '-WorkerIpcDir', $IpcDir,
-            '-BrowserPollSeconds', $BrowserPollSeconds,
-            '-PageIdleSeconds', $PageIdleSeconds,
-            '-PageLoadTimeoutSeconds', $PageLoadTimeoutSeconds,
-            '-MaxLoadAttempts', $MaxLoadAttempts,
-            '-MhtmlRoot', $MhtmlRoot
-        )
         if ($LoadImages) {
-            $arguments += '-LoadImages'
+            & $ScriptPath `
+                -WorkerMode `
+                -LoadImages `
+                -WorkerTaskKind $TaskKind `
+                -WorkerBrowserPort $BrowserPort `
+                -WorkerId $Id `
+                -WorkerIpcDir $IpcDir `
+                -BrowserPollSeconds $BrowserPollSeconds `
+                -PageIdleSeconds $PageIdleSeconds `
+                -PageLoadTimeoutSeconds $PageLoadTimeoutSeconds `
+                -MaxLoadAttempts $MaxLoadAttempts `
+                -MhtmlRoot $MhtmlRoot
         }
-
-        & $ScriptPath @arguments
+        else {
+            & $ScriptPath `
+                -WorkerMode `
+                -WorkerTaskKind $TaskKind `
+                -WorkerBrowserPort $BrowserPort `
+                -WorkerId $Id `
+                -WorkerIpcDir $IpcDir `
+                -BrowserPollSeconds $BrowserPollSeconds `
+                -PageIdleSeconds $PageIdleSeconds `
+                -PageLoadTimeoutSeconds $PageLoadTimeoutSeconds `
+                -MaxLoadAttempts $MaxLoadAttempts `
+                -MhtmlRoot $MhtmlRoot
+        }
     } -ArgumentList @(
         $scriptPath,
         $script:BrowserPort,
@@ -1602,7 +1613,14 @@ function Receive-WorkerOutput {
         return
     }
 
-    Receive-Job -Job $Worker.Job -ErrorAction SilentlyContinue -WarningAction SilentlyContinue | Out-Host
+    Receive-Job -Job $Worker.Job -ErrorAction SilentlyContinue -WarningAction Continue | Out-Host
+    if ($Worker.Job.ChildJobs) {
+        foreach ($childJob in @($Worker.Job.ChildJobs)) {
+            foreach ($errorRecord in @($childJob.Error)) {
+                Write-Warning "Worker #$($Worker.Id) error: $($errorRecord.Exception.Message)"
+            }
+        }
+    }
 }
 
 function Send-TaskToWorker {
