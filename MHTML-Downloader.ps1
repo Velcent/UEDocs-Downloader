@@ -521,7 +521,7 @@ function Get-MhtmlSwitchDiscoveryExpression {
     const cls = (el?.className || '').toString().toLowerCase();
     if (cls.includes('icon-windows')) return 'Windows';
     if (cls.includes('icon-linux')) return 'Linux';
-    if (cls.includes('icon-apple') || cls.includes('icon-mac') || cls.includes('icon-macos')) return 'MacOS';
+    if (cls.includes('icon-apple') || cls.includes('icon-mac') || cls.includes('icon-macos')) return 'Mac';
     if (cls.includes('icon-blueprint')) return 'Blueprint';
     if (cls.includes('icon-cpp') || cls.includes('icon-cplusplus')) return 'C++';
     return '';
@@ -534,16 +534,6 @@ function Get-MhtmlSwitchDiscoveryExpression {
       seen.add(key);
       return true;
     });
-  };
-  const canonicalOption = (value) => {
-    const text = normalize(value);
-    const key = text.toLowerCase().replace(/[\s_+-]+/g, '');
-    if (key === 'windows') return 'Windows';
-    if (key === 'linux') return 'Linux';
-    if (key === 'mac' || key === 'macos' || key === 'apple') return 'MacOS';
-    if (key === 'blueprint') return 'Blueprint';
-    if (key === 'cpp' || key === 'cplusplus' || text === 'C++') return 'C++';
-    return text;
   };
   const readDropdownOptions = async (control) => {
     const openers = Array.from(control.querySelectorAll('.ng-select-container, .ng-arrow-wrapper, input[role="combobox"], ng-select, .ng-select, [role="combobox"], button'));
@@ -568,7 +558,7 @@ function Get-MhtmlSwitchDiscoveryExpression {
     }
     const options = optionNodes
       .filter(option => !option.classList.contains('ng-option-disabled'))
-      .map(option => canonicalOption(option.innerText || option.textContent || option.getAttribute('aria-label') || option.getAttribute('title') || mapIcon(option.querySelector('.block-switch-option-icon, [class*="icon-"]')) || ''));
+      .map(option => normalize(option.innerText || option.textContent || option.getAttribute('aria-label') || option.getAttribute('title') || mapIcon(option.querySelector('.block-switch-option-icon, [class*="icon-"]')) || ''));
     try {
       document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
     } catch {}
@@ -627,20 +617,10 @@ function Get-MhtmlSwitchSelectExpression {
     const cls = (el?.className || '').toString().toLowerCase();
     if (cls.includes('icon-windows')) return 'Windows';
     if (cls.includes('icon-linux')) return 'Linux';
-    if (cls.includes('icon-apple') || cls.includes('icon-mac') || cls.includes('icon-macos')) return 'MacOS';
+    if (cls.includes('icon-apple') || cls.includes('icon-mac') || cls.includes('icon-macos')) return 'Mac';
     if (cls.includes('icon-blueprint')) return 'Blueprint';
     if (cls.includes('icon-cpp') || cls.includes('icon-cplusplus')) return 'C++';
     return '';
-  };
-  const canonicalOption = (value) => {
-    const text = normalize(value);
-    const key = text.toLowerCase().replace(/[\s_+-]+/g, '');
-    if (key === 'windows') return 'Windows';
-    if (key === 'linux') return 'Linux';
-    if (key === 'mac' || key === 'macos' || key === 'apple') return 'MacOS';
-    if (key === 'blueprint') return 'Blueprint';
-    if (key === 'cpp' || key === 'cplusplus' || text === 'C++') return 'C++';
-    return text;
   };
   const clickDropdownOption = async (control, label) => {
     const openers = Array.from(control?.querySelectorAll?.('.ng-select-container, .ng-arrow-wrapper, input[role="combobox"], ng-select, .ng-select, [role="combobox"], button') || []);
@@ -658,7 +638,7 @@ function Get-MhtmlSwitchSelectExpression {
       await delay(150);
       if (document.querySelector('.ng-dropdown-panel .ng-option')) break;
     }
-    const wanted = canonicalOption(label).toLowerCase();
+    const wanted = normalize(label).toLowerCase();
     let options = [];
     for (let attempt = 0; attempt < 10; attempt++) {
       options = Array.from(document.querySelectorAll('.ng-dropdown-panel .ng-option'))
@@ -666,8 +646,8 @@ function Get-MhtmlSwitchSelectExpression {
       if (options.length > 0) break;
       await delay(150);
     }
-    let match = options.find(option => canonicalOption(labelOf(option)).toLowerCase() === wanted) ||
-      options.find(option => canonicalOption(labelOf(option)).toLowerCase().includes(wanted));
+    let match = options.find(option => labelOf(option).toLowerCase() === wanted) ||
+      options.find(option => labelOf(option).toLowerCase().includes(wanted));
     if (match) {
       match.scrollIntoView({ block: 'center', inline: 'nearest' });
       try {
@@ -682,14 +662,14 @@ function Get-MhtmlSwitchSelectExpression {
     return false;
   };
   const clickFallbackOption = async (label) => {
-    const wanted = canonicalOption(label).toLowerCase();
+    const wanted = normalize(label).toLowerCase();
     const candidates = Array.from(document.querySelectorAll(
       'block-switch-control button, block-switch-control [role="button"], block-switch-control .block-switch-option-icon, block-switch-view button, block-switch-view [role="button"], block-switch-view .block-switch-option-icon'
     )).filter(visible);
     const match = candidates.find(el => {
       const iconLabel = mapIcon(el);
       const textLabel = labelOf(el);
-      return canonicalOption(iconLabel).toLowerCase() === wanted || canonicalOption(textLabel).toLowerCase() === wanted || canonicalOption(textLabel).toLowerCase().includes(wanted);
+      return iconLabel.toLowerCase() === wanted || textLabel.toLowerCase() === wanted || textLabel.toLowerCase().includes(wanted);
     });
     if (!match) return false;
     const clickable = match.closest('button, [role="button"], .ng-option') || match;
