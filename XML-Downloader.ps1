@@ -42,12 +42,14 @@ $LearningTargets = @(
         Title = 'Unreal Engine Learning'
         RootUrl = 'https://dev.epicgames.com/community/unreal-engine/learning'
         OutputPath = (Join-Path $MhtmlRoot 'LearnUE.xml')
+        ListOutputPath = (Join-Path $MhtmlRoot 'LearnUE-list.xml')
     },
     [pscustomobject]@{
         Key = 'LearnMH'
         Title = 'MetaHuman Learning'
         RootUrl = 'https://dev.epicgames.com/community/metahuman/learning'
         OutputPath = (Join-Path $MhtmlRoot 'LearnMH.xml')
+        ListOutputPath = (Join-Path $MhtmlRoot 'LearnMH-list.xml')
     }
 )
 
@@ -408,14 +410,15 @@ function Get-LearningSnapshotExpression {
   }
 
   const learningList = document.querySelector('learning-list') || document.querySelector('[class*="learning-list" i]');
+  const totalResultsText = normalize(document.querySelector('div.filter-options-container span')?.textContent || '');
+  const totalResultsMatch = totalResultsText.match(/\b([\d,.]+)\s+results?\b/i) || totalResultsText.match(/\b([\d,.]+)\b/);
+  const totalResults = totalResultsMatch ? Number(totalResultsMatch[1].replace(/[,.]/g, '')) : 0;
   const seen = new Set();
   const items = [];
   const listItems = learningList ? Array.from(learningList.querySelectorAll('li')) : [];
   listItems.forEach((li) => {
     const heading = li.querySelector('h6');
-    if (!heading) return;
-
-    const anchor = heading.closest('a[href]') || heading.parentElement?.closest('a[href]');
+    const anchor = heading?.closest('a[href]') || heading?.parentElement?.closest('a[href]') || li.querySelector('a[href]');
     if (!anchor) return;
 
     const url = toUrl(anchor.getAttribute('href'));
@@ -425,11 +428,11 @@ function Get-LearningSnapshotExpression {
     if (!/\/community\//i.test(parsed.pathname)) return;
     if (/\/learning(?:\/page\/\d+)?\/?$/i.test(parsed.pathname)) return;
 
-    const title = normalize(heading.textContent || anchor.getAttribute('aria-label') || anchor.getAttribute('title') || url);
+    const title = normalize(heading?.textContent || anchor.getAttribute('aria-label') || anchor.getAttribute('title') || anchor.textContent || url);
     if (!title) return;
 
     seen.add(url);
-    items.push({ title, url });
+    items.push({ title, url, html: li.outerHTML || '' });
   });
 
   const h1 = document.querySelector('h1');
@@ -441,6 +444,8 @@ function Get-LearningSnapshotExpression {
     title: document.title || '',
     h1: normalize(h1?.textContent || ''),
     totalPages: Math.max(...pageNumbers.filter(Number.isFinite), 1),
+    totalResults,
+    totalResultsText,
     hasPagination: !!pagination,
     hasLearningList: !!learningList,
     itemCount: items.length,
@@ -764,6 +769,7 @@ function Get-LearningPageDataInSession {
                 FinalUrl = [string]$data.href
                 Title = [string]$data.h1
                 TotalPages = [int]$data.totalPages
+                TotalResults = [int]$data.totalResults
                 Items = @($data.items)
             }
         }
@@ -916,6 +922,7 @@ function New-WorkerSuccessResult {
         PageUrl = $Result.PageUrl
         FinalUrl = $Result.FinalUrl
         TotalPages = $Result.TotalPages
+        TotalResults = $Result.TotalResults
         Items = @($Result.Items)
         Error = ''
     }
@@ -941,6 +948,7 @@ function New-WorkerErrorResult {
         PageUrl = $PageUrl
         FinalUrl = ''
         TotalPages = 0
+        TotalResults = 0
         Items = @()
         Error = $ErrorMessage
     }
@@ -1168,52 +1176,47 @@ function Stop-LearningWorkers {
 function ConvertTo-LearningXml {
     param(
         $Target,
-        [object[]]$PageResults
+        [object[]]$Items
     )
 
     $lines = New-Object System.Collections.ArrayList
     [void]$lines.Add(('<div class="contents-table-el is-active is-root-entry"><a class="contents-table-link is-parent" href="{0}">{1}</a></div>' -f (ConvertTo-XmlAttributeValue $Target.RootUrl), (ConvertTo-XmlAttributeValue $Target.Title)))
     [void]$lines.Add('<ul class="contents-table-list">')
 
-    foreach ($pageResult in @($PageResults | Sort-Object Page)) {
-        if (-not $pageResult) {
+    foreach ($item in @($Items)) {
+        if (-not $item -or [string]::IsNullOrWhiteSpace([string]$item.url)) {
             continue
         }
 
-        $pageNumber = [int]$pageResult.Page
-        $pageUrl = [string]$pageResult.PageUrl
-        if ([string]::IsNullOrWhiteSpace($pageUrl)) {
-            $pageUrl = ConvertTo-PageUrl -RootUrl $Target.RootUrl -Page $pageNumber
+        $title = ConvertTo-SafeText ([string]$item.title)
+        if ([string]::IsNullOrWhiteSpace($title)) {
+            $title = [string]$item.url
         }
 
-        $pageHref = ConvertTo-XmlAttributeValue $pageUrl
-        $pageLabel = ConvertTo-XmlAttributeValue ("Page $pageNumber")
+        $href = ConvertTo-XmlAttributeValue ([string]$item.url)
+        $label = ConvertTo-XmlAttributeValue $title
         [void]$lines.Add("`t<li class=""contents-table-item"">")
-        [void]$lines.Add("`t`t<div class=""contents-table-el""><a class=""contents-table-link is-parent"" href=""$pageHref"">$pageLabel</a></div>")
-        [void]$lines.Add("`t`t<ul class=""contents-table-list"">")
-
-        foreach ($item in @($pageResult.Items)) {
-            if (-not $item -or [string]::IsNullOrWhiteSpace([string]$item.url)) {
-                continue
-            }
-
-            $title = ConvertTo-SafeText ([string]$item.title)
-            if ([string]::IsNullOrWhiteSpace($title)) {
-                $title = [string]$item.url
-            }
-
-            $href = ConvertTo-XmlAttributeValue ([string]$item.url)
-            $label = ConvertTo-XmlAttributeValue $title
-            [void]$lines.Add("`t`t`t<li class=""contents-table-item"">")
-            [void]$lines.Add("`t`t`t`t<div class=""contents-table-el""><a class=""contents-table-link"" href=""$href"">$label</a></div>")
-            [void]$lines.Add("`t`t`t</li>")
-        }
-
-        [void]$lines.Add("`t`t</ul>")
+        [void]$lines.Add("`t`t<div class=""contents-table-el""><a class=""contents-table-link"" href=""$href"">$label</a></div>")
         [void]$lines.Add("`t</li>")
     }
 
     [void]$lines.Add('</ul>')
+    return [string[]]$lines.ToArray()
+}
+
+function ConvertTo-LearningListXml {
+    param([object[]]$Items)
+
+    $lines = New-Object System.Collections.ArrayList
+    foreach ($item in @($Items)) {
+        $html = [string]$item.html
+        if ([string]::IsNullOrWhiteSpace($html)) {
+            continue
+        }
+
+        [void]$lines.Add($html)
+    }
+
     return [string[]]$lines.ToArray()
 }
 
@@ -1397,7 +1400,101 @@ function Invoke-ParallelPageReads {
     return @($results)
 }
 
-$allPageTasks = New-Object System.Collections.ArrayList
+function New-LearningPageTasks {
+    param(
+        $Target,
+        [int]$TotalPages
+    )
+
+    $tasks = New-Object System.Collections.ArrayList
+    for ($page = 1; $page -le $TotalPages; $page++) {
+        [void]$tasks.Add([pscustomobject]@{
+            TargetKey = [string]$Target.Key
+            Page = $page
+            Url = (ConvertTo-PageUrl -RootUrl $Target.RootUrl -Page $page)
+        })
+    }
+
+    return @($tasks)
+}
+
+function Add-LearningUniqueItems {
+    param(
+        [System.Collections.Specialized.OrderedDictionary]$ItemsByKey,
+        [object[]]$PageResults
+    )
+
+    $added = 0
+    foreach ($result in @($PageResults | Sort-Object Page)) {
+        foreach ($item in @($result.Items)) {
+            $url = [string]$item.url
+            if ([string]::IsNullOrWhiteSpace($url)) {
+                continue
+            }
+
+            $key = Get-CanonicalUrlKey -PageUrl $url
+            if ($ItemsByKey.Contains($key)) {
+                continue
+            }
+
+            $ItemsByKey.Add($key, $item)
+            $added++
+        }
+    }
+
+    return $added
+}
+
+function Invoke-LearningTargetScan {
+    param($Target)
+
+    $itemsByKey = [System.Collections.Specialized.OrderedDictionary]::new([System.StringComparer]::OrdinalIgnoreCase)
+    $totalPages = [Math]::Max(1, [int]$Target.TotalPages)
+    $totalResults = [Math]::Max(0, [int]$Target.TotalResults)
+    $pass = 0
+
+    while ($true) {
+        $pass++
+        $scanPages = $totalPages
+        if ($MaxPages -gt 0) {
+            $scanPages = [Math]::Min($scanPages, $MaxPages)
+        }
+
+        Write-Host ""
+        Write-Host "Scan $($Target.Key) pass #${pass}: $scanPages page, target total $totalResults link"
+        $tasks = @(New-LearningPageTasks -Target $Target -TotalPages $scanPages)
+        $pageResults = @(Invoke-ParallelPageReads -Tasks $tasks)
+
+        foreach ($result in @($pageResults)) {
+            if ([int]$result.TotalPages -gt $totalPages -and $MaxPages -le 0) {
+                $totalPages = [int]$result.TotalPages
+            }
+            if ([int]$result.TotalResults -gt 0) {
+                $totalResults = [int]$result.TotalResults
+            }
+        }
+
+        $added = Add-LearningUniqueItems -ItemsByKey $itemsByKey -PageResults $pageResults
+        Write-Host "Unique $($Target.Key): $($itemsByKey.Count)/$totalResults link (+$added)"
+
+        if ($MaxPages -gt 0) {
+            break
+        }
+        if ($totalResults -le 0 -or $itemsByKey.Count -ge $totalResults) {
+            break
+        }
+
+        Write-Warning "$($Target.Key): jumlah link belum sampai total result, ulangi dari halaman pertama."
+    }
+
+    return [pscustomobject]@{
+        Items = @($itemsByKey.Values)
+        TotalResults = $totalResults
+        TotalPages = $totalPages
+        Passes = $pass
+    }
+}
+
 if ($BuildLearn) {
     foreach ($target in $LearningTargets) {
         Write-Host ""
@@ -1409,15 +1506,9 @@ if ($BuildLearn) {
         }
 
         $target | Add-Member -NotePropertyName TotalPages -NotePropertyValue $totalPages -Force
+        $target | Add-Member -NotePropertyName TotalResults -NotePropertyValue ([int]$rootData.TotalResults) -Force
         Write-Host "Total page $($target.Key): $totalPages"
-
-        for ($page = 1; $page -le $totalPages; $page++) {
-            [void]$allPageTasks.Add([pscustomobject]@{
-                TargetKey = [string]$target.Key
-                Page = $page
-                Url = (ConvertTo-PageUrl -RootUrl $target.RootUrl -Page $page)
-            })
-        }
+        Write-Host "Total result $($target.Key): $($target.TotalResults)"
     }
 }
 
@@ -1425,7 +1516,7 @@ if ($DryRun) {
     Write-Host "DryRun aktif: tidak menulis XML."
     if ($BuildLearn) {
         foreach ($target in $LearningTargets) {
-            Write-Host "$($target.Key): $($target.TotalPages) page -> $($target.OutputPath)"
+            Write-Host "$($target.Key): $($target.TotalPages) page, $($target.TotalResults) result -> $($target.OutputPath), $($target.ListOutputPath)"
         }
     }
     if ($BuildDoc) {
@@ -1440,21 +1531,16 @@ if ($DryRun) {
     return
 }
 
-$pageResults = @()
-if ($BuildLearn -and $allPageTasks.Count -gt 0) {
-    $pageResults = @(Invoke-ParallelPageReads -Tasks @($allPageTasks))
+if ($BuildLearn) {
     foreach ($target in $LearningTargets) {
-        $targetResults = @($pageResults | Where-Object { [string]$_.TargetKey -eq [string]$target.Key } | Sort-Object Page)
-        $items = New-Object System.Collections.ArrayList
-        foreach ($result in $targetResults) {
-            foreach ($item in @($result.Items)) {
-                [void]$items.Add($item)
-            }
-        }
-
-        $xmlLines = ConvertTo-LearningXml -Target $target -PageResults $targetResults
+        $scanResult = Invoke-LearningTargetScan -Target $target
+        $items = @($scanResult.Items)
+        $xmlLines = ConvertTo-LearningXml -Target $target -Items $items
+        $listXmlLines = ConvertTo-LearningListXml -Items $items
         Set-Content -LiteralPath $target.OutputPath -Value $xmlLines -Encoding UTF8
-        Write-Host "Tulis XML: $(ConvertTo-RelativeRootPath $target.OutputPath) ($($targetResults.Count) page, $(@($items).Count) link mentah)"
+        Set-Content -LiteralPath $target.ListOutputPath -Value $listXmlLines -Encoding UTF8
+        Write-Host "Tulis XML: $(ConvertTo-RelativeRootPath $target.OutputPath) ($($items.Count)/$($scanResult.TotalResults) link unik, $($scanResult.Passes) pass)"
+        Write-Host "Tulis XML list: $(ConvertTo-RelativeRootPath $target.ListOutputPath) ($($listXmlLines.Count) li unik)"
     }
 }
 
