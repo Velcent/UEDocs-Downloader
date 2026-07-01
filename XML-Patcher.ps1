@@ -156,17 +156,14 @@ function ConvertFrom-LearningXmlLi {
     }
 }
 
-function Add-LearningXmlChildItems {
+function Get-LearningXmlWritableChildren {
     param(
-        [System.Collections.ArrayList]$Lines,
         [object[]]$Items,
-        [int]$Depth,
-        [System.Collections.Generic.HashSet[string]]$BlockedKeys,
+        [System.Collections.Generic.HashSet[string]]$WrittenKeys,
         [ref]$RemovedChildren
     )
 
-    $indent = "`t" * $Depth
-    $writtenKeys = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    $children = New-Object System.Collections.ArrayList
     foreach ($item in @($Items)) {
         if (-not $item) {
             continue
@@ -178,18 +175,44 @@ function Add-LearningXmlChildItems {
         }
 
         $key = Get-CanonicalUrlKey -PageUrl $href
-        if (($BlockedKeys -and $BlockedKeys.Contains($key)) -or $writtenKeys.Contains($key)) {
+        if ($WrittenKeys.Contains($key)) {
             $RemovedChildren.Value++
             continue
         }
-        [void]$writtenKeys.Add($key)
+        [void]$WrittenKeys.Add($key)
+        [void]$children.Add($item)
+    }
 
-        $nextBlockedKeys = Copy-StringHashSet -Source $BlockedKeys
-        [void]$nextBlockedKeys.Add($key)
-        $children = @($item.Children | Where-Object {
-            $childUrl = ConvertTo-CleanUrl ([string]$_.Url)
-            -not [string]::IsNullOrWhiteSpace($childUrl) -and -not $nextBlockedKeys.Contains((Get-CanonicalUrlKey -PageUrl $childUrl))
-        })
+    return @($children)
+}
+
+function Add-LearningXmlChildItems {
+    param(
+        [System.Collections.ArrayList]$Lines,
+        [object[]]$Items,
+        [int]$Depth,
+        [System.Collections.Generic.HashSet[string]]$WrittenKeys,
+        [ref]$RemovedChildren
+    )
+
+    $indent = "`t" * $Depth
+    foreach ($item in @($Items)) {
+        if (-not $item) {
+            continue
+        }
+
+        $href = ConvertTo-CleanUrl ([string]$item.Url)
+        if ([string]::IsNullOrWhiteSpace($href)) {
+            continue
+        }
+
+        $key = Get-CanonicalUrlKey -PageUrl $href
+        if ($WrittenKeys.Contains($key)) {
+            $RemovedChildren.Value++
+            continue
+        }
+
+        $children = @(Get-LearningXmlWritableChildren -Items @($item.Children) -WrittenKeys $WrittenKeys -RemovedChildren $RemovedChildren)
 
         $title = ConvertTo-SafeText ([string]$item.Title)
         if ([string]::IsNullOrWhiteSpace($title)) {
@@ -204,7 +227,7 @@ function Add-LearningXmlChildItems {
         [void]$Lines.Add("$indent`t<div class=""contents-table-el""><a class=""$linkClass"" href=""$safeHref"">$label</a></div>")
         if ($children.Count -gt 0) {
             [void]$Lines.Add("$indent`t<ul class=""contents-table-list"">")
-            Add-LearningXmlChildItems -Lines $Lines -Items $children -Depth ($Depth + 2) -BlockedKeys $nextBlockedKeys -RemovedChildren $RemovedChildren
+            Add-LearningXmlChildItems -Lines $Lines -Items $children -Depth ($Depth + 2) -WrittenKeys $WrittenKeys -RemovedChildren $RemovedChildren
             [void]$Lines.Add("$indent`t</ul>")
         }
         [void]$Lines.Add("$indent</li>")
@@ -294,6 +317,7 @@ function Write-LearningXml {
     [void]$lines.Add('<ul class="contents-table-list">')
 
     $writtenParentKeys = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    $writtenAllKeys = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
     foreach ($li in $parentLis) {
         $anchor = Get-DirectContentAnchor -Li $li
         if (-not $anchor) {
@@ -311,6 +335,7 @@ function Write-LearningXml {
             continue
         }
         [void]$writtenParentKeys.Add($parentKey)
+        [void]$writtenAllKeys.Add($parentKey)
 
         $children = New-Object System.Collections.ArrayList
         foreach ($childLi in Get-DirectChildItems -Li $li) {
@@ -329,16 +354,19 @@ function Write-LearningXml {
         $label = ConvertTo-XmlAttributeValue $title
         $publishedAt = ConvertTo-XmlAttributeValue ([string]$anchor.ParentNode.GetAttribute('data-published-at'))
         $publishedTimestamp = ConvertTo-XmlAttributeValue ([string]$anchor.ParentNode.GetAttribute('data-published-timestamp'))
+
+        if ($children.Count -gt 0) {
+            $children = @(Get-LearningXmlWritableChildren -Items @($children) -WrittenKeys $writtenAllKeys -RemovedChildren ([ref]$removedChildren))
+        }
+
         $linkClass = if ($children.Count -gt 0) { 'contents-table-link is-parent' } else { 'contents-table-link' }
 
         [void]$lines.Add("`t<li class=""contents-table-item"">")
         [void]$lines.Add("`t`t<div class=""contents-table-el"" data-published-at=""$publishedAt"" data-published-timestamp=""$publishedTimestamp""><a class=""$linkClass"" href=""$safeHref"">$label</a></div>")
 
         if ($children.Count -gt 0) {
-            $blockedKeys = Copy-StringHashSet -Source $parentKeys
-            [void]$blockedKeys.Add($parentKey)
             [void]$lines.Add("`t`t<ul class=""contents-table-list"">")
-            Add-LearningXmlChildItems -Lines $lines -Items @($children) -Depth 3 -BlockedKeys $blockedKeys -RemovedChildren ([ref]$removedChildren)
+            Add-LearningXmlChildItems -Lines $lines -Items @($children) -Depth 3 -WrittenKeys $writtenAllKeys -RemovedChildren ([ref]$removedChildren)
             [void]$lines.Add("`t`t</ul>")
         }
 

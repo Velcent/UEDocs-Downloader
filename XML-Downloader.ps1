@@ -2031,10 +2031,17 @@ function ConvertTo-LearningXml {
     }
 
     $parentTitleCounts = @{}
+    $writtenAllKeys = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
     foreach ($item in @($Items)) {
         if (-not $item -or [string]::IsNullOrWhiteSpace([string]$item.url)) {
             continue
         }
+
+        $parentKey = Get-CanonicalUrlKey -PageUrl ([string]$item.url)
+        if ($writtenAllKeys.Contains($parentKey)) {
+            continue
+        }
+        [void]$writtenAllKeys.Add($parentKey)
 
         $title = ConvertTo-SafeText ([string]$item.title)
         if ([string]::IsNullOrWhiteSpace($title)) {
@@ -2054,18 +2061,13 @@ function ConvertTo-LearningXml {
         $label = ConvertTo-XmlAttributeValue $title
         $publishedAt = ConvertTo-XmlAttributeValue ([string]$item.publishedAt)
         $publishedTimestamp = ConvertTo-XmlAttributeValue ([string]$item.publishedTimestamp)
-        $blockedKeys = Copy-StringHashSet -Source $parentUrlKeys
-        [void]$blockedKeys.Add((Get-CanonicalUrlKey -PageUrl ([string]$item.url)))
-        $children = @($item.children | Where-Object {
-            $childUrl = [string]$_.url
-            -not [string]::IsNullOrWhiteSpace($childUrl) -and -not $blockedKeys.Contains((Get-CanonicalUrlKey -PageUrl $childUrl))
-        })
+        $children = @(Get-LearningXmlWritableChildren -Items @($item.children) -WrittenKeys $writtenAllKeys)
         $linkClass = if ($children.Count -gt 0) { 'contents-table-link is-parent' } else { 'contents-table-link' }
         [void]$lines.Add("`t<li class=""contents-table-item"">")
         [void]$lines.Add("`t`t<div class=""contents-table-el"" data-published-at=""$publishedAt"" data-published-timestamp=""$publishedTimestamp""><a class=""$linkClass"" href=""$href"">$label</a></div>")
         if ($children.Count -gt 0) {
             [void]$lines.Add("`t`t<ul class=""contents-table-list"">")
-            Add-LearningXmlChildItems -Lines $lines -Items $children -Depth 3 -BlockedKeys $blockedKeys
+            Add-LearningXmlChildItems -Lines $lines -Items $children -Depth 3 -WrittenKeys $writtenAllKeys
             [void]$lines.Add("`t`t</ul>")
         }
         [void]$lines.Add("`t</li>")
@@ -2075,16 +2077,13 @@ function ConvertTo-LearningXml {
     return [string[]]$lines.ToArray()
 }
 
-function Add-LearningXmlChildItems {
+function Get-LearningXmlWritableChildren {
     param(
-        [System.Collections.ArrayList]$Lines,
         [object[]]$Items,
-        [int]$Depth,
-        [System.Collections.Generic.HashSet[string]]$BlockedKeys
+        [System.Collections.Generic.HashSet[string]]$WrittenKeys
     )
 
-    $indent = "`t" * $Depth
-    $writtenKeys = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    $children = New-Object System.Collections.ArrayList
     foreach ($item in @($Items)) {
         if (-not $item) {
             continue
@@ -2096,22 +2095,46 @@ function Add-LearningXmlChildItems {
         }
 
         $key = Get-CanonicalUrlKey -PageUrl $url
-        if (($BlockedKeys -and $BlockedKeys.Contains($key)) -or $writtenKeys.Contains($key)) {
+        if ($WrittenKeys.Contains($key)) {
             continue
         }
-        [void]$writtenKeys.Add($key)
+        [void]$WrittenKeys.Add($key)
+        [void]$children.Add($item)
+    }
+
+    return @($children)
+}
+
+function Add-LearningXmlChildItems {
+    param(
+        [System.Collections.ArrayList]$Lines,
+        [object[]]$Items,
+        [int]$Depth,
+        [System.Collections.Generic.HashSet[string]]$WrittenKeys
+    )
+
+    $indent = "`t" * $Depth
+    foreach ($item in @($Items)) {
+        if (-not $item) {
+            continue
+        }
+
+        $url = ConvertTo-CleanUrl ([string]$item.url)
+        if ([string]::IsNullOrWhiteSpace($url)) {
+            continue
+        }
+
+        $key = Get-CanonicalUrlKey -PageUrl $url
+        if ($WrittenKeys.Contains($key)) {
+            continue
+        }
 
         $title = ConvertTo-SafeText ([string]$item.title)
         if ([string]::IsNullOrWhiteSpace($title)) {
             $title = $url
         }
 
-        $nextBlockedKeys = Copy-StringHashSet -Source $BlockedKeys
-        [void]$nextBlockedKeys.Add($key)
-        $children = @($item.children | Where-Object {
-            $childUrl = ConvertTo-CleanUrl ([string]$_.url)
-            -not [string]::IsNullOrWhiteSpace($childUrl) -and -not $nextBlockedKeys.Contains((Get-CanonicalUrlKey -PageUrl $childUrl))
-        })
+        $children = @(Get-LearningXmlWritableChildren -Items @($item.children) -WrittenKeys $WrittenKeys)
 
         $href = ConvertTo-XmlAttributeValue $url
         $label = ConvertTo-XmlAttributeValue $title
@@ -2121,7 +2144,7 @@ function Add-LearningXmlChildItems {
         [void]$Lines.Add("$indent`t<div class=""contents-table-el""><a class=""$linkClass"" href=""$href"">$label</a></div>")
         if ($children.Count -gt 0) {
             [void]$Lines.Add("$indent`t<ul class=""contents-table-list"">")
-            Add-LearningXmlChildItems -Lines $Lines -Items $children -Depth ($Depth + 2) -BlockedKeys $nextBlockedKeys
+            Add-LearningXmlChildItems -Lines $Lines -Items $children -Depth ($Depth + 2) -WrittenKeys $WrittenKeys
             [void]$Lines.Add("$indent`t</ul>")
         }
         [void]$Lines.Add("$indent</li>")
