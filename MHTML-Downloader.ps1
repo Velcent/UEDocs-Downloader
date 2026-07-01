@@ -901,7 +901,15 @@ function Get-MhtmlSnippetPrepareExpression {
     return text;
   };
   const textOf = (el) => el ? decodeEntities(el.value || el.innerText || el.textContent || '') : '';
-  const snippetType = (snippet) => snippet.querySelector('blueprint-render, .blueprint-render') ? 'blueprint' : 'code';
+  const snippetType = (snippet) => {
+    const ownType = normalize([
+      snippet.getAttribute?.('snippet-type'),
+      snippet.getAttribute?.('data-snippet-type'),
+      snippet.getAttribute?.('type')
+    ].filter(Boolean).join(' ')).toLowerCase();
+    if (ownType === 'blueprint' || snippet.matches?.('[snippet-type="blueprint"], [data-snippet-type="blueprint"]')) return 'blueprint';
+    return snippet.querySelector('blueprint-render, .blueprint-render') ? 'blueprint' : 'code';
+  };
   const sourceLooksUseful = (text, type) => {
     const value = (text || '').trim();
     if (!value) return false;
@@ -936,7 +944,7 @@ function Get-MhtmlSnippetPrepareExpression {
   };
   const findDomSource = (snippet, type) => {
     const nodes = sourceRootsFor(snippet)
-      .flatMap(root => Array.from(root.querySelectorAll('[data-full-source], [data-source], [class*="full-source" i], [class*="raw-source" i]')))
+      .flatMap(root => Array.from(root.querySelectorAll('[data-full-source], [data-source], [class*="full-source" i], [class*="raw-source" i], .visually-hidden')))
       .filter(el => isOwnedBySnippet(snippet, el) && !el.closest?.('blueprint-render') && !el.classList?.contains('mhtml-full-snippet-source'));
     const texts = nodes.map(el => decodeEntities(
       el.getAttribute('data-full-source') ||
@@ -1037,8 +1045,27 @@ function Get-MhtmlSnippetPrepareExpression {
     textarea.textContent = source || '';
     return textarea;
   };
+  const findExistingStaticSourceElement = (root, source) => {
+    const wanted = (source || '').trim();
+    if (!wanted) return null;
+    const candidates = Array.from(root.querySelectorAll('[data-full-source], [data-source], [class*="full-source" i], [class*="raw-source" i], .visually-hidden'))
+      .filter(el => !el.matches?.('textarea') && !el.closest?.('blueprint-render') && !el.classList?.contains('mhtml-full-snippet-source'));
+    return candidates.find(el => textOf(el).trim() === wanted) || null;
+  };
+  const replaceExistingSourceElement = (el, source, type, metadata = {}) => {
+    if (!el?.parentNode) return null;
+    const textarea = document.createElement('textarea');
+    writeTextareaSource(textarea, source, type, metadata);
+    el.replaceWith(textarea);
+    return textarea;
+  };
   const injectSnippetSource = (snippet, source, type, metadata = {}) => {
     if (!sourceLooksUseful(source, type)) return false;
+    const existing = findExistingStaticSourceElement(snippet, source);
+    if (existing) {
+      replaceExistingSourceElement(existing, source, type, metadata);
+      return true;
+    }
     let textarea = Array.from(snippet.children).find(el => el.matches?.('textarea.mhtml-full-snippet-source'));
     if (!textarea) {
       textarea = document.createElement('textarea');
@@ -1058,12 +1085,16 @@ function Get-MhtmlSnippetPrepareExpression {
   };
   const injectLegacySource = (pre, source) => {
     if (!sourceLooksUseful(source, 'code')) return false;
-    let textarea = pre.nextElementSibling?.matches?.('textarea.mhtml-full-snippet-source') ? pre.nextElementSibling : null;
+    let textarea = pre.nextElementSibling?.matches?.('textarea') ? pre.nextElementSibling : null;
     if (!textarea) {
       textarea = document.createElement('textarea');
       pre.insertAdjacentElement('afterend', textarea);
     }
     writeTextareaSource(textarea, source, 'code', {});
+    const duplicate = textarea.nextElementSibling;
+    if (duplicate?.matches?.('textarea:not(.mhtml-full-snippet-source)') && !textOf(duplicate).trim()) {
+      duplicate.remove();
+    }
     return true;
   };
   const processSnippet = async (snippet, index) => {
