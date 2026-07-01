@@ -38,6 +38,7 @@ $script:MainDocumentStatusText = ''
 $script:MainDocumentFailedText = ''
 $script:MainDocumentRequestId = ''
 $script:StartedEdgeProfileDirs = New-Object System.Collections.ArrayList
+$script:LearningChildMaxDepth = 5
 
 $LearningTargets = @(
     [pscustomobject]@{
@@ -891,6 +892,62 @@ function Get-CanonicalUrlKey {
     }
 }
 
+function Get-LearningRecursiveContainerKey {
+    param([string]$PageUrl)
+
+    if ([string]::IsNullOrWhiteSpace($PageUrl)) {
+        return ''
+    }
+
+    try {
+        $uri = [Uri](ConvertTo-CleanUrl $PageUrl)
+        $segments = @($uri.AbsolutePath.Trim('/').Split('/') | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+        if ($segments.Count -lt 5 -or $segments[0] -ine 'community' -or $segments[1] -ine 'learning') {
+            return ''
+        }
+
+        $kind = [string]$segments[2]
+        if ($kind -ieq 'courses') {
+            if ($segments.Count -eq 5) {
+                return Get-CanonicalUrlKey -PageUrl $uri.AbsoluteUri
+            }
+            return ''
+        }
+
+        if ($kind -ieq 'paths') {
+            return Get-CanonicalUrlKey -PageUrl $uri.AbsoluteUri
+        }
+
+        if ($kind -ieq 'tutorials' -and $segments.Count -eq 5) {
+            return Get-CanonicalUrlKey -PageUrl $uri.AbsoluteUri
+        }
+
+        return ''
+    }
+    catch {
+        return ''
+    }
+}
+
+function Set-LearningObjectProperty {
+    param(
+        [object]$Object,
+        [string]$Name,
+        [object]$Value
+    )
+
+    if (-not $Object) {
+        return
+    }
+
+    if ($Object.PSObject.Properties[$Name]) {
+        $Object.$Name = $Value
+    }
+    else {
+        Add-Member -InputObject $Object -NotePropertyName $Name -NotePropertyValue $Value -Force
+    }
+}
+
 function ConvertTo-CleanUrl {
     param([string]$PageUrl)
 
@@ -1228,6 +1285,161 @@ function Invoke-LearningDetailScan {
     }
 
     return @(Invoke-ParallelLearningDetailReads -Items $Items)
+}
+
+function Copy-StringHashSet {
+    param([System.Collections.Generic.HashSet[string]]$Source)
+
+    $copy = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    if ($Source) {
+        foreach ($item in $Source) {
+            [void]$copy.Add([string]$item)
+        }
+    }
+
+    return $copy
+}
+
+function Expand-LearningNestedChildren {
+    param(
+        [object[]]$Items,
+        [int]$MaxDepth = $script:LearningChildMaxDepth
+    )
+
+    if ($MaxDepth -le 0) {
+        return
+    }
+
+    $scannedContainers = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    $current = New-Object System.Collections.ArrayList
+    foreach ($item in @($Items)) {
+        if (-not $item) {
+            continue
+        }
+
+        $ancestorKeys = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+        $itemUrl = [string]$item.url
+        if (-not [string]::IsNullOrWhiteSpace($itemUrl)) {
+            [void]$ancestorKeys.Add((Get-CanonicalUrlKey -PageUrl $itemUrl))
+        }
+
+        [void]$current.Add([pscustomobject]@{
+            Node = $item
+            AncestorKeys = $ancestorKeys
+        })
+    }
+
+    for ($depth = 1; $depth -le $MaxDepth -and $current.Count -gt 0; $depth++) {
+        $tasks = New-Object System.Collections.ArrayList
+        $next = New-Object System.Collections.ArrayList
+
+        foreach ($entry in @($current)) {
+            $node = $entry.Node
+            $ancestorKeys = $entry.AncestorKeys
+            foreach ($child in @($node.children)) {
+                if (-not $child) {
+                    continue
+                }
+
+                $childUrl = [string]$child.url
+                if ([string]::IsNullOrWhiteSpace($childUrl)) {
+                    continue
+                }
+
+                $childKey = Get-CanonicalUrlKey -PageUrl $childUrl
+                if ($ancestorKeys.Contains($childKey)) {
+                    continue
+                }
+
+                $childAncestorKeys = Copy-StringHashSet -Source $ancestorKeys
+                [void]$childAncestorKeys.Add($childKey)
+
+                if (@($child.children).Count -gt 0) {
+                    [void]$next.Add([pscustomobject]@{
+                        Node = $child
+                        AncestorKeys = $childAncestorKeys
+                    })
+                    continue
+                }
+
+                $containerKey = Get-LearningRecursiveContainerKey -PageUrl $childUrl
+                if ([string]::IsNullOrWhiteSpace($containerKey) -or $scannedContainers.Contains($containerKey)) {
+                    continue
+                }
+
+                [void]$scannedContainers.Add($containerKey)
+                [void]$tasks.Add([pscustomobject]@{
+                    Child = $child
+                    AncestorKeys = $childAncestorKeys
+                    Item = [pscustomobject]@{
+                        title = [string]$child.title
+                        url = $childUrl
+                        html = ''
+                    }
+                })
+            }
+        }
+
+        if ($tasks.Count -eq 0) {
+            $current = $next
+            continue
+        }
+
+        Write-Host "Detail scan sub-child depth #${depth}: $($tasks.Count) link"
+        $detailItems = @($tasks | ForEach-Object { $_.Item })
+        $details = @(Invoke-LearningDetailScan -Items $detailItems)
+        $detailsByOriginal = @{}
+        foreach ($detail in @($details)) {
+            $originalUrl = [string]$detail.originalUrl
+            if (-not [string]::IsNullOrWhiteSpace($originalUrl)) {
+                $detailsByOriginal[(Get-CanonicalUrlKey -PageUrl $originalUrl)] = $detail
+            }
+        }
+
+        foreach ($task in @($tasks)) {
+            $originalKey = Get-CanonicalUrlKey -PageUrl ([string]$task.Item.url)
+            if (-not $detailsByOriginal.ContainsKey($originalKey)) {
+                continue
+            }
+
+            $detail = $detailsByOriginal[$originalKey]
+            $detailUrl = [string]$detail.url
+            if (-not [string]::IsNullOrWhiteSpace($detailUrl)) {
+                Set-LearningObjectProperty -Object $task.Child -Name 'url' -Value $detailUrl
+                [void]$task.AncestorKeys.Add((Get-CanonicalUrlKey -PageUrl $detailUrl))
+            }
+
+            $filteredChildren = New-Object System.Collections.ArrayList
+            $seenChildKeys = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+            foreach ($detailChild in @($detail.children)) {
+                $detailChildUrl = [string]$detailChild.url
+                if ([string]::IsNullOrWhiteSpace($detailChildUrl)) {
+                    continue
+                }
+
+                $detailChildKey = Get-CanonicalUrlKey -PageUrl $detailChildUrl
+                if ($task.AncestorKeys.Contains($detailChildKey) -or $seenChildKeys.Contains($detailChildKey)) {
+                    continue
+                }
+
+                [void]$seenChildKeys.Add($detailChildKey)
+                [void]$filteredChildren.Add($detailChild)
+            }
+
+            if ($filteredChildren.Count -gt 0) {
+                Set-LearningObjectProperty -Object $task.Child -Name 'children' -Value @($filteredChildren)
+                [void]$next.Add([pscustomobject]@{
+                    Node = $task.Child
+                    AncestorKeys = $task.AncestorKeys
+                })
+            }
+            else {
+                Set-LearningObjectProperty -Object $task.Child -Name 'children' -Value @()
+            }
+        }
+
+        $current = $next
+    }
 }
 
 function Wait-DocumentationPageReady {
@@ -1842,32 +2054,18 @@ function ConvertTo-LearningXml {
         $label = ConvertTo-XmlAttributeValue $title
         $publishedAt = ConvertTo-XmlAttributeValue ([string]$item.publishedAt)
         $publishedTimestamp = ConvertTo-XmlAttributeValue ([string]$item.publishedTimestamp)
+        $blockedKeys = Copy-StringHashSet -Source $parentUrlKeys
+        [void]$blockedKeys.Add((Get-CanonicalUrlKey -PageUrl ([string]$item.url)))
         $children = @($item.children | Where-Object {
             $childUrl = [string]$_.url
-            -not [string]::IsNullOrWhiteSpace($childUrl) -and -not $parentUrlKeys.Contains((Get-CanonicalUrlKey -PageUrl $childUrl))
+            -not [string]::IsNullOrWhiteSpace($childUrl) -and -not $blockedKeys.Contains((Get-CanonicalUrlKey -PageUrl $childUrl))
         })
         $linkClass = if ($children.Count -gt 0) { 'contents-table-link is-parent' } else { 'contents-table-link' }
         [void]$lines.Add("`t<li class=""contents-table-item"">")
         [void]$lines.Add("`t`t<div class=""contents-table-el"" data-published-at=""$publishedAt"" data-published-timestamp=""$publishedTimestamp""><a class=""$linkClass"" href=""$href"">$label</a></div>")
         if ($children.Count -gt 0) {
             [void]$lines.Add("`t`t<ul class=""contents-table-list"">")
-            foreach ($child in $children) {
-                $childUrl = [string]$child.url
-                if ([string]::IsNullOrWhiteSpace($childUrl)) {
-                    continue
-                }
-
-                $childTitle = ConvertTo-SafeText ([string]$child.title)
-                if ([string]::IsNullOrWhiteSpace($childTitle)) {
-                    $childTitle = $childUrl
-                }
-
-                $childHref = ConvertTo-XmlAttributeValue (ConvertTo-CleanUrl $childUrl)
-                $childLabel = ConvertTo-XmlAttributeValue $childTitle
-                [void]$lines.Add("`t`t`t<li class=""contents-table-item"">")
-                [void]$lines.Add("`t`t`t`t<div class=""contents-table-el""><a class=""contents-table-link"" href=""$childHref"">$childLabel</a></div>")
-                [void]$lines.Add("`t`t`t</li>")
-            }
+            Add-LearningXmlChildItems -Lines $lines -Items $children -Depth 3 -BlockedKeys $blockedKeys
             [void]$lines.Add("`t`t</ul>")
         }
         [void]$lines.Add("`t</li>")
@@ -1875,6 +2073,59 @@ function ConvertTo-LearningXml {
 
     [void]$lines.Add('</ul>')
     return [string[]]$lines.ToArray()
+}
+
+function Add-LearningXmlChildItems {
+    param(
+        [System.Collections.ArrayList]$Lines,
+        [object[]]$Items,
+        [int]$Depth,
+        [System.Collections.Generic.HashSet[string]]$BlockedKeys
+    )
+
+    $indent = "`t" * $Depth
+    $writtenKeys = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($item in @($Items)) {
+        if (-not $item) {
+            continue
+        }
+
+        $url = ConvertTo-CleanUrl ([string]$item.url)
+        if ([string]::IsNullOrWhiteSpace($url)) {
+            continue
+        }
+
+        $key = Get-CanonicalUrlKey -PageUrl $url
+        if (($BlockedKeys -and $BlockedKeys.Contains($key)) -or $writtenKeys.Contains($key)) {
+            continue
+        }
+        [void]$writtenKeys.Add($key)
+
+        $title = ConvertTo-SafeText ([string]$item.title)
+        if ([string]::IsNullOrWhiteSpace($title)) {
+            $title = $url
+        }
+
+        $nextBlockedKeys = Copy-StringHashSet -Source $BlockedKeys
+        [void]$nextBlockedKeys.Add($key)
+        $children = @($item.children | Where-Object {
+            $childUrl = ConvertTo-CleanUrl ([string]$_.url)
+            -not [string]::IsNullOrWhiteSpace($childUrl) -and -not $nextBlockedKeys.Contains((Get-CanonicalUrlKey -PageUrl $childUrl))
+        })
+
+        $href = ConvertTo-XmlAttributeValue $url
+        $label = ConvertTo-XmlAttributeValue $title
+        $linkClass = if ($children.Count -gt 0) { 'contents-table-link is-parent' } else { 'contents-table-link' }
+
+        [void]$Lines.Add("$indent<li class=""contents-table-item"">")
+        [void]$Lines.Add("$indent`t<div class=""contents-table-el""><a class=""$linkClass"" href=""$href"">$label</a></div>")
+        if ($children.Count -gt 0) {
+            [void]$Lines.Add("$indent`t<ul class=""contents-table-list"">")
+            Add-LearningXmlChildItems -Lines $Lines -Items $children -Depth ($Depth + 2) -BlockedKeys $nextBlockedKeys
+            [void]$Lines.Add("$indent`t</ul>")
+        }
+        [void]$Lines.Add("$indent</li>")
+    }
 }
 
 function ConvertTo-LearningListXml {
@@ -2010,15 +2261,10 @@ function ConvertFrom-LearningXmlLi {
 
     $children = New-Object System.Collections.ArrayList
     foreach ($childLi in @($Li.SelectNodes("./ul[contains(concat(' ', normalize-space(@class), ' '), ' contents-table-list ')]/li"))) {
-        $childAnchor = $childLi.SelectSingleNode("./div[contains(concat(' ', normalize-space(@class), ' '), ' contents-table-el ')]/a")
-        if (-not $childAnchor) {
-            continue
+        $childItem = ConvertFrom-LearningXmlLi -Li $childLi
+        if ($childItem) {
+            [void]$children.Add($childItem)
         }
-
-        [void]$children.Add([pscustomobject]@{
-            title = ConvertTo-SafeText ([string]$childAnchor.InnerText)
-            url = [string]$childAnchor.GetAttribute('href')
-        })
     }
 
     return [pscustomobject]@{
@@ -2210,6 +2456,8 @@ function Merge-LearningScanWithCache {
         [void]$merged.Add($enriched)
         [void]$usedFinalKeys.Add($finalKey)
     }
+
+    Expand-LearningNestedChildren -Items @($merged)
 
     return [pscustomobject]@{
         Items = @($merged)
