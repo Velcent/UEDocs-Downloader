@@ -8,6 +8,7 @@ param(
     [int]$MaxPages = 0,
     [switch]$Overwrite,
     [switch]$DryRun,
+    [switch]$LoadImages,
     [switch]$NoPause,
     [switch]$WorkerMode,
     [int]$WorkerBrowserPort = 0,
@@ -218,7 +219,7 @@ function Invoke-CdpCommand {
         $responseText = Receive-WebSocketText $Socket
         $response = $responseText | ConvertFrom-Json
         if (-not $response.id) {
-            Update-NetworkStateFromEvent -Message $response
+            Handle-CdpEvent -Socket $Socket -Message $response
         }
     } while ($response.id -ne $id)
 
@@ -227,6 +228,25 @@ function Invoke-CdpCommand {
     }
 
     return $response
+}
+
+function Send-CdpCommandNoWait {
+    param(
+        [System.Net.WebSockets.ClientWebSocket]$Socket,
+        [string]$Method,
+        [hashtable]$Params = @{}
+    )
+
+    $script:CdpCommandId++
+    $message = @{
+        id = $script:CdpCommandId
+        method = $Method
+        params = $Params
+    } | ConvertTo-Json -Depth 30 -Compress
+
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes($message)
+    $segment = [ArraySegment[byte]]::new($bytes)
+    [void]$Socket.SendAsync($segment, [System.Net.WebSockets.WebSocketMessageType]::Text, $true, [Threading.CancellationToken]::None).GetAwaiter().GetResult()
 }
 
 function Reset-NetworkState {
@@ -270,6 +290,49 @@ function Update-NetworkStateFromEvent {
     }
 }
 
+function Handle-CdpEvent {
+    param(
+        [System.Net.WebSockets.ClientWebSocket]$Socket,
+        $Message
+    )
+
+    Update-NetworkStateFromEvent -Message $Message
+
+    if ($Message -and $Message.method -eq 'Fetch.requestPaused') {
+        $requestId = [string]$Message.params.requestId
+        if ([string]::IsNullOrWhiteSpace($requestId)) {
+            return
+        }
+
+        $resourceType = [string]$Message.params.resourceType
+        $requestUrl = [string]$Message.params.request.url
+        $shouldBlock = -not $LoadImages -and (
+            $resourceType -eq 'Image' -or
+            $resourceType -eq 'Media' -or
+            $requestUrl -match '(?i)/community/api/(learning|documentation|user_profiles)/image/' -or
+            $requestUrl -match '(?i)[?&]resizing_type='
+        )
+
+        $method = if ($shouldBlock) { 'Fetch.failRequest' } else { 'Fetch.continueRequest' }
+        $params = if ($shouldBlock) {
+            @{
+                requestId = $requestId
+                errorReason = 'BlockedByClient'
+            }
+        }
+        else {
+            @{ requestId = $requestId }
+        }
+
+        try {
+            Send-CdpCommandNoWait -Socket $Socket -Method $method -Params $params
+        }
+        catch {
+            Write-Warning "Fetch handler gagal untuk ${requestUrl}: $($_.Exception.Message)"
+        }
+    }
+}
+
 function Update-NetworkStateFromNavigateResult {
     param($Response)
 
@@ -280,6 +343,74 @@ function Update-NetworkStateFromNavigateResult {
     if (-not [string]::IsNullOrWhiteSpace([string]$Response.result.errorText)) {
         $script:MainDocumentFailedText = [string]$Response.result.errorText
     }
+}
+
+function Get-MhtmlCaptureBlockerExpression {
+    return @'
+(() => {
+  const clearBody = (body) => {
+    if (!body) return;
+    while (body.firstChild) body.removeChild(body.firstChild);
+    body.setAttribute('data-mhtml-body-cleared', 'true');
+  };
+
+  const clearCurrentFrameBody = () => {
+    try {
+      if (window.top !== window) clearBody(document.body);
+    } catch (_) {
+      clearBody(document.body);
+    }
+  };
+
+  const clearIframeBody = (iframe) => {
+    try {
+      const doc = iframe.contentDocument || iframe.contentWindow?.document;
+      if (!doc || !doc.body) return;
+      clearBody(doc.body);
+    } catch (_) {}
+  };
+
+  const cleanImageNode = (el) => {
+    try {
+      el.removeAttribute('src');
+      el.removeAttribute('srcset');
+      el.removeAttribute('imagesrcset');
+      el.removeAttribute('poster');
+      if (el.tagName === 'IMG') {
+        el.setAttribute('alt', el.getAttribute('alt') || '');
+        el.setAttribute('loading', 'lazy');
+      }
+    } catch (_) {}
+  };
+
+  const clean = () => {
+    clearCurrentFrameBody();
+    document.querySelectorAll('img, source, video, audio').forEach(cleanImageNode);
+    document.querySelectorAll('embed, object').forEach((el) => {
+      try { el.remove(); } catch (_) {}
+    });
+    document.querySelectorAll('iframe').forEach((iframe) => {
+      clearIframeBody(iframe);
+      if (iframe.__mhtmlBodyCleanerAttached) return;
+      iframe.__mhtmlBodyCleanerAttached = true;
+      iframe.addEventListener('load', () => clearIframeBody(iframe), true);
+    });
+  };
+
+  clean();
+  document.addEventListener('DOMContentLoaded', clean, true);
+  window.addEventListener('load', clean, true);
+  if (!window.__mhtmlCaptureBlockerObserver) {
+    window.__mhtmlCaptureBlockerObserver = true;
+    new MutationObserver(clean).observe(document.documentElement || document, {
+      childList: true,
+      subtree: true,
+      attributes: true,
+      attributeFilter: ['src', 'srcset', 'imagesrcset', 'poster']
+    });
+  }
+})()
+'@
 }
 
 function Test-IgnorableNavigationFailure {
@@ -1526,6 +1657,25 @@ function New-MhtmlPageSession {
     [void](Invoke-CdpCommand -Socket $socket -Method 'Page.enable')
     [void](Invoke-CdpCommand -Socket $socket -Method 'Runtime.enable')
     [void](Invoke-CdpCommand -Socket $socket -Method 'Network.enable')
+    if (-not $LoadImages) {
+        [void](Invoke-CdpCommand -Socket $socket -Method 'Page.addScriptToEvaluateOnNewDocument' -Params @{
+            source = Get-MhtmlCaptureBlockerExpression
+        })
+        [void](Invoke-CdpCommand -Socket $socket -Method 'Fetch.enable' -Params @{
+            patterns = @(
+                @{
+                    urlPattern = '*'
+                    resourceType = 'Image'
+                    requestStage = 'Request'
+                },
+                @{
+                    urlPattern = '*'
+                    resourceType = 'Media'
+                    requestStage = 'Request'
+                }
+            )
+        })
+    }
     try {
         [void](Invoke-CdpCommand -Socket $socket -Method 'Browser.grantPermissions' -Params @{
             origin = 'https://dev.epicgames.com'
@@ -1643,6 +1793,9 @@ function Save-MhtmlPageInSession {
                 $folder = [System.IO.Path]::GetDirectoryName($filePath)
                 New-Item -ItemType Directory -Force -Path $folder | Out-Null
 
+                if (-not $LoadImages) {
+                    [void](Invoke-PageEval -Socket $Socket -Expression (Get-MhtmlCaptureBlockerExpression))
+                }
                 $snapshot = Invoke-CdpCommand -Socket $Socket -Method 'Page.captureSnapshot' -Params @{ format = 'mhtml' }
                 $snapshotData = [string]$snapshot.result.data
                 $snapshotBytes = [System.Text.Encoding]::UTF8.GetByteCount($snapshotData)
@@ -2070,6 +2223,7 @@ function Start-PageWorkerJob {
             [int]$PageLoadTimeoutSeconds,
             [int]$MaxLoadAttempts,
             [bool]$OverwriteFlag,
+            [bool]$LoadImagesFlag,
             [string]$MhtmlRoot
         )
 
@@ -2083,6 +2237,7 @@ function Start-PageWorkerJob {
             -PageLoadTimeoutSeconds $PageLoadTimeoutSeconds `
             -MaxLoadAttempts $MaxLoadAttempts `
             -Overwrite:$OverwriteFlag `
+            -LoadImages:$LoadImagesFlag `
             -MhtmlRoot $MhtmlRoot
     } -ArgumentList @(
         $scriptPath,
@@ -2094,6 +2249,7 @@ function Start-PageWorkerJob {
         $PageLoadTimeoutSeconds,
         $MaxLoadAttempts,
         $Overwrite.IsPresent,
+        $LoadImages.IsPresent,
         $MhtmlRoot
     )
 }
