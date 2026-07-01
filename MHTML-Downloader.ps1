@@ -27,7 +27,7 @@ $PageLoadTimeoutSeconds = [Math]::Max(1, $PageLoadTimeoutSeconds)
 $MaxLoadAttempts = [Math]::Max(1, $MaxLoadAttempts)
 $ParallelPages = [Math]::Min(30, [Math]::Max(1, $ParallelPages))
 
-$MinimumMhtmlBytes = 680KB
+$MinimumMhtmlBytes = 650KB
 $MhtmlRoot = [System.IO.Path]::GetFullPath($MhtmlRoot)
 $script:BrowserPort = if ($WorkerMode) { $WorkerBrowserPort } else { $null }
 $script:BrowserProfileDir = Join-Path $MhtmlRoot '.edge-profile'
@@ -889,7 +889,18 @@ function Get-MhtmlSnippetPrepareExpression {
     const rect = el.getBoundingClientRect();
     return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
   };
-  const textOf = (el) => el ? (el.value || el.innerText || el.textContent || '') : '';
+  const decodeEntities = (value) => {
+    let text = value || '';
+    const decoder = document.createElement('textarea');
+    for (let index = 0; index < 3; index++) {
+      decoder.innerHTML = text;
+      const decoded = decoder.value;
+      if (decoded === text) break;
+      text = decoded;
+    }
+    return text;
+  };
+  const textOf = (el) => el ? decodeEntities(el.value || el.innerText || el.textContent || '') : '';
   const isBlueprintSource = (text) => /Begin Object[\s\S]*End Object/.test(text || '');
   const snippetType = (snippet) => snippet.querySelector('blueprint-render') ? 'blueprint' : 'code';
   const sourceLooksUseful = (text, type) => {
@@ -899,9 +910,30 @@ function Get-MhtmlSnippetPrepareExpression {
     if (/^(copied|copy|copy full snippet)$/i.test(value)) return false;
     return value.length > 0;
   };
-  const existingVisibleSource = (snippet, type) => {
-    const nodes = Array.from(snippet.querySelectorAll('textarea, pre code, pre, code, [class*="source" i], [class*="code" i]'));
+  const isOwnedBySnippet = (snippet, el) => {
+    const ownerSnippet = el.closest?.('block-code-snippet');
+    return !ownerSnippet || ownerSnippet === snippet;
+  };
+  const sourceRootsFor = (snippet) => {
+    return [snippet, snippet.parentElement].filter(Boolean);
+  };
+  const findEpicTextareaSource = (snippet, type) => {
+    const nodes = sourceRootsFor(snippet)
+      .flatMap(root => Array.from(root.querySelectorAll('textarea:not(.mhtml-full-snippet-source)')))
+      .filter(el => isOwnedBySnippet(snippet, el));
     const texts = nodes.map(textOf).filter(text => sourceLooksUseful(text, type));
+    texts.sort((a, b) => b.length - a.length);
+    return texts[0] || '';
+  };
+  const findDomSource = (snippet, type) => {
+    const nodes = sourceRootsFor(snippet)
+      .flatMap(root => Array.from(root.querySelectorAll('[data-full-source], [data-source], [class*="full-source" i], [class*="raw-source" i]')))
+      .filter(el => isOwnedBySnippet(snippet, el) && !el.closest?.('blueprint-render'));
+    const texts = nodes.map(el => decodeEntities(
+      el.getAttribute('data-full-source') ||
+      el.getAttribute('data-source') ||
+      textOf(el)
+    )).filter(text => sourceLooksUseful(text, type));
     texts.sort((a, b) => b.length - a.length);
     return texts[0] || '';
   };
@@ -929,14 +961,6 @@ function Get-MhtmlSnippetPrepareExpression {
     scored.sort((a, b) => b.score - a.score);
     return scored[0]?.button || null;
   };
-  const readClipboardText = async () => {
-    try {
-      if (!navigator.clipboard?.readText) return '';
-      return await navigator.clipboard.readText();
-    } catch {
-      return '';
-    }
-  };
   const injectTextarea = (snippet, text, type) => {
     let textarea = snippet.querySelector('textarea.mhtml-full-snippet-source');
     if (!textarea) {
@@ -954,55 +978,55 @@ function Get-MhtmlSnippetPrepareExpression {
     textarea.value = text || '';
     textarea.textContent = text || '';
   };
-  const snippets = Array.from(document.querySelectorAll('block-code-snippet'));
-  const results = [];
-  for (let index = 0; index < snippets.length; index++) {
-    const snippet = snippets[index];
+  const waitForSnippetSource = async (snippet, type) => {
+    let bestSource = '';
+    let fromTextarea = false;
+    for (let attempt = 0; attempt < 24; attempt++) {
+      await delay(150);
+      const textareaSource = findEpicTextareaSource(snippet, type);
+      if (sourceLooksUseful(textareaSource, type)) {
+        return { source: textareaSource, fromTextarea: true };
+      }
+
+      const domSource = findDomSource(snippet, type);
+      if (sourceLooksUseful(domSource, type)) {
+        bestSource = domSource;
+        fromTextarea = false;
+      }
+    }
+
+    return { source: bestSource, fromTextarea };
+  };
+  const processSnippet = async (snippet, index) => {
     const type = snippetType(snippet);
-    const beforeClipboard = await readClipboardText();
     const button = findCopyButton(snippet);
     if (button) {
       try {
         button.scrollIntoView({ block: 'center', inline: 'nearest' });
         button.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, view: window }));
+        button.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true, view: window }));
         button.click();
       } catch {}
     }
 
-    let source = '';
-    for (let attempt = 0; attempt < 12; attempt++) {
-      await delay(150);
-      const clipboardText = await readClipboardText();
-      if (sourceLooksUseful(clipboardText, type) && clipboardText !== beforeClipboard) {
-        source = clipboardText;
-        break;
-      }
-      const domText = existingVisibleSource(snippet, type);
-      if (sourceLooksUseful(domText, type)) {
-        source = domText;
-        break;
-      }
-      if (sourceLooksUseful(clipboardText, type)) {
-        source = clipboardText;
-      }
-    }
-
-    if (!source) {
-      source = existingVisibleSource(snippet, type);
-    }
+    const waitResult = await waitForSnippetSource(snippet, type);
+    const source = waitResult.source || '';
     if (sourceLooksUseful(source, type)) {
       injectTextarea(snippet, source, type);
     }
-    results.push({
+    return {
       index,
       type,
       clicked: !!button,
       injected: !!snippet.querySelector('textarea.mhtml-full-snippet-source'),
+      fromTextarea: !!waitResult.fromTextarea,
       sourceLength: (source || '').length,
       hasBeginObject: /Begin Object/.test(source || ''),
       hasEndObject: /End Object/.test(source || '')
-    });
-  }
+    };
+  };
+  const snippets = Array.from(document.querySelectorAll('block-code-snippet'));
+  const results = await Promise.all(snippets.map((snippet, index) => processSnippet(snippet, index)));
   return JSON.stringify({ snippetCount: snippets.length, results });
 })()
 '@
@@ -1730,16 +1754,6 @@ function New-MhtmlPageSession {
             )
         })
     }
-    try {
-        [void](Invoke-CdpCommand -Socket $socket -Method 'Browser.grantPermissions' -Params @{
-            origin = 'https://dev.epicgames.com'
-            permissions = @('clipboardReadWrite', 'clipboardSanitizedWrite')
-        })
-    }
-    catch {
-        Write-Warning "Grant clipboard permission gagal, lanjut dengan fallback DOM: $($_.Exception.Message)"
-    }
-
     return [pscustomobject]@{
         Socket = $socket
         TargetId = [string]$target.id
