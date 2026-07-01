@@ -428,6 +428,9 @@ function Get-MhtmlSnapshotExpression {
   const loadingCount = loadingSelectors
     .flatMap(selector => Array.from(document.querySelectorAll(selector)))
     .filter(isVisible).length;
+  const hotToastErrors = Array.from(document.querySelectorAll('hot-toast-container hot-toast, hot-toast'))
+    .map(toast => normalize(toast.textContent || toast.innerText || ''))
+    .filter(text => /\berror\b/i.test(text));
   const h1 = document.querySelector('h1');
   const htmlLength = document.documentElement?.outerHTML?.length || 0;
 
@@ -437,6 +440,7 @@ function Get-MhtmlSnapshotExpression {
     title: document.title || '',
     h1: normalize(h1?.textContent || ''),
     hasH1: !!h1,
+    hotToastErrors,
     loadingCount,
     isLoading: document.readyState !== 'complete' || loadingCount > 0,
     htmlLength
@@ -920,6 +924,14 @@ function Assert-PageLoadOk {
     $title = [string]$Data.title
     $h1 = [string]$Data.h1
     $htmlLength = if ($Data.PSObject.Properties['htmlLength']) { [int]$Data.htmlLength } else { 0 }
+    $hotToastErrors = @()
+    if ($Data.PSObject.Properties['hotToastErrors']) {
+        $hotToastErrors = @($Data.hotToastErrors | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) })
+    }
+
+    if ($hotToastErrors.Count -gt 0) {
+        throw "Halaman menampilkan hot-toast error: $($hotToastErrors -join ' | ')"
+    }
 
     if ($h1 -eq 'One more step' -and $htmlLength -lt 102400) {
         throw "Halaman terlihat error challenge: h1='$h1', size=$htmlLength bytes"
