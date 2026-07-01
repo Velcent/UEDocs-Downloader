@@ -2,9 +2,9 @@ param(
     [string]$MhtmlRoot = (Join-Path $PSScriptRoot 'mhtml'),
     [int]$BrowserPollSeconds = 1,
     [double]$PageIdleSeconds = 0.1,
-    [int]$PageLoadTimeoutSeconds = 30,
+    [int]$PageLoadTimeoutSeconds = 60,
     [int]$MaxLoadAttempts = 100000,
-    [int]$ParallelPages = 5,
+    [int]$ParallelPages = 6,
     [int]$MaxPages = 0,
     [switch]$Overwrite,
     [switch]$DryRun,
@@ -979,6 +979,64 @@ function Get-MhtmlSnippetPrepareExpression {
     scored.sort((a, b) => b.score - a.score);
     return scored[0] || null;
   };
+  const findExpandButton = (root) => {
+    const actionRoots = Array.from(root.querySelectorAll?.('.block-code-snippet-actions, [class*="snippet-actions" i], [class*="code-snippet" i]') || []);
+    const roots = actionRoots.length ? actionRoots : [root];
+    const candidates = roots.flatMap(item => Array.from(item.querySelectorAll?.('button, [role="button"], a') || []))
+      .filter(visible)
+      .map(button => ({
+        button,
+        label: normalize([
+          button.innerText,
+          button.textContent,
+          button.getAttribute('aria-label'),
+          button.getAttribute('title'),
+          button.getAttribute('data-tooltip'),
+          button.getAttribute('mattooltip')
+        ].filter(Boolean).join(' '))
+      }))
+      .filter(item => /expand|show\s+more|view\s+more/i.test(item.label) && !/copy/i.test(item.label));
+    return candidates[0] || null;
+  };
+  const codeRenderText = (root) => {
+    const nodes = Array.from(root.querySelectorAll?.('pre code, pre') || []);
+    if (root.matches?.('pre, code')) nodes.unshift(root);
+    return nodes
+      .filter(el => !el.closest?.('blueprint-render') && !el.matches?.('textarea'))
+      .map(textOf)
+      .join('\n');
+  };
+  const hasLineNumbersAttribute = (root) => {
+    const nodes = [root].concat(Array.from(root.querySelectorAll?.('pre, code, [linenumbers], [line-numbers], [data-line-numbers]') || []));
+    return nodes.some(node => {
+      if (node.hasAttribute?.('linenumbers') || node.hasAttribute?.('line-numbers') || node.hasAttribute?.('data-line-numbers')) return true;
+      return Array.from(node.attributes || []).some(attr => /line-?numbers?/i.test(attr.name));
+    });
+  };
+  const tryExpandShortCode = async (root, sourceLineCount, expectedLineCount) => {
+    if (expectedLineCount <= 0 || sourceLineCount >= expectedLineCount) {
+      return { attempted: false, ok: false, label: '' };
+    }
+    const expand = findExpandButton(root);
+    if (!expand?.button) {
+      return { attempted: false, ok: false, label: '' };
+    }
+    const before = codeRenderText(root);
+    try {
+      expand.button.scrollIntoView({ block: 'center', inline: 'nearest' });
+      expand.button.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, view: window }));
+      expand.button.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true, view: window }));
+      expand.button.click();
+    } catch {}
+    for (let attempt = 0; attempt < 16; attempt++) {
+      await delay(150);
+      const after = codeRenderText(root);
+      if (after !== before && hasLineNumbersAttribute(root)) {
+        return { attempted: true, ok: true, label: expand.label };
+      }
+    }
+    return { attempted: true, ok: false, label: expand.label };
+  };
   const sourceRootForLooseCopyButton = (button) => {
     let node = button.parentElement;
     for (let depth = 0; node && depth < 8; depth++, node = node.parentElement) {
@@ -1116,7 +1174,9 @@ function Get-MhtmlSnippetPrepareExpression {
     const source = waitResult.source || '';
     const type = expectedType;
     const sourceLineCount = countSourceLines(source);
+    const expandResult = type === 'code' ? await tryExpandShortCode(snippet, sourceLineCount, expectedLineCount) : { attempted: false, ok: false, label: '' };
     const injected = injectSnippetSource(snippet, source, type, { expectedLineCount, buttonLabel });
+    const lineCountOk = sourceLineCountMatches(expectedLineCount, sourceLineCount) || (type === 'code' && expandResult.ok && sourceLooksUseful(source, type));
     return {
       index,
       type,
@@ -1128,7 +1188,10 @@ function Get-MhtmlSnippetPrepareExpression {
       sourceLength: (source || '').length,
       expectedLineCount,
       sourceLineCount,
-      lineCountOk: sourceLineCountMatches(expectedLineCount, sourceLineCount),
+      lineCountOk,
+      expandAttempted: !!expandResult.attempted,
+      expandOk: !!expandResult.ok,
+      expandLabel: expandResult.label || '',
       sourceHead: normalize((source || '').split(/\r?\n/).find(line => line.trim()) || '').slice(0, 160)
     };
   };
@@ -1168,7 +1231,9 @@ function Get-MhtmlSnippetPrepareExpression {
     const waitResult = await waitForSnippetSource(root, type);
     const source = waitResult.source || '';
     const sourceLineCount = countSourceLines(source);
+    const expandResult = type === 'code' ? await tryExpandShortCode(root, sourceLineCount, expectedLineCount) : { attempted: false, ok: false, label: '' };
     const injected = injectSnippetSource(root, source, type, { expectedLineCount, buttonLabel });
+    const lineCountOk = sourceLineCountMatches(expectedLineCount, sourceLineCount) || (type === 'code' && expandResult.ok && sourceLooksUseful(source, type));
     return {
       index: offset + index,
       type,
@@ -1181,7 +1246,10 @@ function Get-MhtmlSnippetPrepareExpression {
       sourceLength: (source || '').length,
       expectedLineCount,
       sourceLineCount,
-      lineCountOk: sourceLineCountMatches(expectedLineCount, sourceLineCount),
+      lineCountOk,
+      expandAttempted: !!expandResult.attempted,
+      expandOk: !!expandResult.ok,
+      expandLabel: expandResult.label || '',
       sourceHead: normalize((source || '').split(/\r?\n/).find(line => line.trim()) || '').slice(0, 160)
     };
   };
