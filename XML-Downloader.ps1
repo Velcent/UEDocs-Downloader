@@ -2,7 +2,7 @@ param(
     [string]$MhtmlRoot = (Join-Path $PSScriptRoot 'mhtml'),
     [int]$BrowserPollSeconds = 1,
     [double]$PageIdleSeconds = 0.1,
-    [int]$PageLoadTimeoutSeconds = 30,
+    [int]$PageLoadTimeoutSeconds = 0,
     [int]$MaxLoadAttempts = 100000,
     [int]$ParallelPages = 6,
     [int]$MaxPages = 0,
@@ -25,7 +25,6 @@ $ProgressPreference = 'SilentlyContinue'
 
 $BrowserPollSeconds = [Math]::Max(1, $BrowserPollSeconds)
 $PageIdleSeconds = [Math]::Max(0, $PageIdleSeconds)
-$PageLoadTimeoutSeconds = [Math]::Max(1, $PageLoadTimeoutSeconds)
 $MaxLoadAttempts = [Math]::Max(1, $MaxLoadAttempts)
 $ParallelPages = [Math]::Min(30, [Math]::Max(1, $ParallelPages))
 $MhtmlRoot = [System.IO.Path]::GetFullPath($MhtmlRoot)
@@ -111,6 +110,13 @@ if ($BuildCustom) {
     $DocumentationTargets = @($DocumentationTargets | Where-Object { [string]$_.Key -eq [string]$selectedTarget.Key })
     $BuildLearn = $LearningTargets.Count -gt 0
     $BuildDoc = $DocumentationTargets.Count -gt 0
+}
+
+if ($PageLoadTimeoutSeconds -le 0) {
+    $PageLoadTimeoutSeconds = if ($BuildDoc) { 3000 } else { 30 }
+}
+else {
+    $PageLoadTimeoutSeconds = [Math]::Max(1, $PageLoadTimeoutSeconds)
 }
 
 if ($WorkerMode) {
