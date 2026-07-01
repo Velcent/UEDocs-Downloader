@@ -2,7 +2,7 @@ param(
     [string]$MhtmlRoot = (Join-Path $PSScriptRoot 'mhtml'),
     [int]$BrowserPollSeconds = 1,
     [double]$PageIdleSeconds = 0.1,
-    [int]$PageLoadTimeoutSeconds = 300,
+    [int]$PageLoadTimeoutSeconds = 30,
     [int]$MaxLoadAttempts = 100000,
     [int]$ParallelPages = 5,
     [int]$MaxPages = 0,
@@ -365,8 +365,19 @@ function Get-MhtmlCaptureBlockerExpression {
   const clearIframeBody = (iframe) => {
     try {
       const doc = iframe.contentDocument || iframe.contentWindow?.document;
-      if (!doc || !doc.body) return;
+      if (!doc || !doc.body) return false;
       clearBody(doc.body);
+      return true;
+    } catch (_) {
+      return false;
+    }
+  };
+
+  const replaceIframeWithEmptyBody = (iframe) => {
+    try {
+      iframe.setAttribute('data-mhtml-original-src', iframe.getAttribute('src') || '');
+      iframe.setAttribute('srcdoc', '<!doctype html><html><head><meta charset="utf-8"></head><body data-mhtml-body-cleared="true"></body></html>');
+      iframe.removeAttribute('src');
     } catch (_) {}
   };
 
@@ -390,10 +401,17 @@ function Get-MhtmlCaptureBlockerExpression {
       try { el.remove(); } catch (_) {}
     });
     document.querySelectorAll('iframe').forEach((iframe) => {
-      clearIframeBody(iframe);
+      if (!clearIframeBody(iframe) && iframe.__mhtmlIframeLoaded) {
+        replaceIframeWithEmptyBody(iframe);
+      }
       if (iframe.__mhtmlBodyCleanerAttached) return;
       iframe.__mhtmlBodyCleanerAttached = true;
-      iframe.addEventListener('load', () => clearIframeBody(iframe), true);
+      iframe.addEventListener('load', () => {
+        iframe.__mhtmlIframeLoaded = true;
+        if (!clearIframeBody(iframe)) {
+          replaceIframeWithEmptyBody(iframe);
+        }
+      }, true);
     });
   };
 
