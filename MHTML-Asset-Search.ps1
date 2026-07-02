@@ -1,10 +1,11 @@
-[CmdletBinding()]
+[CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'Medium')]
 param(
     [Parameter(Mandatory = $true, Position = 0, ValueFromRemainingArguments = $true)]
     [string[]]$Url,
     [string]$MhtmlRoot = '',
     [string]$AssetBinRoot = '',
-    [string]$OutputPath = ''
+    [string]$OutputPath = '',
+    [switch]$DeleteMatched
 )
 
 Set-StrictMode -Version Latest
@@ -103,23 +104,33 @@ function Find-UrlInText {
     $matchedTerms = New-Object System.Collections.Generic.List[string]
     $seen = @{}
 
-    foreach ($line in [System.IO.File]::ReadLines($Path)) {
-        foreach ($term in $Terms) {
-            if ($seen.ContainsKey($term.Value)) {
-                continue
-            }
+    $reader = $null
+    try {
+        $reader = [System.IO.StreamReader]::new($Path)
+        while (-not $reader.EndOfStream) {
+            $line = $reader.ReadLine()
+            foreach ($term in $Terms) {
+                if ($seen.ContainsKey($term.Value)) {
+                    continue
+                }
 
-            foreach ($variant in $term.Variants) {
-                if ($line.IndexOf($variant, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
-                    $seen[$term.Value] = $true
-                    $matchedTerms.Add($term.Value) | Out-Null
-                    break
+                foreach ($variant in $term.Variants) {
+                    if ($line.IndexOf($variant, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
+                        $seen[$term.Value] = $true
+                        $matchedTerms.Add($term.Value) | Out-Null
+                        break
+                    }
                 }
             }
-        }
 
-        if ($matchedTerms.Count -eq $Terms.Count) {
-            break
+            if ($matchedTerms.Count -eq $Terms.Count) {
+                break
+            }
+        }
+    }
+    finally {
+        if ($reader) {
+            $reader.Dispose()
         }
     }
 
@@ -183,6 +194,7 @@ $results = New-Object System.Collections.Generic.List[object]
 $files = @(Get-SearchFiles -MhtmlPaths $mhtmlSearchRoots -BinPath $AssetBinRoot)
 $total = $files.Count
 $index = 0
+$deletedCount = 0
 
 foreach ($item in $files) {
     $index++
@@ -210,6 +222,12 @@ foreach ($item in $files) {
 
         Write-Host ("MATCH: {0} :: {1}" -f ($relativePath -replace '\\', '/'), $matchedUrl)
     }
+
+    if ($DeleteMatched -and $PSCmdlet.ShouldProcess($file.FullName, 'Delete matched file')) {
+        Remove-Item -LiteralPath $file.FullName -Force
+        $deletedCount++
+        Write-Host ("DELETE: {0}" -f ($relativePath -replace '\\', '/'))
+    }
 }
 
 $writer = $null
@@ -235,4 +253,5 @@ Write-Host 'Done.'
 Write-Host "Search  : $($searchTerms.Count)"
 Write-Host "Scanned : $total"
 Write-Host "Matched : $($results.Count)"
+Write-Host "Deleted : $deletedCount"
 Write-Host "Output  : $OutputPath"

@@ -394,14 +394,6 @@ function Get-MhtmlCaptureBlockerExpression {
     }
   };
 
-  const replaceIframeWithEmptyBody = (iframe) => {
-    try {
-      iframe.setAttribute('data-mhtml-original-src', iframe.getAttribute('src') || '');
-      iframe.setAttribute('srcdoc', '<!doctype html><html><head><meta charset="utf-8"></head><body data-mhtml-body-cleared="true"></body></html>');
-      iframe.removeAttribute('src');
-    } catch (_) {}
-  };
-
   const cleanImageNode = (el) => {
     try {
       el.removeAttribute('src');
@@ -422,16 +414,12 @@ function Get-MhtmlCaptureBlockerExpression {
       try { el.remove(); } catch (_) {}
     });
     document.querySelectorAll('iframe').forEach((iframe) => {
-      if (!clearIframeBody(iframe) && iframe.__mhtmlIframeLoaded) {
-        replaceIframeWithEmptyBody(iframe);
-      }
+      clearIframeBody(iframe);
       if (iframe.__mhtmlBodyCleanerAttached) return;
       iframe.__mhtmlBodyCleanerAttached = true;
       iframe.addEventListener('load', () => {
         iframe.__mhtmlIframeLoaded = true;
-        if (!clearIframeBody(iframe)) {
-          replaceIframeWithEmptyBody(iframe);
-        }
+        clearIframeBody(iframe);
       }, true);
     });
   };
