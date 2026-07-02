@@ -1303,7 +1303,7 @@ function Copy-StringHashSet {
         }
     }
 
-    return $copy
+    return ,$copy
 }
 
 function Expand-LearningNestedChildren {
