@@ -38,6 +38,7 @@ $script:MainDocumentFailedText = ''
 $script:MainDocumentRequestId = ''
 $script:StartedEdgeProfileDirs = New-Object System.Collections.ArrayList
 $script:LearningChildMaxDepth = 5
+$script:LearningRawCacheDir = ''
 
 $LearningTargets = @(
     [pscustomobject]@{
@@ -935,6 +936,231 @@ function Get-LearningRecursiveContainerKey {
     }
 }
 
+function Get-LearningUrlMatchKeys {
+    param([string]$PageUrl)
+
+    $keys = [System.Collections.Generic.List[string]]::new()
+    if ([string]::IsNullOrWhiteSpace($PageUrl)) {
+        return @()
+    }
+
+    $clean = ConvertTo-CleanUrl $PageUrl
+    if ([string]::IsNullOrWhiteSpace($clean)) {
+        return @()
+    }
+
+    $key = Get-CanonicalUrlKey -PageUrl $clean
+    if (-not $keys.Contains($key)) {
+        $keys.Add($key)
+    }
+
+    try {
+        $uri = [Uri]$clean
+        $segments = @($uri.AbsolutePath.Trim('/').Split('/') | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+        if ($segments.Count -ge 5 -and $segments[0] -ieq 'community' -and $segments[1] -ieq 'learning' -and $segments[2] -ieq 'courses') {
+            $basePath = '/' + (($segments | Select-Object -First 5) -join '/')
+            $baseUrl = "$($uri.Scheme.ToLowerInvariant())://$($uri.Host.ToLowerInvariant())$basePath"
+            $baseKey = Get-CanonicalUrlKey -PageUrl $baseUrl
+            if (-not $keys.Contains($baseKey)) {
+                $keys.Add($baseKey)
+            }
+        }
+    }
+    catch {
+    }
+
+    return @($keys)
+}
+
+function Get-LearningItemMatchKeys {
+    param([object]$Item)
+
+    $keys = [System.Collections.Generic.List[string]]::new()
+    if (-not $Item) {
+        return @()
+    }
+
+    foreach ($url in @([string]$Item.url, [string]$Item.originalUrl)) {
+        foreach ($key in @(Get-LearningUrlMatchKeys -PageUrl $url)) {
+            if (-not $keys.Contains($key)) {
+                $keys.Add($key)
+            }
+        }
+    }
+
+    return @($keys)
+}
+
+function Get-LearningItemUniqueKeys {
+    param([object]$Item)
+
+    $keys = [System.Collections.Generic.List[string]]::new()
+    if (-not $Item) {
+        return @()
+    }
+
+    foreach ($url in @([string]$Item.url, [string]$Item.originalUrl)) {
+        $clean = ConvertTo-CleanUrl $url
+        if ([string]::IsNullOrWhiteSpace($clean)) {
+            continue
+        }
+
+        $key = Get-CanonicalUrlKey -PageUrl $clean
+        if (-not $keys.Contains($key)) {
+            $keys.Add($key)
+        }
+    }
+
+    return @($keys)
+}
+
+function Test-LearningCourseContainerUrl {
+    param([string]$PageUrl)
+
+    if ([string]::IsNullOrWhiteSpace($PageUrl)) {
+        return $false
+    }
+
+    try {
+        $uri = [Uri](ConvertTo-CleanUrl $PageUrl)
+        $segments = @($uri.AbsolutePath.Trim('/').Split('/') | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+        return ($segments.Count -eq 5 -and
+            $segments[0] -ieq 'community' -and
+            $segments[1] -ieq 'learning' -and
+            $segments[2] -ieq 'courses')
+    }
+    catch {
+        return $false
+    }
+}
+
+function Get-LearningChildren {
+    param([object]$Item)
+
+    if (-not $Item) {
+        return @()
+    }
+
+    $property = $Item.PSObject.Properties['children']
+    if (-not $property -or $null -eq $property.Value) {
+        return @()
+    }
+
+    $value = $property.Value
+    if ($value -is [System.Management.Automation.PSCustomObject] -and @($value.PSObject.Properties).Count -eq 0) {
+        return @()
+    }
+    if ($value -is [System.Collections.IDictionary] -and $value.Count -eq 0) {
+        return @()
+    }
+
+    return @($value | Where-Object {
+        $null -ne $_ -and -not ($_ -is [System.Management.Automation.PSCustomObject] -and @($_.PSObject.Properties).Count -eq 0)
+    })
+}
+
+function Add-LearningChildMatchKeys {
+    param(
+        [object[]]$Items,
+        [System.Collections.Generic.HashSet[string]]$Keys,
+        [System.Collections.Generic.HashSet[string]]$OwnerKeys = $null
+    )
+
+    foreach ($item in @($Items)) {
+        if (-not $item) {
+            continue
+        }
+
+        $itemKeys = @(Get-LearningItemMatchKeys -Item $item)
+        if ($OwnerKeys -and @($itemKeys | Where-Object { $OwnerKeys.Contains($_) }).Count -gt 0) {
+            continue
+        }
+
+        foreach ($key in $itemKeys) {
+            [void]$Keys.Add($key)
+        }
+
+        Add-LearningChildMatchKeys -Items @(Get-LearningChildren -Item $item) -Keys $Keys
+    }
+}
+
+function Get-LearningBestItemByMatch {
+    param(
+        [object]$Item,
+        [hashtable]$ItemsByMatchKey
+    )
+
+    if (-not $Item -or -not $ItemsByMatchKey) {
+        return $Item
+    }
+
+    $bestItem = $Item
+    foreach ($key in @(Get-LearningItemUniqueKeys -Item $Item)) {
+        if ($ItemsByMatchKey.ContainsKey($key)) {
+            $bestItem = $ItemsByMatchKey[$key]
+            break
+        }
+    }
+
+    $rawItem = Read-LearningDetailRawCache -RawCacheDir $script:LearningRawCacheDir -Item $bestItem
+    if (-not $rawItem) {
+        $rawItem = Read-LearningDetailRawCache -RawCacheDir $script:LearningRawCacheDir -Item $Item
+    }
+
+    if ($rawItem -and @(Get-LearningChildren -Item $rawItem).Count -gt @(Get-LearningChildren -Item $bestItem).Count) {
+        return $rawItem
+    }
+
+    $allowContainerMatch = $false
+    foreach ($url in @([string]$Item.url, [string]$Item.originalUrl)) {
+        if (Test-LearningCourseContainerUrl -PageUrl $url) {
+            $allowContainerMatch = $true
+            break
+        }
+    }
+
+    if ($allowContainerMatch) {
+        foreach ($key in @(Get-LearningItemMatchKeys -Item $Item)) {
+            if ($ItemsByMatchKey.ContainsKey($key)) {
+                $candidate = $ItemsByMatchKey[$key]
+                $candidateRaw = Read-LearningDetailRawCache -RawCacheDir $script:LearningRawCacheDir -Item $candidate
+                if ($candidateRaw -and @(Get-LearningChildren -Item $candidateRaw).Count -gt @(Get-LearningChildren -Item $candidate).Count) {
+                    return $candidateRaw
+                }
+                return $candidate
+            }
+        }
+    }
+
+    return $bestItem
+}
+
+function New-LearningXmlNodeItem {
+    param(
+        [object]$Item,
+        [object]$BestItem
+    )
+
+    if (-not $BestItem) {
+        $BestItem = $Item
+    }
+
+    $title = ConvertTo-SafeText ([string]$Item.title)
+    if ([string]::IsNullOrWhiteSpace($title)) {
+        $title = ConvertTo-SafeText ([string]$BestItem.title)
+    }
+
+    return [pscustomobject]@{
+        title = $title
+        url = if ([string]::IsNullOrWhiteSpace([string]$BestItem.url)) { [string]$Item.url } else { [string]$BestItem.url }
+        originalUrl = if ([string]::IsNullOrWhiteSpace([string]$BestItem.originalUrl)) { [string]$Item.originalUrl } else { [string]$BestItem.originalUrl }
+        html = if ([string]::IsNullOrWhiteSpace([string]$BestItem.html)) { [string]$Item.html } else { [string]$BestItem.html }
+        publishedAt = if ([string]::IsNullOrWhiteSpace([string]$BestItem.publishedAt)) { [string]$Item.publishedAt } else { [string]$BestItem.publishedAt }
+        publishedTimestamp = if ([double]$BestItem.publishedTimestamp -le 0) { [double]$Item.publishedTimestamp } else { [double]$BestItem.publishedTimestamp }
+        children = @(Get-LearningChildren -Item $BestItem)
+    }
+}
+
 function Set-LearningObjectProperty {
     param(
         [object]$Object,
@@ -990,6 +1216,190 @@ function ConvertTo-RelativeRootPath {
     }
 
     return $full
+}
+
+function Get-StableHashText {
+    param([string]$Value)
+
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes([string]$Value)
+    $hash = [System.Security.Cryptography.SHA256]::Create().ComputeHash($bytes)
+    return ([System.BitConverter]::ToString($hash) -replace '-', '').ToLowerInvariant()
+}
+
+function Get-LearningRawCacheDir {
+    param($Target)
+
+    $key = [string]$Target.Key
+    if ([string]::IsNullOrWhiteSpace($key)) {
+        $key = 'learning'
+    }
+
+    $dir = Join-Path (Join-Path $MhtmlRoot '.xml-downloader-cache') $key
+    foreach ($child in @('', 'pages', 'details')) {
+        $path = if ([string]::IsNullOrWhiteSpace($child)) { $dir } else { Join-Path $dir $child }
+        New-Item -ItemType Directory -Force -Path $path | Out-Null
+    }
+
+    return $dir
+}
+
+function Write-RawJsonCache {
+    param(
+        [string]$Path,
+        [object]$Data
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Path) -or -not $Data) {
+        return
+    }
+
+    $parent = Split-Path -Parent $Path
+    if (-not [string]::IsNullOrWhiteSpace($parent)) {
+        New-Item -ItemType Directory -Force -Path $parent | Out-Null
+    }
+
+    $tempPath = "$Path.tmp"
+    $Data | ConvertTo-Json -Depth 100 | Set-Content -LiteralPath $tempPath -Encoding UTF8
+    Move-Item -LiteralPath $tempPath -Destination $Path -Force
+}
+
+function Read-RawJsonCache {
+    param([string]$Path)
+
+    if ([string]::IsNullOrWhiteSpace($Path) -or -not (Test-Path -LiteralPath $Path)) {
+        return $null
+    }
+
+    try {
+        return Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json
+    }
+    catch {
+        Write-Warning "Gagal baca raw cache: $(ConvertTo-RelativeRootPath $Path) - $($_.Exception.Message)"
+        return $null
+    }
+}
+
+function Get-LearningPageRawCachePath {
+    param(
+        [string]$RawCacheDir,
+        [int]$Page
+    )
+
+    if ([string]::IsNullOrWhiteSpace($RawCacheDir) -or $Page -le 0) {
+        return ''
+    }
+
+    return Join-Path (Join-Path $RawCacheDir 'pages') ("page-{0:D6}.json" -f $Page)
+}
+
+function Get-LearningRootRawCachePath {
+    param([string]$RawCacheDir)
+
+    if ([string]::IsNullOrWhiteSpace($RawCacheDir)) {
+        return ''
+    }
+
+    return Join-Path $RawCacheDir 'root.json'
+}
+
+function Get-LearningDetailRawCachePath {
+    param(
+        [string]$RawCacheDir,
+        [string]$Url
+    )
+
+    if ([string]::IsNullOrWhiteSpace($RawCacheDir) -or [string]::IsNullOrWhiteSpace($Url)) {
+        return ''
+    }
+
+    $key = Get-CanonicalUrlKey -PageUrl $Url
+    return Join-Path (Join-Path $RawCacheDir 'details') ("{0}.json" -f (Get-StableHashText $key))
+}
+
+function Save-LearningPageRawCache {
+    param(
+        [string]$RawCacheDir,
+        [object]$Result
+    )
+
+    if (-not $Result) {
+        return
+    }
+
+    $path = Get-LearningPageRawCachePath -RawCacheDir $RawCacheDir -Page ([int]$Result.Page)
+    Write-RawJsonCache -Path $path -Data $Result
+}
+
+function Save-LearningRootRawCache {
+    param(
+        [string]$RawCacheDir,
+        [object]$Result
+    )
+
+    $path = Get-LearningRootRawCachePath -RawCacheDir $RawCacheDir
+    Write-RawJsonCache -Path $path -Data $Result
+}
+
+function Read-LearningPageRawCache {
+    param(
+        [string]$RawCacheDir,
+        [int]$Page
+    )
+
+    $path = Get-LearningPageRawCachePath -RawCacheDir $RawCacheDir -Page $Page
+    return Read-RawJsonCache -Path $path
+}
+
+function Read-LearningRootRawCache {
+    param([string]$RawCacheDir)
+
+    $path = Get-LearningRootRawCachePath -RawCacheDir $RawCacheDir
+    return Read-RawJsonCache -Path $path
+}
+
+function Save-LearningDetailRawCache {
+    param(
+        [string]$RawCacheDir,
+        [object]$Item
+    )
+
+    if (-not $Item) {
+        return
+    }
+
+    foreach ($url in @([string]$Item.originalUrl, [string]$Item.url)) {
+        if ([string]::IsNullOrWhiteSpace($url)) {
+            continue
+        }
+
+        $path = Get-LearningDetailRawCachePath -RawCacheDir $RawCacheDir -Url $url
+        Write-RawJsonCache -Path $path -Data $Item
+    }
+}
+
+function Read-LearningDetailRawCache {
+    param(
+        [string]$RawCacheDir,
+        [object]$Item
+    )
+
+    if (-not $Item) {
+        return $null
+    }
+
+    foreach ($url in @([string]$Item.url, [string]$Item.originalUrl)) {
+        if ([string]::IsNullOrWhiteSpace($url)) {
+            continue
+        }
+
+        $path = Get-LearningDetailRawCachePath -RawCacheDir $RawCacheDir -Url $url
+        $cached = Read-RawJsonCache -Path $path
+        if ($cached) {
+            return $cached
+        }
+    }
+
+    return $null
 }
 
 function ConvertTo-XmlAttributeValue {
@@ -1162,7 +1572,7 @@ function Wait-LearningDetailPageReady {
 
         $hasPageData = -not [string]::IsNullOrWhiteSpace([string]$data.h1) -or
             $data.hasContentMeta -or
-            @($data.children).Count -gt 0
+            @(Get-LearningChildren -Item $data).Count -gt 0
 
         if ($data.readyState -eq 'complete' -and $hasPageData) {
             if (-not $stableSince) {
@@ -1208,7 +1618,7 @@ function Get-LearningDetailDataInSession {
                 Title = [string]$data.h1
                 PublishedAt = [string]$data.publishedAt
                 PublishedTimestamp = [double]$data.publishedTimestamp
-                Children = @($data.children)
+                Children = @(Get-LearningChildren -Item $data)
             }
         }
         catch {
@@ -1265,7 +1675,7 @@ function Invoke-SerialLearningDetailScan {
                 $title = $finalUrl
             }
 
-            [void]$enriched.Add([pscustomobject]@{
+            $enrichedItem = [pscustomobject]@{
                 title = $title
                 url = $finalUrl
                 originalUrl = $originalUrl
@@ -1273,7 +1683,9 @@ function Invoke-SerialLearningDetailScan {
                 publishedAt = if ($detail) { [string]$detail.PublishedAt } else { '' }
                 publishedTimestamp = if ($detail) { [double]$detail.PublishedTimestamp } else { 0 }
                 children = if ($detail) { @($detail.Children) } else { @() }
-            })
+            }
+            [void]$enriched.Add($enrichedItem)
+            Save-LearningDetailRawCache -RawCacheDir $script:LearningRawCacheDir -Item $enrichedItem
         }
     }
     finally {
@@ -1286,11 +1698,33 @@ function Invoke-SerialLearningDetailScan {
 function Invoke-LearningDetailScan {
     param([object[]]$Items)
 
-    if ($ParallelPages -le 1 -or @($Items).Count -le 1) {
-        return @(Invoke-SerialLearningDetailScan -Items $Items)
+    $cachedItems = New-Object System.Collections.ArrayList
+    $pendingItems = New-Object System.Collections.ArrayList
+    foreach ($item in @($Items)) {
+        $cached = Read-LearningDetailRawCache -RawCacheDir $script:LearningRawCacheDir -Item $item
+        if ($cached) {
+            [void]$cachedItems.Add($cached)
+        }
+        else {
+            [void]$pendingItems.Add($item)
+        }
     }
 
-    return @(Invoke-ParallelLearningDetailReads -Items $Items)
+    if ($cachedItems.Count -gt 0) {
+        Write-Host "Raw cache detail: $($cachedItems.Count) link"
+    }
+
+    $scannedItems = @()
+    if ($pendingItems.Count -gt 0) {
+        if ($ParallelPages -le 1 -or @($pendingItems).Count -le 1) {
+            $scannedItems = @(Invoke-SerialLearningDetailScan -Items @($pendingItems))
+        }
+        else {
+            $scannedItems = @(Invoke-ParallelLearningDetailReads -Items @($pendingItems))
+        }
+    }
+
+    return @(@($cachedItems) + @($scannedItems) | Sort-Object @{ Expression = { [double]$_.publishedTimestamp }; Descending = $true }, @{ Expression = { [string]$_.title }; Ascending = $true })
 }
 
 function Copy-StringHashSet {
@@ -1342,7 +1776,7 @@ function Expand-LearningNestedChildren {
         foreach ($entry in @($current)) {
             $node = $entry.Node
             $ancestorKeys = $entry.AncestorKeys
-            foreach ($child in @($node.children)) {
+            foreach ($child in @(Get-LearningChildren -Item $node)) {
                 if (-not $child) {
                     continue
                 }
@@ -1360,7 +1794,7 @@ function Expand-LearningNestedChildren {
                 $childAncestorKeys = Copy-StringHashSet -Source $ancestorKeys
                 [void]$childAncestorKeys.Add($childKey)
 
-                if (@($child.children).Count -gt 0) {
+                if (@(Get-LearningChildren -Item $child).Count -gt 0) {
                     [void]$next.Add([pscustomobject]@{
                         Node = $child
                         AncestorKeys = $childAncestorKeys
@@ -1417,7 +1851,7 @@ function Expand-LearningNestedChildren {
 
             $filteredChildren = New-Object System.Collections.ArrayList
             $seenChildKeys = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
-            foreach ($detailChild in @($detail.children)) {
+            foreach ($detailChild in @(Get-LearningChildren -Item $detail)) {
                 $detailChildUrl = [string]$detailChild.url
                 if ([string]::IsNullOrWhiteSpace($detailChildUrl)) {
                     continue
@@ -2028,12 +2462,20 @@ function ConvertTo-LearningXml {
     [void]$lines.Add(('<div class="contents-table-el is-active is-root-entry"><a class="contents-table-link is-parent" href="{0}">{1}</a></div>' -f (ConvertTo-XmlAttributeValue $Target.RootUrl), (ConvertTo-XmlAttributeValue $Target.Title)))
     [void]$lines.Add('<ul class="contents-table-list">')
 
-    $parentUrlKeys = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    $itemsByMatchKey = @{}
+    $nestedChildKeys = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
     foreach ($item in @($Items)) {
-        $url = [string]$item.url
-        if (-not [string]::IsNullOrWhiteSpace($url)) {
-            [void]$parentUrlKeys.Add((Get-CanonicalUrlKey -PageUrl $url))
+        foreach ($key in @(Get-LearningItemMatchKeys -Item $item)) {
+            if (-not $itemsByMatchKey.ContainsKey($key)) {
+                $itemsByMatchKey[$key] = $item
+            }
         }
+
+        $ownerKeys = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+        foreach ($key in @(Get-LearningItemMatchKeys -Item $item)) {
+            [void]$ownerKeys.Add($key)
+        }
+        Add-LearningChildMatchKeys -Items @(Get-LearningChildren -Item $item) -Keys $nestedChildKeys -OwnerKeys $ownerKeys
     }
 
     $parentTitleCounts = @{}
@@ -2043,11 +2485,16 @@ function ConvertTo-LearningXml {
             continue
         }
 
-        $parentKey = Get-CanonicalUrlKey -PageUrl ([string]$item.url)
-        if ($writtenAllKeys.Contains($parentKey)) {
+        $itemMatchKeys = @(Get-LearningItemMatchKeys -Item $item)
+        if (@($itemMatchKeys | Where-Object { $writtenAllKeys.Contains($_) }).Count -gt 0) {
             continue
         }
-        [void]$writtenAllKeys.Add($parentKey)
+        if (@($itemMatchKeys | Where-Object { $nestedChildKeys.Contains($_) }).Count -gt 0) {
+            continue
+        }
+        foreach ($key in $itemMatchKeys) {
+            [void]$writtenAllKeys.Add($key)
+        }
 
         $title = ConvertTo-SafeText ([string]$item.title)
         if ([string]::IsNullOrWhiteSpace($title)) {
@@ -2067,13 +2514,13 @@ function ConvertTo-LearningXml {
         $label = ConvertTo-XmlAttributeValue $title
         $publishedAt = ConvertTo-XmlAttributeValue ([string]$item.publishedAt)
         $publishedTimestamp = ConvertTo-XmlAttributeValue ([string]$item.publishedTimestamp)
-        $children = @(Get-LearningXmlWritableChildren -Items @($item.children) -WrittenKeys $writtenAllKeys)
+        $children = @(Get-LearningXmlWritableChildren -Items @(Get-LearningChildren -Item $item) -WrittenKeys $writtenAllKeys -ItemsByMatchKey $itemsByMatchKey)
         $linkClass = if ($children.Count -gt 0) { 'contents-table-link is-parent' } else { 'contents-table-link' }
         [void]$lines.Add("`t<li class=""contents-table-item"">")
         [void]$lines.Add("`t`t<div class=""contents-table-el"" data-published-at=""$publishedAt"" data-published-timestamp=""$publishedTimestamp""><a class=""$linkClass"" href=""$href"">$label</a></div>")
         if ($children.Count -gt 0) {
             [void]$lines.Add("`t`t<ul class=""contents-table-list"">")
-            Add-LearningXmlChildItems -Lines $lines -Items $children -Depth 3 -WrittenKeys $writtenAllKeys
+            Add-LearningXmlChildItems -Lines $lines -Items $children -Depth 3 -WrittenKeys $writtenAllKeys -ItemsByMatchKey $itemsByMatchKey
             [void]$lines.Add("`t`t</ul>")
         }
         [void]$lines.Add("`t</li>")
@@ -2086,26 +2533,32 @@ function ConvertTo-LearningXml {
 function Get-LearningXmlWritableChildren {
     param(
         [object[]]$Items,
-        [System.Collections.Generic.HashSet[string]]$WrittenKeys
+        [System.Collections.Generic.HashSet[string]]$WrittenKeys,
+        [hashtable]$ItemsByMatchKey
     )
 
     $children = New-Object System.Collections.ArrayList
+    $selectedKeys = Copy-StringHashSet -Source $WrittenKeys
     foreach ($item in @($Items)) {
         if (-not $item) {
             continue
         }
 
-        $url = ConvertTo-CleanUrl ([string]$item.url)
+        $bestItem = Get-LearningBestItemByMatch -Item $item -ItemsByMatchKey $ItemsByMatchKey
+        $nodeItem = New-LearningXmlNodeItem -Item $item -BestItem $bestItem
+        $url = ConvertTo-CleanUrl ([string]$nodeItem.url)
         if ([string]::IsNullOrWhiteSpace($url)) {
             continue
         }
 
-        $key = Get-CanonicalUrlKey -PageUrl $url
-        if ($WrittenKeys.Contains($key)) {
+        $uniqueKeys = @(Get-LearningItemUniqueKeys -Item $nodeItem)
+        if (@($uniqueKeys | Where-Object { $selectedKeys.Contains($_) }).Count -gt 0) {
             continue
         }
-        [void]$WrittenKeys.Add($key)
-        [void]$children.Add($item)
+        foreach ($key in $uniqueKeys) {
+            [void]$selectedKeys.Add($key)
+        }
+        [void]$children.Add($nodeItem)
     }
 
     return @($children)
@@ -2116,7 +2569,8 @@ function Add-LearningXmlChildItems {
         [System.Collections.ArrayList]$Lines,
         [object[]]$Items,
         [int]$Depth,
-        [System.Collections.Generic.HashSet[string]]$WrittenKeys
+        [System.Collections.Generic.HashSet[string]]$WrittenKeys,
+        [hashtable]$ItemsByMatchKey
     )
 
     $indent = "`t" * $Depth
@@ -2125,22 +2579,27 @@ function Add-LearningXmlChildItems {
             continue
         }
 
-        $url = ConvertTo-CleanUrl ([string]$item.url)
+        $bestItem = Get-LearningBestItemByMatch -Item $item -ItemsByMatchKey $ItemsByMatchKey
+        $nodeItem = New-LearningXmlNodeItem -Item $item -BestItem $bestItem
+        $url = ConvertTo-CleanUrl ([string]$nodeItem.url)
         if ([string]::IsNullOrWhiteSpace($url)) {
             continue
         }
 
-        $key = Get-CanonicalUrlKey -PageUrl $url
-        if ($WrittenKeys.Contains($key)) {
+        $uniqueKeys = @(Get-LearningItemUniqueKeys -Item $nodeItem)
+        if (@($uniqueKeys | Where-Object { $WrittenKeys.Contains($_) }).Count -gt 0) {
             continue
         }
+        foreach ($key in $uniqueKeys) {
+            [void]$WrittenKeys.Add($key)
+        }
 
-        $title = ConvertTo-SafeText ([string]$item.title)
+        $title = ConvertTo-SafeText ([string]$nodeItem.title)
         if ([string]::IsNullOrWhiteSpace($title)) {
             $title = $url
         }
 
-        $children = @(Get-LearningXmlWritableChildren -Items @($item.children) -WrittenKeys $WrittenKeys)
+        $children = @(Get-LearningXmlWritableChildren -Items @(Get-LearningChildren -Item $nodeItem) -WrittenKeys $WrittenKeys -ItemsByMatchKey $ItemsByMatchKey)
 
         $href = ConvertTo-XmlAttributeValue $url
         $label = ConvertTo-XmlAttributeValue $title
@@ -2150,7 +2609,7 @@ function Add-LearningXmlChildItems {
         [void]$Lines.Add("$indent`t<div class=""contents-table-el""><a class=""$linkClass"" href=""$href"">$label</a></div>")
         if ($children.Count -gt 0) {
             [void]$Lines.Add("$indent`t<ul class=""contents-table-list"">")
-            Add-LearningXmlChildItems -Lines $Lines -Items $children -Depth ($Depth + 2) -WrittenKeys $WrittenKeys
+            Add-LearningXmlChildItems -Lines $Lines -Items $children -Depth ($Depth + 2) -WrittenKeys $WrittenKeys -ItemsByMatchKey $ItemsByMatchKey
             [void]$Lines.Add("$indent`t</ul>")
         }
         [void]$Lines.Add("$indent</li>")
@@ -2415,6 +2874,27 @@ function Merge-LearningScanWithCache {
         }
 
         if ($cached) {
+            $rawCached = Read-LearningDetailRawCache -RawCacheDir $script:LearningRawCacheDir -Item $item
+            if ($rawCached -and (
+                @(Get-LearningChildren -Item $rawCached).Count -gt @(Get-LearningChildren -Item $cached).Count -or
+                ((-not (Test-LearningItemHasTimestamp -Item $cached)) -and (Test-LearningItemHasTimestamp -Item $rawCached))
+            )) {
+                if ([string]::IsNullOrWhiteSpace([string]$rawCached.html)) {
+                    Set-LearningObjectProperty -Object $rawCached -Name 'html' -Value ([string]$item.html)
+                }
+                if ([string]::IsNullOrWhiteSpace([string]$rawCached.originalUrl)) {
+                    Set-LearningObjectProperty -Object $rawCached -Name 'originalUrl' -Value ([string]$item.url)
+                }
+                if (-not [string]::IsNullOrWhiteSpace([string]$rawCached.originalUrl)) {
+                    $newByOriginal[(Get-CanonicalUrlKey -PageUrl ([string]$rawCached.originalUrl))] = $rawCached
+                }
+                if (-not [string]::IsNullOrWhiteSpace([string]$rawCached.url)) {
+                    $newByOriginal[(Get-CanonicalUrlKey -PageUrl ([string]$rawCached.url))] = $rawCached
+                }
+                $newByOriginal[$key] = $rawCached
+                continue
+            }
+
             if (-not (Test-LearningItemHasTimestamp -Item $cached) -and -not $queuedTimestampKeys.Contains($key)) {
                 [void]$timestampItems.Add([pscustomobject]@{
                     title = if ([string]::IsNullOrWhiteSpace([string]$item.title)) { [string]$cached.title } else { [string]$item.title }
@@ -2577,12 +3057,29 @@ function ConvertTo-DocumentationXml {
 }
 
 function Invoke-ParallelPageReads {
-    param([object[]]$Tasks)
+    param(
+        [object[]]$Tasks,
+        [string]$RawCacheDir = $script:LearningRawCacheDir
+    )
 
     $results = New-Object System.Collections.ArrayList
     $queue = New-Object System.Collections.ArrayList
     foreach ($task in @($Tasks)) {
-        [void]$queue.Add($task)
+        $cached = Read-LearningPageRawCache -RawCacheDir $RawCacheDir -Page ([int]$task.Page)
+        if ($cached) {
+            [void]$results.Add($cached)
+        }
+        else {
+            [void]$queue.Add($task)
+        }
+    }
+
+    if ($results.Count -gt 0) {
+        Write-Host "Raw cache page: $($results.Count)/$(@($Tasks).Count)"
+    }
+
+    if ($queue.Count -eq 0) {
+        return @($results)
     }
 
     if ($ParallelPages -le 1) {
@@ -2592,6 +3089,7 @@ function Invoke-ParallelPageReads {
             $result = Get-LearningPageData -PageUrl ([string]$task.Url)
             $result | Add-Member -NotePropertyName Page -NotePropertyValue ([int]$task.Page) -Force
             $result | Add-Member -NotePropertyName TargetKey -NotePropertyValue ([string]$task.TargetKey) -Force
+            Save-LearningPageRawCache -RawCacheDir $RawCacheDir -Result $result
             [void]$results.Add($result)
         }
         return @($results)
@@ -2629,6 +3127,7 @@ function Invoke-ParallelPageReads {
                 if ($result) {
                     if ($result.Success) {
                         [void]$results.Add($result)
+                        Save-LearningPageRawCache -RawCacheDir $RawCacheDir -Result $result
                         Write-Host "Selesai page $($result.Page): $($result.PageUrl) ($(@($result.Items).Count) link)"
                     }
                     else {
@@ -2727,6 +3226,7 @@ function Invoke-ParallelLearningDetailReads {
                 if ($result) {
                     if ($result.Success) {
                         [void]$results.Add($result)
+                        Save-LearningDetailRawCache -RawCacheDir $script:LearningRawCacheDir -Item $result
                         Write-Host "Selesai detail $($result.ItemIndex): $($result.originalUrl) -> $($result.url)"
                     }
                     else {
@@ -2787,7 +3287,7 @@ function Invoke-ParallelLearningDetailReads {
             html = [string]$result.html
             publishedAt = [string]$result.publishedAt
             publishedTimestamp = [double]$result.publishedTimestamp
-            children = @($result.children)
+            children = @(Get-LearningChildren -Item $result)
         })
     }
 
@@ -2842,6 +3342,11 @@ function Add-LearningUniqueItems {
 function Invoke-LearningTargetScan {
     param($Target)
 
+    if (-not $Target.PSObject.Properties['RawCacheDir']) {
+        $Target | Add-Member -NotePropertyName RawCacheDir -NotePropertyValue (Get-LearningRawCacheDir -Target $Target) -Force
+    }
+    $script:LearningRawCacheDir = [string]$Target.RawCacheDir
+
     $itemsByKey = [System.Collections.Specialized.OrderedDictionary]::new([System.StringComparer]::OrdinalIgnoreCase)
     $totalPages = [Math]::Max(1, [int]$Target.TotalPages)
     $totalResults = [Math]::Max(0, [int]$Target.TotalResults)
@@ -2857,7 +3362,7 @@ function Invoke-LearningTargetScan {
         Write-Host ""
         Write-Host "Scan $($Target.Key) pass #${pass}: $scanPages page, target total $totalResults link"
         $tasks = @(New-LearningPageTasks -Target $Target -TotalPages $scanPages)
-        $pageResults = @(Invoke-ParallelPageReads -Tasks $tasks)
+        $pageResults = @(Invoke-ParallelPageReads -Tasks $tasks -RawCacheDir ([string]$Target.RawCacheDir))
 
         foreach ($result in @($pageResults)) {
             if ([int]$result.TotalPages -gt $totalPages -and $MaxPages -le 0) {
@@ -2895,6 +3400,10 @@ function Invoke-LearningTargetScan {
 if ($BuildLearn) {
     foreach ($target in $LearningTargets) {
         Write-Host ""
+        $rawCacheDir = Get-LearningRawCacheDir -Target $target
+        $target | Add-Member -NotePropertyName RawCacheDir -NotePropertyValue $rawCacheDir -Force
+        $script:LearningRawCacheDir = $rawCacheDir
+        Write-Host "Raw cache $($target.Key): $(ConvertTo-RelativeRootPath $rawCacheDir)"
         $cache = Get-LearningCache -Target $target
         $missingTimestampCount = @($cache.Items | Where-Object { -not (Test-LearningItemHasTimestamp -Item $_) }).Count
         $target | Add-Member -NotePropertyName Cache -NotePropertyValue $cache -Force
@@ -2904,7 +3413,18 @@ if ($BuildLearn) {
 
         $learningRootUrl = ConvertTo-LearningRootUrl -RootUrl $target.RootUrl
         Write-Host "Baca root: $learningRootUrl"
-        $rootData = Get-LearningPageData -PageUrl $learningRootUrl
+        $rootData = $null
+        try {
+            $rootData = Get-LearningPageData -PageUrl $learningRootUrl
+            Save-LearningRootRawCache -RawCacheDir $rawCacheDir -Result $rootData
+        }
+        catch {
+            $rootData = Read-LearningRootRawCache -RawCacheDir $rawCacheDir
+            if (-not $rootData) {
+                throw
+            }
+            Write-Warning "Gagal baca root dari browser, pakai raw cache: $learningRootUrl - $($_.Exception.Message)"
+        }
         $totalPages = [Math]::Max(1, [int]$rootData.TotalPages)
         if ($MaxPages -gt 0) {
             $totalPages = [Math]::Min($totalPages, $MaxPages)
@@ -2938,6 +3458,10 @@ if ($DryRun) {
 
 if ($BuildLearn) {
     foreach ($target in $LearningTargets) {
+        if (-not $target.PSObject.Properties['RawCacheDir']) {
+            $target | Add-Member -NotePropertyName RawCacheDir -NotePropertyValue (Get-LearningRawCacheDir -Target $target) -Force
+        }
+        $script:LearningRawCacheDir = [string]$target.RawCacheDir
         $cache = $target.Cache
         if (-not $cache) {
             $cache = Get-LearningCache -Target $target

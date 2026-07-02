@@ -164,6 +164,7 @@ function Get-LearningXmlWritableChildren {
     )
 
     $children = New-Object System.Collections.ArrayList
+    $selectedKeys = Copy-StringHashSet -Source $WrittenKeys
     foreach ($item in @($Items)) {
         if (-not $item) {
             continue
@@ -175,11 +176,11 @@ function Get-LearningXmlWritableChildren {
         }
 
         $key = Get-CanonicalUrlKey -PageUrl $href
-        if ($WrittenKeys.Contains($key)) {
+        if ($selectedKeys.Contains($key)) {
             $RemovedChildren.Value++
             continue
         }
-        [void]$WrittenKeys.Add($key)
+        [void]$selectedKeys.Add($key)
         [void]$children.Add($item)
     }
 
@@ -211,6 +212,7 @@ function Add-LearningXmlChildItems {
             $RemovedChildren.Value++
             continue
         }
+        [void]$WrittenKeys.Add($key)
 
         $children = @(Get-LearningXmlWritableChildren -Items @($item.Children) -WrittenKeys $WrittenKeys -RemovedChildren $RemovedChildren)
 
