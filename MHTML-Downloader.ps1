@@ -372,31 +372,6 @@ function Update-NetworkStateFromNavigateResult {
 function Get-MhtmlCaptureBlockerExpression {
     return @'
 (() => {
-  const clearBody = (body) => {
-    if (!body) return;
-    while (body.firstChild) body.removeChild(body.firstChild);
-    body.setAttribute('data-mhtml-body-cleared', 'true');
-  };
-
-  const clearCurrentFrameBody = () => {
-    try {
-      if (window.top !== window) clearBody(document.body);
-    } catch (_) {
-      clearBody(document.body);
-    }
-  };
-
-  const clearIframeBody = (iframe) => {
-    try {
-      const doc = iframe.contentDocument || iframe.contentWindow?.document;
-      if (!doc || !doc.body) return false;
-      clearBody(doc.body);
-      return true;
-    } catch (_) {
-      return false;
-    }
-  };
-
   const cleanImageNode = (el) => {
     try {
       el.removeAttribute('src');
@@ -411,19 +386,9 @@ function Get-MhtmlCaptureBlockerExpression {
   };
 
   const clean = () => {
-    clearCurrentFrameBody();
     document.querySelectorAll('img, source, video, audio').forEach(cleanImageNode);
     document.querySelectorAll('embed, object').forEach((el) => {
       try { el.remove(); } catch (_) {}
-    });
-    document.querySelectorAll('iframe').forEach((iframe) => {
-      clearIframeBody(iframe);
-      if (iframe.__mhtmlBodyCleanerAttached) return;
-      iframe.__mhtmlBodyCleanerAttached = true;
-      iframe.addEventListener('load', () => {
-        iframe.__mhtmlIframeLoaded = true;
-        clearIframeBody(iframe);
-      }, true);
     });
   };
 
