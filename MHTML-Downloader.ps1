@@ -38,6 +38,7 @@ $script:MainDocumentFailedText = ''
 $script:MainDocumentRequestId = ''
 $script:MainDocumentFrameId = ''
 $script:KnownUrlMapCache = @{}
+$script:XmlSourceFilesForLinkIndex = @()
 $script:UnrealApplicationVersionFallbacks = @('5.7', '5.6', '5.5', '5.4', '5.3')
 $script:MetaHumanApplicationVersionFallbacks = @('5.7', '5.6', '5.0-5.5')
 
@@ -1510,6 +1511,43 @@ function Resolve-PageUrl {
     }
 }
 
+function Test-ExcludedXmlLinkUrl {
+    param([string]$PageUrl)
+
+    if ([string]::IsNullOrWhiteSpace($PageUrl)) {
+        return $false
+    }
+
+    try {
+        $uri = [Uri]$PageUrl
+        $host = $uri.Host.ToLowerInvariant()
+        $path = $uri.AbsolutePath.TrimEnd('/').ToLowerInvariant()
+        return (
+            (($host -eq 'www.unrealengine.com' -or $host -eq 'unrealengine.com') -and ($path -eq '/marketplace' -or $path.StartsWith('/marketplace/'))) -or
+            ($host -eq 'www.fab.com' -or $host -eq 'fab.com')
+        )
+    }
+    catch {
+        return $false
+    }
+}
+
+function Test-PdfUrl {
+    param([string]$PageUrl)
+
+    if ([string]::IsNullOrWhiteSpace($PageUrl)) {
+        return $false
+    }
+
+    try {
+        $uri = [Uri]$PageUrl
+        return $uri.AbsolutePath -match '(?i)\.pdf$'
+    }
+    catch {
+        return ([string]$PageUrl) -match '(?i)\.pdf(?:[?#].*)?$'
+    }
+}
+
 function Get-CanonicalUrlKey {
     param([string]$PageUrl)
 
@@ -1737,8 +1775,14 @@ function Get-LinkIndexTasks {
         if ([string]::IsNullOrWhiteSpace([string]$row.url) -or [string]::IsNullOrWhiteSpace([string]$row.file)) {
             continue
         }
+        if (Test-ExcludedXmlLinkUrl -PageUrl ([string]$row.url)) {
+            continue
+        }
 
         $filePath = ConvertTo-LocalPathFromListValue ([string]$row.file)
+        if (Test-PdfUrl -PageUrl ([string]$row.url)) {
+            $filePath = [System.IO.Path]::ChangeExtension($filePath, '.pdf')
+        }
         $saveFolder = ConvertTo-LocalPathFromListValue ([string]$row.save_folder)
         if ([string]::IsNullOrWhiteSpace($saveFolder)) {
             $saveFolder = [System.IO.Path]::GetDirectoryName($filePath)
@@ -1806,6 +1850,9 @@ function Add-NavDivTask {
     if ([string]::IsNullOrWhiteSpace($url)) {
         return $false
     }
+    if (Test-ExcludedXmlLinkUrl -PageUrl $url) {
+        return $false
+    }
 
     $title = Get-NormalizedText ([string]$anchor.InnerText)
     if ([string]::IsNullOrWhiteSpace($title)) {
@@ -1814,7 +1861,8 @@ function Add-NavDivTask {
 
     $segment = Get-IndexedSegment -Index $Index -Title $title -SourceXml $SourceXml
     $nodeFolder = [System.IO.Path]::GetFullPath((Join-Path $ParentFolder $segment))
-    $filePath = Join-Path $ParentFolder "$segment.mhtml"
+    $fileExtension = if (Test-PdfUrl -PageUrl $url) { '.pdf' } else { '.mhtml' }
+    $filePath = Join-Path $ParentFolder "$segment$fileExtension"
 
     $task = [pscustomobject]@{
         Url = $url
@@ -1882,6 +1930,11 @@ function Get-XmlDownloadTasks {
     Write-Host "XML langsung di folder mhtml: $($xmlFiles.Count) file"
 
     foreach ($xmlFile in $xmlFiles) {
+        $xmlFullName = [System.IO.Path]::GetFullPath($xmlFile.FullName)
+        if ($script:XmlSourceFilesForLinkIndex -notcontains $xmlFullName) {
+            $script:XmlSourceFilesForLinkIndex += @($xmlFullName)
+        }
+
         $linkPath = Get-IndexPathForXml -SourceXml $xmlFile.FullName -Kind 'link'
         $existingTasks = @(Get-LinkIndexTasks -LinkPath $linkPath -SourceXml $xmlFile.FullName)
         if ($existingTasks.Count -gt 0) {
@@ -1920,17 +1973,29 @@ function Write-LinkIndex {
     param($Tasks)
 
     $writtenPaths = New-Object System.Collections.ArrayList
-    $groups = @($Tasks | Group-Object -Property SourceXml)
-    foreach ($group in $groups) {
-        $linkPath = Get-IndexPathForXml -SourceXml $group.Name -Kind 'link'
-        if ((Test-Path -LiteralPath $linkPath) -and (Get-Item -LiteralPath $linkPath).Length -gt 0) {
-            [void]$writtenPaths.Add($linkPath)
+    $sourceXmls = New-Object System.Collections.ArrayList
+    foreach ($sourceXml in @($Tasks | Select-Object -ExpandProperty SourceXml -Unique) + @($script:XmlSourceFilesForLinkIndex)) {
+        if ([string]::IsNullOrWhiteSpace([string]$sourceXml)) {
             continue
         }
+        $fullSourceXml = [System.IO.Path]::GetFullPath([string]$sourceXml)
+        if ($sourceXmls -notcontains $fullSourceXml) {
+            [void]$sourceXmls.Add($fullSourceXml)
+        }
+    }
+
+    foreach ($sourceXml in @($sourceXmls)) {
+        $linkPath = Get-IndexPathForXml -SourceXml $sourceXml -Kind 'link'
+        $groupTasks = @($Tasks | Where-Object {
+            [System.IO.Path]::GetFullPath([string]$_.SourceXml) -ieq [string]$sourceXml
+        })
 
         $rows = New-Object System.Collections.ArrayList
         [void]$rows.Add("url`tsave_folder`tfile`ttitle`tchild_count`tparent_url`tsource_xml")
-        foreach ($task in @($group.Group)) {
+        foreach ($task in @($groupTasks)) {
+            if (Test-ExcludedXmlLinkUrl -PageUrl ([string]$task.Url)) {
+                continue
+            }
             [void]$rows.Add((
                 "$(ConvertTo-TsvValue $task.Url)`t" +
                 "$(ConvertTo-TsvValue (ConvertTo-RelativeRootPath $task.SaveFolder))`t" +
@@ -2000,6 +2065,79 @@ function Close-MhtmlPageSession {
     Close-DevToolsPage -TargetId ([string]$Session.TargetId)
 }
 
+function Save-PdfFromBrowserSession {
+    param(
+        [System.Net.WebSockets.ClientWebSocket]$Socket,
+        $Task
+    )
+
+    $pageUrl = [string]$Task.Url
+    $filePath = [System.IO.Path]::GetFullPath([string]$Task.FilePath)
+    $filePath = [System.IO.Path]::ChangeExtension($filePath, '.pdf')
+
+    $folder = [System.IO.Path]::GetDirectoryName($filePath)
+    New-Item -ItemType Directory -Force -Path $folder | Out-Null
+
+    Write-Host ""
+    Write-Host "Buka Edge PDF: $pageUrl"
+
+    Reset-NetworkState
+    $navigateResponse = Invoke-CdpCommand -Socket $Socket -Method 'Page.navigate' -Params @{ url = $pageUrl }
+    Update-NetworkStateFromNavigateResult -Response $navigateResponse
+
+    $deadline = (Get-Date).AddSeconds($PageLoadTimeoutSeconds)
+    $lastError = ''
+    while ((Get-Date) -lt $deadline) {
+        if (-not [string]::IsNullOrWhiteSpace($script:MainDocumentRequestId)) {
+            try {
+                $bodyResponse = Invoke-CdpCommand -Socket $Socket -Method 'Network.getResponseBody' -Params @{
+                    requestId = $script:MainDocumentRequestId
+                }
+
+                $body = [string]$bodyResponse.result.body
+                $bytes = if ([bool]$bodyResponse.result.base64Encoded) {
+                    [Convert]::FromBase64String($body)
+                }
+                else {
+                    [System.Text.Encoding]::UTF8.GetBytes($body)
+                }
+
+                if (-not $bytes -or $bytes.Length -le 0) {
+                    throw 'Body PDF kosong.'
+                }
+
+                $tempPath = "$filePath.download"
+                [System.IO.File]::WriteAllBytes($tempPath, $bytes)
+                Move-Item -LiteralPath $tempPath -Destination $filePath -Force
+
+                Write-Host "Simpan PDF: $(ConvertTo-RelativeRootPath $filePath) ($($bytes.Length) bytes)"
+                return (New-MhtmlSaveResult `
+                    -OriginalUrl $pageUrl `
+                    -FinalUrl $pageUrl `
+                    -Title ([string]$Task.Title) `
+                    -FilePath $filePath `
+                    -Saved $true `
+                    -ChildCount ([int]$Task.ChildCount) `
+                    -ParentUrl ([string]$Task.ParentUrl) `
+                    -SourceXml ([string]$Task.SourceXml))
+            }
+            catch {
+                $lastError = $_.Exception.Message
+            }
+        }
+
+        try {
+            [void](Invoke-CdpCommand -Socket $Socket -Method 'Runtime.evaluate' -Params @{ expression = 'location.href'; returnByValue = $true })
+        }
+        catch {
+            $lastError = $_.Exception.Message
+        }
+        Start-Sleep -Milliseconds 500
+    }
+
+    throw "Gagal download PDF lewat browser: $pageUrl - $lastError"
+}
+
 function Save-MhtmlPageInSession {
     param(
         [System.Net.WebSockets.ClientWebSocket]$Socket,
@@ -2007,6 +2145,10 @@ function Save-MhtmlPageInSession {
     )
 
     $pageUrl = [string]$Task.Url
+    if (Test-PdfUrl -PageUrl $pageUrl) {
+        return @(Save-PdfFromBrowserSession -Socket $Socket -Task $Task)
+    }
+
     $baseFilePath = [System.IO.Path]::GetFullPath([string]$Task.FilePath)
     $saved = $false
     $data = $null
@@ -2254,7 +2396,6 @@ function Invoke-PersistentPageWorker {
 
     $session = $null
     try {
-        $session = New-MhtmlPageSession
         Write-Host "Worker #$Id siap menunggu task."
 
         while ($true) {
