@@ -1536,7 +1536,10 @@ function Resolve-PageUrl {
 }
 
 function Test-ExcludedXmlLinkUrl {
-    param([string]$PageUrl)
+    param(
+        [string]$PageUrl,
+        [string]$SourceXml = ''
+    )
 
     if ([string]::IsNullOrWhiteSpace($PageUrl)) {
         return $false
@@ -1544,11 +1547,13 @@ function Test-ExcludedXmlLinkUrl {
 
     try {
         $uri = [Uri]$PageUrl
-        $host = $uri.Host.ToLowerInvariant()
+        $urlHost = $uri.Host.ToLowerInvariant()
         $path = $uri.AbsolutePath.TrimEnd('/').ToLowerInvariant()
+        $segments = @($path.Split('/') | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
         return (
-            (($host -eq 'www.unrealengine.com' -or $host -eq 'unrealengine.com') -and ($path -eq '/marketplace' -or $path.StartsWith('/marketplace/'))) -or
-            ($host -eq 'www.fab.com' -or $host -eq 'fab.com')
+            ($urlHost -eq 'fab.com' -or $urlHost.EndsWith('.fab.com')) -or
+            ($urlHost -eq 'docs.unrealengine.com' -and (Test-LearningXmlSource -SourceXml $SourceXml)) -or
+            (($urlHost -eq 'unrealengine.com' -or $urlHost.EndsWith('.unrealengine.com')) -and ($segments -contains 'marketplace'))
         )
     }
     catch {
@@ -1799,7 +1804,7 @@ function Get-LinkIndexTasks {
         if ([string]::IsNullOrWhiteSpace([string]$row.url) -or [string]::IsNullOrWhiteSpace([string]$row.file)) {
             continue
         }
-        if (Test-ExcludedXmlLinkUrl -PageUrl ([string]$row.url)) {
+        if (Test-ExcludedXmlLinkUrl -PageUrl ([string]$row.url) -SourceXml $SourceXml) {
             continue
         }
 
@@ -1874,7 +1879,7 @@ function Add-NavDivTask {
     if ([string]::IsNullOrWhiteSpace($url)) {
         return $false
     }
-    if (Test-ExcludedXmlLinkUrl -PageUrl $url) {
+    if (Test-ExcludedXmlLinkUrl -PageUrl $url -SourceXml $SourceXml) {
         return $false
     }
 
@@ -2017,7 +2022,7 @@ function Write-LinkIndex {
         $rows = New-Object System.Collections.ArrayList
         [void]$rows.Add("url`tsave_folder`tfile`ttitle`tchild_count`tparent_url`tsource_xml")
         foreach ($task in @($groupTasks)) {
-            if (Test-ExcludedXmlLinkUrl -PageUrl ([string]$task.Url)) {
+            if (Test-ExcludedXmlLinkUrl -PageUrl ([string]$task.Url) -SourceXml ([string]$task.SourceXml)) {
                 continue
             }
             [void]$rows.Add((
@@ -2804,6 +2809,11 @@ function Get-NextBrowserTask {
         $task = Get-NextTask -Queue $Queue -SeenFiles $SeenFiles
         if (-not $task) {
             return $null
+        }
+
+        if (Test-ExcludedXmlLinkUrl -PageUrl ([string]$task.Url) -SourceXml ([string]$task.SourceXml)) {
+            Write-Host "Lewati link eksternal marketplace/Fab: $($task.Url)"
+            continue
         }
 
         $urlKey = ''
