@@ -5,6 +5,7 @@ param(
     [int]$PageLoadTimeoutSeconds = 60,
     [int]$MaxLoadAttempts = 100000,
     [int]$ParallelPages = 6,
+    [int]$BlockCodeParallelism = 10,
     [int]$MaxPages = 0,
     [switch]$Overwrite,
     [switch]$DryRun,
@@ -26,6 +27,7 @@ $PageIdleSeconds = [Math]::Max(0, $PageIdleSeconds)
 $PageLoadTimeoutSeconds = [Math]::Max(1, $PageLoadTimeoutSeconds)
 $MaxLoadAttempts = [Math]::Max(1, $MaxLoadAttempts)
 $ParallelPages = [Math]::Min(30, [Math]::Max(1, $ParallelPages))
+$BlockCodeParallelism = [Math]::Min(100, [Math]::Max(1, $BlockCodeParallelism))
 
 $MinimumMhtmlBytes = 650KB
 $MhtmlRoot = [System.IO.Path]::GetFullPath($MhtmlRoot)
@@ -868,10 +870,26 @@ function Get-MhtmlSwitchSelectExpression {
 }
 
 function Get-MhtmlSnippetPrepareExpression {
-    return @'
+    param([int]$Parallelism = 10)
+
+    $safeParallelism = [Math]::Min(100, [Math]::Max(1, $Parallelism))
+    return (@'
 (async () => {
+  const blockCodeParallelism = __MHTML_BLOCK_CODE_PARALLELISM__;
   const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
   const normalize = (value) => (value || '').replace(/\s+/g, ' ').trim();
+  const mapLimit = async (items, limit, worker) => {
+    const results = new Array(items.length);
+    let nextIndex = 0;
+    const workerCount = Math.min(Math.max(1, limit || 1), items.length);
+    await Promise.all(Array.from({ length: workerCount }, async () => {
+      while (nextIndex < items.length) {
+        const index = nextIndex++;
+        results[index] = await worker(items[index], index);
+      }
+    }));
+    return results;
+  };
   const visible = (el) => {
     if (!el) return false;
     const style = getComputedStyle(el);
@@ -1165,13 +1183,16 @@ function Get-MhtmlSnippetPrepareExpression {
     const sourceLineCount = countSourceLines(source);
     const expandResult = type === 'code' ? await tryExpandShortCode(snippet, sourceLineCount, expectedLineCount) : { attempted: false, ok: false, label: '' };
     const injected = injectSnippetSource(snippet, source, type, { expectedLineCount, buttonLabel });
-    const lineCountOk = sourceLineCountMatches(expectedLineCount, sourceLineCount) || (type === 'code' && expandResult.ok && sourceLooksUseful(source, type));
+    const filled = sourceLooksUseful(source, type);
+    const lineCountOk = sourceLineCountMatches(expectedLineCount, sourceLineCount) ||
+      (type === 'blueprint' && expectedLineCount > 0 && sourceLineCount < expectedLineCount && filled) ||
+      (type === 'code' && expandResult.ok && filled);
     return {
       index,
       type,
       clicked: !!button,
       buttonLabel,
-      filled: sourceLooksUseful(source, type),
+      filled,
       injected,
       fromTextarea: !!waitResult.fromTextarea,
       sourceLength: (source || '').length,
@@ -1222,14 +1243,17 @@ function Get-MhtmlSnippetPrepareExpression {
     const sourceLineCount = countSourceLines(source);
     const expandResult = type === 'code' ? await tryExpandShortCode(root, sourceLineCount, expectedLineCount) : { attempted: false, ok: false, label: '' };
     const injected = injectSnippetSource(root, source, type, { expectedLineCount, buttonLabel });
-    const lineCountOk = sourceLineCountMatches(expectedLineCount, sourceLineCount) || (type === 'code' && expandResult.ok && sourceLooksUseful(source, type));
+    const filled = sourceLooksUseful(source, type);
+    const lineCountOk = sourceLineCountMatches(expectedLineCount, sourceLineCount) ||
+      (type === 'blueprint' && expectedLineCount > 0 && sourceLineCount < expectedLineCount && filled) ||
+      (type === 'code' && expandResult.ok && filled);
     return {
       index: offset + index,
       type,
       looseCopy: true,
       clicked: true,
       buttonLabel,
-      filled: sourceLooksUseful(source, type),
+      filled,
       injected,
       fromTextarea: !!waitResult.fromTextarea,
       sourceLength: (source || '').length,
@@ -1243,16 +1267,16 @@ function Get-MhtmlSnippetPrepareExpression {
     };
   };
   const snippets = Array.from(document.querySelectorAll('block-code-snippet'));
-  const snippetResults = await Promise.all(snippets.map((snippet, index) => processSnippet(snippet, index)));
+  const snippetResults = await mapLimit(snippets, blockCodeParallelism, processSnippet);
   const legacySnippets = Array.from(document.querySelectorAll('pre.block-code-snippet-plain'))
     .filter(pre => !pre.closest('block-code-snippet'));
   const legacyResults = legacySnippets.map((pre, index) => processLegacySnippet(pre, snippets.length, index));
   const looseTargets = findLooseCopyTargets();
-  const looseResults = await Promise.all(looseTargets.map((target, index) => processLooseCopyTarget(target, snippets.length + legacySnippets.length, index)));
+  const looseResults = await mapLimit(looseTargets, blockCodeParallelism, (target, index) => processLooseCopyTarget(target, snippets.length + legacySnippets.length, index));
   const results = snippetResults.concat(legacyResults, looseResults);
-  return JSON.stringify({ snippetCount: results.length, blockSnippetCount: snippets.length, legacySnippetCount: legacySnippets.length, looseCopySnippetCount: looseTargets.length, results });
+  return JSON.stringify({ snippetCount: results.length, blockSnippetCount: snippets.length, legacySnippetCount: legacySnippets.length, looseCopySnippetCount: looseTargets.length, blockCodeParallelism, results });
 })()
-'@
+'@).Replace('__MHTML_BLOCK_CODE_PARALLELISM__', [string]$safeParallelism)
 }
 
 function Get-SwitchOptionCombinations {
@@ -2210,7 +2234,7 @@ function Save-MhtmlPageInSession {
                     }
                 }
 
-                $snippetJson = Invoke-PageEval -Socket $Socket -Expression (Get-MhtmlSnippetPrepareExpression) -AwaitPromise
+                $snippetJson = Invoke-PageEval -Socket $Socket -Expression (Get-MhtmlSnippetPrepareExpression -Parallelism $BlockCodeParallelism) -AwaitPromise
                 $snippetData = $snippetJson | ConvertFrom-Json
                 if ($snippetData -and [int]$snippetData.snippetCount -gt 0) {
                     $filledCount = @($snippetData.results | Where-Object { $_.filled }).Count
@@ -2666,6 +2690,7 @@ function Start-PageWorkerJob {
             [double]$PageIdleSeconds,
             [int]$PageLoadTimeoutSeconds,
             [int]$MaxLoadAttempts,
+            [int]$BlockCodeParallelism,
             [bool]$OverwriteFlag,
             [bool]$LoadImagesFlag,
             [string]$MhtmlRoot
@@ -2680,6 +2705,7 @@ function Start-PageWorkerJob {
             -PageIdleSeconds $PageIdleSeconds `
             -PageLoadTimeoutSeconds $PageLoadTimeoutSeconds `
             -MaxLoadAttempts $MaxLoadAttempts `
+            -BlockCodeParallelism $BlockCodeParallelism `
             -Overwrite:$OverwriteFlag `
             -LoadImages:$LoadImagesFlag `
             -MhtmlRoot $MhtmlRoot
@@ -2692,6 +2718,7 @@ function Start-PageWorkerJob {
         $PageIdleSeconds,
         $PageLoadTimeoutSeconds,
         $MaxLoadAttempts,
+        $BlockCodeParallelism,
         $Overwrite.IsPresent,
         $LoadImages.IsPresent,
         $MhtmlRoot
