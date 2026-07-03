@@ -2,7 +2,8 @@ param(
     [string]$Root = $PSScriptRoot,
     [int]$BrowserPollSeconds = 0.5,
     [int]$ParallelDownloads = 6,
-    [int]$DownloadRetries = 100000
+    [int]$DownloadRetries = 100000,
+    [switch]$SkipYoutubeVideo
 )
 
 $ErrorActionPreference = 'Stop'
@@ -1018,6 +1019,11 @@ foreach ($mhtmlFile in $mhtmlFiles) {
 
         if ($localVideoIds.ContainsKey($youtubeId)) {
             Write-Host "Skipping online download: local MP4 URL found for $youtubeId"
+            continue
+        }
+
+        if ($SkipYoutubeVideo) {
+            Write-Host "Skipping YouTube video download: $youtubeId"
             continue
         }
 
