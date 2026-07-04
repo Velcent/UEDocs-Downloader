@@ -131,6 +131,20 @@ function Get-Mp4SourceForVideoId {
     return "$(ConvertTo-HtmlAttributeValue "https://media.local/assets/video/$VideoId.mp4")"
 }
 
+function Repair-PatchedMediaLocalUrls {
+    param([string]$Text)
+
+    if ([string]::IsNullOrEmpty($Text)) {
+        return $Text
+    }
+
+    $pattern = "(?i)(?<url>https://media\.local/assets/video/[A-Za-z0-9_-]+\.mp4)[\)\]\}\.,;:]+(?=(`"|&quot;|'|<|>|\s|$))"
+    return [regex]::Replace($Text, $pattern, {
+        param($Match)
+        return $Match.Groups['url'].Value
+    })
+}
+
 function ConvertTo-CssUrlValue {
     param([string]$Value)
 
@@ -177,21 +191,27 @@ function Get-PosterUrlFromLocalEmbedFile {
     }
 
     $embedText = [System.IO.File]::ReadAllText($embedPath)
+    $decodedEmbedText = [System.Net.WebUtility]::HtmlDecode($embedText).
+        Replace('\/', '/').
+        Replace('\u0026', '&')
+    $escapedVideoId = [regex]::Escape($VideoId)
     $patterns = @(
         'const\s+posterUrl\s*=\s*`\$\{document\.location\.origin\}(?<path>/community/api/cms/image/[^`"]+)',
         'const\s+posterUrl\s*=\s*["''](?<path>/community/api/cms/image/[^"'']+)["'']',
         'background-image:\s*url\((?:&quot;|"|''|\\")?(?<url>https://dev\.epicgames\.com/community/api/cms/image/[^"''\)\s\\]+)',
-        'background-image:\s*url\((?:&quot;|"|''|\\")?(?<path>/community/api/cms/image/[^"''\)\s\\]+)'
+        'background-image:\s*url\((?:&quot;|"|''|\\")?(?<path>/community/api/cms/image/[^"''\)\s\\]+)',
+        ('(?<url>https?://(?:i\.ytimg\.com|img\.youtube\.com)/(?:vi|vi_webp)/{0}/[^"''<>\s\\)]+)' -f $escapedVideoId),
+        ('(?<url>https?://[^"''<>\s\\)]+ytimg\.com/[^"''<>\s\\)]*/{0}/[^"''<>\s\\)]+)' -f $escapedVideoId)
     )
 
     foreach ($pattern in $patterns) {
-        $match = [regex]::Match($embedText, $pattern, 'IgnoreCase')
+        $match = [regex]::Match($decodedEmbedText, $pattern, 'IgnoreCase')
         if (-not $match.Success) {
             continue
         }
 
         if ($match.Groups['url'].Success) {
-            return $match.Groups['url'].Value
+            return $match.Groups['url'].Value.TrimEnd(',', '.', ';')
         }
 
         if ($match.Groups['path'].Success) {
@@ -336,6 +356,10 @@ function Patch-YoutubeLinkFallback {
         $patchedText = [regex]::Replace($patchedText, $pattern, $mp4Source, 'IgnoreCase')
     }
 
+    if ($replacementCount -gt 0) {
+        $patchedText = Repair-PatchedMediaLocalUrls -Text $patchedText
+    }
+
     return @{
         Text = $patchedText
         Patched = ($replacementCount -gt 0)
@@ -400,7 +424,7 @@ function Patch-EmbedPart {
     $headers = $MhtmlText.Substring($boundaryIndex, $bodyStart - $boundaryIndex)
     $oldBody = $MhtmlText.Substring($bodyStart, $nextBoundaryIndex - $bodyStart)
     $posterUrl = Get-PosterUrlFromEmbedBody $oldBody
-    if ([string]::IsNullOrWhiteSpace($posterUrl) -and $Kind -eq 'epic') {
+    if ([string]::IsNullOrWhiteSpace($posterUrl)) {
         $posterUrl = Get-PosterUrlFromLocalEmbedFile $VideoId
     }
     $html = Get-VideoPlayerHtml -VideoId $VideoId -PosterUrl $posterUrl
@@ -456,7 +480,7 @@ foreach ($group in $groups) {
 
         $videoId = $patchInfo.Id
         $result = Patch-EmbedPart -MhtmlText $text -EmbedUrl $row.embed_html -VideoId $videoId -Kind $patchInfo.Kind
-        $text = $result.Text
+        $text = Repair-PatchedMediaLocalUrls -Text $result.Text
 
         if ($result.Patched) {
             $patchedInFile++

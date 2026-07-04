@@ -212,6 +212,98 @@ iframe {
 "@
 }
 
+function Get-YoutubeCoverImageUrl {
+    param(
+        [string]$Html,
+        [string]$VideoId
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Html) -or [string]::IsNullOrWhiteSpace($VideoId)) {
+        return $null
+    }
+
+    $decodedHtml = [System.Net.WebUtility]::HtmlDecode($Html).
+        Replace('\/', '/').
+        Replace('\u0026', '&')
+    $escapedVideoId = [regex]::Escape($VideoId)
+    $patterns = @(
+        ('https?://(?:i\.ytimg\.com|img\.youtube\.com)/(?:vi|vi_webp)/{0}/[^"''<>\s\\)]+' -f $escapedVideoId),
+        ('https?://[^"''<>\s\\)]+ytimg\.com/[^"''<>\s\\)]*/{0}/[^"''<>\s\\)]+' -f $escapedVideoId)
+    )
+
+    foreach ($pattern in $patterns) {
+        $match = [regex]::Match($decodedHtml, $pattern, 'IgnoreCase')
+        if ($match.Success) {
+            return $match.Value.TrimEnd(',', '.', ';')
+        }
+    }
+
+    return $null
+}
+
+function Test-RemoteImageUrl {
+    param([string]$Url)
+
+    try {
+        $response = Invoke-WebRequest -Uri $Url -Method Head -UseBasicParsing -ErrorAction Stop
+        if ($response.StatusCode -lt 200 -or $response.StatusCode -ge 300) {
+            return $false
+        }
+
+        $contentType = $response.Headers['Content-Type']
+        return (-not $contentType -or $contentType -match '^image/')
+    }
+    catch {
+        return $false
+    }
+}
+
+function Get-YoutubeOnlineCoverImageUrl {
+    param([string]$VideoId)
+
+    if ([string]::IsNullOrWhiteSpace($VideoId)) {
+        return $null
+    }
+
+    $coverUrls = @(
+        "https://i.ytimg.com/vi/$VideoId/maxresdefault.jpg",
+        "https://i.ytimg.com/vi_webp/$VideoId/maxresdefault.webp",
+        "https://i.ytimg.com/vi/$VideoId/hqdefault.jpg",
+        "https://i.ytimg.com/vi_webp/$VideoId/hqdefault.webp",
+        "https://i.ytimg.com/vi/$VideoId/mqdefault.jpg",
+        "https://i.ytimg.com/vi/$VideoId/default.jpg"
+    )
+
+    foreach ($coverUrl in $coverUrls) {
+        if (Test-RemoteImageUrl $coverUrl) {
+            return $coverUrl
+        }
+    }
+
+    return $null
+}
+
+function Add-YoutubeCoverImageUrlToHtml {
+    param(
+        [string]$Html,
+        [string]$CoverUrl
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Html) -or [string]::IsNullOrWhiteSpace($CoverUrl)) {
+        return $Html
+    }
+
+    $encodedCoverUrl = [System.Net.WebUtility]::HtmlEncode($CoverUrl)
+    $coverMeta = "<meta property=""og:image"" content=""$encodedCoverUrl"">"
+
+    if ($Html -match '(?i)</head>') {
+        return ([regex]::new('</head>', [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)).
+            Replace($Html, "$coverMeta`r`n</head>", 1)
+    }
+
+    return "$Html`r`n<!-- YouTube cover: $encodedCoverUrl -->"
+}
+
 function Save-YoutubeEmbedHtml {
     param(
         [string]$MhtmlText,
@@ -220,21 +312,68 @@ function Save-YoutubeEmbedHtml {
     )
 
     if (Test-Path -LiteralPath $HtmlPath) {
-        Write-Host "Skipping embed HTML: $(Split-Path -Leaf $HtmlPath) already exists"
-        return
+        $existingHtml = [System.IO.File]::ReadAllText($HtmlPath)
+        if (Get-YoutubeCoverImageUrl -Html $existingHtml -VideoId $VideoId) {
+            Write-Host "Skipping embed HTML: $(Split-Path -Leaf $HtmlPath) already exists"
+            return
+        }
+
+        Write-Host "Refreshing YouTube embed HTML without cover: $(Split-Path -Leaf $HtmlPath)"
     }
 
-    $html = Get-YoutubeEmbedHtmlFromMhtml -MhtmlText $MhtmlText -VideoId $VideoId
-    if ([string]::IsNullOrWhiteSpace($html)) {
-        $html = Get-RemoteText "https://www.youtube.com/embed/$VideoId"
+    $candidates = @()
+    $mhtmlHtml = Get-YoutubeEmbedHtmlFromMhtml -MhtmlText $MhtmlText -VideoId $VideoId
+    if (-not [string]::IsNullOrWhiteSpace($mhtmlHtml)) {
+        $candidates += [pscustomobject]@{
+            Source = 'MHTML'
+            Html = $mhtmlHtml
+            CoverUrl = Get-YoutubeCoverImageUrl -Html $mhtmlHtml -VideoId $VideoId
+        }
     }
 
-    if ([string]::IsNullOrWhiteSpace($html)) {
+    if (-not $candidates -or -not ($candidates | Where-Object { $_.CoverUrl } | Select-Object -First 1)) {
+        $onlineHtml = Get-RemoteText "https://www.youtube.com/embed/$VideoId"
+        if (-not [string]::IsNullOrWhiteSpace($onlineHtml)) {
+            $candidates += [pscustomobject]@{
+                Source = 'online'
+                Html = $onlineHtml
+                CoverUrl = Get-YoutubeCoverImageUrl -Html $onlineHtml -VideoId $VideoId
+            }
+        }
+    }
+
+    $selected = $candidates | Where-Object { $_.CoverUrl } | Select-Object -First 1
+    if (-not $selected) {
+        $selected = $candidates | Select-Object -First 1
+    }
+
+    if ($selected) {
+        $html = $selected.Html
+        $coverUrl = $selected.CoverUrl
+    }
+    else {
         $html = New-YoutubeEmbedHtml -VideoId $VideoId
+        $coverUrl = $null
+    }
+
+    if ([string]::IsNullOrWhiteSpace($coverUrl)) {
+        Write-Host "YouTube cover not found in HTML. Checking online cover: $VideoId"
+        $coverUrl = Get-YoutubeOnlineCoverImageUrl -VideoId $VideoId
+        if (-not [string]::IsNullOrWhiteSpace($coverUrl)) {
+            $html = Add-YoutubeCoverImageUrlToHtml -Html $html -CoverUrl $coverUrl
+        }
     }
 
     [System.IO.File]::WriteAllText($HtmlPath, $html, [System.Text.UTF8Encoding]::new($false))
-    Write-Host "Saved YouTube embed HTML: $(Split-Path -Leaf $HtmlPath)"
+    if ($selected -and $selected.CoverUrl) {
+        Write-Host "Saved YouTube embed HTML from $($selected.Source): $(Split-Path -Leaf $HtmlPath)"
+    }
+    elseif (-not [string]::IsNullOrWhiteSpace($coverUrl)) {
+        Write-Host "Saved YouTube embed HTML with online cover: $(Split-Path -Leaf $HtmlPath)"
+    }
+    else {
+        Write-Host "Saved YouTube embed HTML without cover: $(Split-Path -Leaf $HtmlPath)"
+    }
 }
 
 function Get-LocalMp4UrlsFromMhtml {
