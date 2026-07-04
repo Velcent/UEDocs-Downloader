@@ -399,14 +399,11 @@ function Handle-CdpEvent {
 
         $resourceType = [string]$Message.params.resourceType
         $requestUrl = [string]$Message.params.request.url
-        $isEmbedUrl = $requestUrl -match '(?i)(youtube\.com/embed|player\.vimeo\.com|embed|iframe)'
         $shouldBlock = -not $LoadImages -and (
             $resourceType -eq 'Image' -or
             $resourceType -eq 'Media' -or
-            ($resourceType -eq 'Other' -and $isEmbedUrl) -or
             $requestUrl -match '(?i)/community/api/(learning|documentation|user_profiles)/image/' -or
-            $requestUrl -match '(?i)[?&]resizing_type=' -or
-            ($resourceType -ne 'Document' -and $isEmbedUrl)
+            $requestUrl -match '(?i)[?&]resizing_type='
         )
 
         $method = if ($shouldBlock) { 'Fetch.failRequest' } else { 'Fetch.continueRequest' }
@@ -1440,21 +1437,6 @@ function New-LearningPageSession {
     [void](Invoke-CdpCommand -Socket $socket -Method 'Runtime.enable')
     [void](Invoke-CdpCommand -Socket $socket -Method 'Network.enable')
     if (-not $LoadImages) {
-        [void](Invoke-CdpCommand -Socket $socket -Method 'Page.addScriptToEvaluateOnNewDocument' -Params @{
-            source = @'
-(() => {
-  const removeEmbeds = () => {
-    document.querySelectorAll('iframe, embed, object, video, audio').forEach((el) => {
-      try { el.remove(); } catch (_) {}
-    });
-  };
-  removeEmbeds();
-  new MutationObserver(removeEmbeds).observe(document.documentElement || document, { childList: true, subtree: true });
-})();
-'@
-        })
-    }
-    if (-not $LoadImages) {
         [void](Invoke-CdpCommand -Socket $socket -Method 'Fetch.enable' -Params @{
             patterns = @(
                 @{
@@ -1465,11 +1447,6 @@ function New-LearningPageSession {
                 @{
                     urlPattern = '*'
                     resourceType = 'Media'
-                    requestStage = 'Request'
-                },
-                @{
-                    urlPattern = '*'
-                    resourceType = 'Other'
                     requestStage = 'Request'
                 }
             )
