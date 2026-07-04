@@ -338,10 +338,17 @@ function Patch-YoutubeLinkFallback {
 
     $mp4Source = Get-Mp4SourceForVideoId $VideoId
     $escapedVideoId = [regex]::Escape($VideoId)
-    $watchPattern = 'https?://(?:www\.)?youtube(?:-nocookie)?\.com/watch\?[^"''<>\s\\)]*v(?:=|=3D)' + $escapedVideoId + '[^"''<>\s\\)]*'
-    $embedPattern = 'https?://(?:www\.)?youtube(?:-nocookie)?\.com/(?:embed|shorts|live)/' + $escapedVideoId + '[^"''<>\s\\)]*'
-    $shortUrlPattern = 'https?://youtu\.be/' + $escapedVideoId + '[^"''<>\s\\)]*'
-    $patterns = @($watchPattern, $embedPattern, $shortUrlPattern)
+    $urlTailChars = '[^"''<>\s\\\]\(\)]*'
+    $watchPattern = 'https?://(?:www\.)?youtube(?:-nocookie)?\.com/watch\?' + $urlTailChars + 'v(?:=|=3D)' + $escapedVideoId + $urlTailChars
+    $embedPattern = 'https?://(?:www\.)?youtube(?:-nocookie)?\.com/(?:embed|shorts|live)/' + $escapedVideoId + $urlTailChars
+    $shortUrlPattern = 'https?://youtu\.be/' + $escapedVideoId + $urlTailChars
+    $youtubePattern = '(?:' + $watchPattern + '|' + $embedPattern + '|' + $shortUrlPattern + ')'
+    $patterns = @(
+        ($youtubePattern + '\]\(' + $youtubePattern + '\)'),
+        $watchPattern,
+        $embedPattern,
+        $shortUrlPattern
+    )
 
     $patchedText = $MhtmlText
     $replacementCount = 0
