@@ -63,8 +63,8 @@ function Get-YoutubeVideoIdFromUrl {
 
     $decoded = [System.Net.WebUtility]::HtmlDecode($Url).Replace('\/', '/')
     $patterns = @(
-        '(?i)(?:(?:www\.)?youtube(?:-nocookie)?\.com/(?:embed|shorts|live)/|youtu\.be/)(?<id>[A-Za-z0-9_-]{11})',
-        '(?i)(?:www\.)?youtube(?:-nocookie)?\.com/.*?[?&]v=(?<id>[A-Za-z0-9_-]{11})'
+        '(?i)(?:(?:(?:www\.|m\.)?youtube(?:-nocookie)?|music\.youtube)\.com/(?:embed|shorts|live|v|e)/|youtu\.be/)(?<id>[A-Za-z0-9_-]{11})',
+        '(?i)(?:(?:www\.|m\.)?youtube(?:-nocookie)?|music\.youtube)\.com/.*?[?&]v(?:=|=3D)(?<id>[A-Za-z0-9_-]{11})'
     )
 
     foreach ($pattern in $patterns) {
@@ -339,8 +339,9 @@ function Patch-YoutubeLinkFallback {
     $mp4Source = Get-Mp4SourceForVideoId $VideoId
     $escapedVideoId = [regex]::Escape($VideoId)
     $urlTailChars = '[^"''<>\s\\\]\(\)]*'
-    $watchPattern = 'https?://(?:www\.)?youtube(?:-nocookie)?\.com/watch\?' + $urlTailChars + 'v(?:=|=3D)' + $escapedVideoId + $urlTailChars
-    $embedPattern = 'https?://(?:www\.)?youtube(?:-nocookie)?\.com/(?:embed|shorts|live)/' + $escapedVideoId + $urlTailChars
+    $youtubeHostPattern = '(?:(?:www\.|m\.)?youtube(?:-nocookie)?|music\.youtube)\.com'
+    $watchPattern = 'https?://' + $youtubeHostPattern + '/watch\?' + $urlTailChars + 'v(?:=|=3D)' + $escapedVideoId + $urlTailChars
+    $embedPattern = 'https?://' + $youtubeHostPattern + '/(?:embed|shorts|live|v|e)/' + $escapedVideoId + $urlTailChars
     $shortUrlPattern = 'https?://youtu\.be/' + $escapedVideoId + $urlTailChars
     $youtubePattern = '(?:' + $watchPattern + '|' + $embedPattern + '|' + $shortUrlPattern + ')'
     $patterns = @(
