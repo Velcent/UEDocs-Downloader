@@ -372,38 +372,7 @@ function Update-NetworkStateFromNavigateResult {
 function Get-MhtmlCaptureBlockerExpression {
     return @'
 (() => {
-  const cleanImageNode = (el) => {
-    try {
-      el.removeAttribute('src');
-      el.removeAttribute('srcset');
-      el.removeAttribute('imagesrcset');
-      el.removeAttribute('poster');
-      if (el.tagName === 'IMG') {
-        el.setAttribute('alt', el.getAttribute('alt') || '');
-        el.setAttribute('loading', 'lazy');
-      }
-    } catch (_) {}
-  };
-
-  const clean = () => {
-    document.querySelectorAll('img, source, video, audio').forEach(cleanImageNode);
-    document.querySelectorAll('embed, object').forEach((el) => {
-      try { el.remove(); } catch (_) {}
-    });
-  };
-
-  clean();
-  document.addEventListener('DOMContentLoaded', clean, true);
-  window.addEventListener('load', clean, true);
-  if (!window.__mhtmlCaptureBlockerObserver) {
-    window.__mhtmlCaptureBlockerObserver = true;
-    new MutationObserver(clean).observe(document.documentElement || document, {
-      childList: true,
-      subtree: true,
-      attributes: true,
-      attributeFilter: ['src', 'srcset', 'imagesrcset', 'poster']
-    });
-  }
+  window.__mhtmlCaptureBlockerNetworkOnly = true;
 })()
 '@
 }
