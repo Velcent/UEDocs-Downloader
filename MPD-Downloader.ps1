@@ -3,6 +3,7 @@ param(
     [int]$BrowserPollSeconds = 0.5,
     [int]$ParallelDownloads = 6,
     [int]$DownloadRetries = 100000,
+    [int]$MaxDuration = 0,
     [switch]$SkipYoutubeVideo
 )
 
@@ -12,6 +13,8 @@ $ProgressPreference = 'SilentlyContinue'
 $Root = (Resolve-Path -LiteralPath $Root).Path
 $ParallelDownloads = [Math]::Max(1, $ParallelDownloads)
 $DownloadRetries = [Math]::Max(0, $DownloadRetries)
+$MaxDuration = [Math]::Max(0, $MaxDuration)
+$MaxDurationSeconds = $MaxDuration * 60
 $VideoDir = Join-Path $Root 'video'
 $HtmlDir = Join-Path $VideoDir 'embed'
 $MpdDir = Join-Path $VideoDir 'mpd'
@@ -917,6 +920,117 @@ function Format-FileSize {
     return "$Bytes bytes"
 }
 
+function Format-DurationText {
+    param([double]$Seconds)
+
+    if ($Seconds -ge 3600) {
+        return '{0:00}:{1:00}:{2:00}' -f [Math]::Floor($Seconds / 3600), ([Math]::Floor($Seconds / 60) % 60), [Math]::Floor($Seconds % 60)
+    }
+
+    return '{0:00}:{1:00}' -f [Math]::Floor($Seconds / 60), [Math]::Floor($Seconds % 60)
+}
+
+function Convert-Iso8601DurationToSeconds {
+    param([string]$Duration)
+
+    if ([string]::IsNullOrWhiteSpace($Duration)) {
+        return $null
+    }
+
+    $match = [regex]::Match(
+        $Duration.Trim(),
+        '(?i)^P(?:(?<days>\d+(?:\.\d+)?)D)?(?:T(?:(?<hours>\d+(?:\.\d+)?)H)?(?:(?<minutes>\d+(?:\.\d+)?)M)?(?:(?<seconds>\d+(?:\.\d+)?)S)?)?$'
+    )
+    if (-not $match.Success) {
+        return $null
+    }
+
+    $total = 0.0
+    if ($match.Groups['days'].Success) {
+        $total += [double]::Parse($match.Groups['days'].Value, [System.Globalization.CultureInfo]::InvariantCulture) * 86400
+    }
+    if ($match.Groups['hours'].Success) {
+        $total += [double]::Parse($match.Groups['hours'].Value, [System.Globalization.CultureInfo]::InvariantCulture) * 3600
+    }
+    if ($match.Groups['minutes'].Success) {
+        $total += [double]::Parse($match.Groups['minutes'].Value, [System.Globalization.CultureInfo]::InvariantCulture) * 60
+    }
+    if ($match.Groups['seconds'].Success) {
+        $total += [double]::Parse($match.Groups['seconds'].Value, [System.Globalization.CultureInfo]::InvariantCulture)
+    }
+
+    return $total
+}
+
+function Get-MpdDurationSeconds {
+    param([string]$MpdPath)
+
+    if ([string]::IsNullOrWhiteSpace($MpdPath) -or -not (Test-Path -LiteralPath $MpdPath)) {
+        return $null
+    }
+
+    try {
+        [xml]$mpd = Get-Content -LiteralPath $MpdPath -Raw
+        $duration = $mpd.DocumentElement.GetAttribute('mediaPresentationDuration')
+        return Convert-Iso8601DurationToSeconds $duration
+    }
+    catch {
+        try {
+            $text = Get-Content -LiteralPath $MpdPath -Raw
+            $match = [regex]::Match($text, 'mediaPresentationDuration\s*=\s*["''](?<duration>[^"'']+)["'']', 'IgnoreCase')
+            if ($match.Success) {
+                return Convert-Iso8601DurationToSeconds $match.Groups['duration'].Value
+            }
+        }
+        catch {
+        }
+    }
+
+    return $null
+}
+
+function Get-YoutubeDurationSeconds {
+    param(
+        [string]$YtDlpPath,
+        [string]$SourceUrl
+    )
+
+    if ([string]::IsNullOrWhiteSpace($SourceUrl)) {
+        return $null
+    }
+
+    try {
+        $output = & $YtDlpPath --skip-download --no-playlist --print duration $SourceUrl 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            return $null
+        }
+
+        foreach ($line in @($output)) {
+            $value = [string]$line
+            if ($value -match '^\s*(?<duration>\d+(?:\.\d+)?)\s*$') {
+                return [double]::Parse($matches['duration'], [System.Globalization.CultureInfo]::InvariantCulture)
+            }
+        }
+    }
+    catch {
+    }
+
+    return $null
+}
+
+function Get-DownloadTaskDurationSeconds {
+    param(
+        [object]$Task,
+        [string]$YtDlpPath
+    )
+
+    if ($Task.Kind -eq 'youtube') {
+        return Get-YoutubeDurationSeconds -YtDlpPath $YtDlpPath -SourceUrl $Task.SourceUrl
+    }
+
+    return Get-MpdDurationSeconds -MpdPath $Task.MpdPath
+}
+
 function Get-VideoSizeText {
     param([string]$Mp4Path)
 
@@ -1037,7 +1151,8 @@ function Invoke-ParallelDownloads {
     param(
         [object[]]$Tasks,
         [int]$MaxParallel,
-        [int]$RetryLimit
+        [int]$RetryLimit,
+        [int]$MaxDurationSeconds
     )
 
     if (-not $Tasks -or $Tasks.Count -eq 0) {
@@ -1073,6 +1188,21 @@ function Invoke-ParallelDownloads {
             if ($task.Kind -ne 'youtube' -and -not (Test-Path -LiteralPath $task.MpdPath)) {
                 Write-Warning "MP4 skipped because $(Split-Path -Leaf $task.MpdPath) does not exist."
                 continue
+            }
+
+            if ($MaxDurationSeconds -gt 0 -and [int]$task.RetryCount -eq 0) {
+                $durationSeconds = Get-DownloadTaskDurationSeconds -Task $task -YtDlpPath $ytDlp.Source
+                if ($null -ne $durationSeconds) {
+                    if ($durationSeconds -gt $MaxDurationSeconds) {
+                        Write-Warning "MP4 skipped because duration $(Format-DurationText $durationSeconds) exceeds max $(Format-DurationText $MaxDurationSeconds): $(Split-Path -Leaf $task.Mp4Path)"
+                        continue
+                    }
+
+                    Write-Host "Duration OK: $(Split-Path -Leaf $task.Mp4Path) $(Format-DurationText $durationSeconds)/$(Format-DurationText $MaxDurationSeconds)"
+                }
+                else {
+                    Write-Warning "Cannot read duration, continuing download: $(Split-Path -Leaf $task.Mp4Path)"
+                }
             }
 
             $attempt = [int]$task.RetryCount + 1
@@ -1313,8 +1443,8 @@ foreach ($mhtmlFile in $mhtmlFiles) {
     }
 }
 
-Invoke-ParallelDownloads -Tasks $epicDownloadTasks -MaxParallel $ParallelDownloads -RetryLimit $DownloadRetries
-Invoke-ParallelDownloads -Tasks $youtubeDownloadTasks -MaxParallel $ParallelDownloads -RetryLimit $DownloadRetries
+Invoke-ParallelDownloads -Tasks $epicDownloadTasks -MaxParallel $ParallelDownloads -RetryLimit $DownloadRetries -MaxDurationSeconds $MaxDurationSeconds
+Invoke-ParallelDownloads -Tasks $youtubeDownloadTasks -MaxParallel $ParallelDownloads -RetryLimit $DownloadRetries -MaxDurationSeconds $MaxDurationSeconds
 
 foreach ($entry in $listEntries) {
     Add-MpdListEntry -MhtmlPath $entry.MhtmlPath -EmbedUrl $entry.EmbedUrl -Mp4Path $entry.Mp4Path
