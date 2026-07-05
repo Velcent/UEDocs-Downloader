@@ -36,6 +36,9 @@ $script:MainDocumentStatus = $null
 $script:MainDocumentStatusText = ''
 $script:MainDocumentFailedText = ''
 $script:MainDocumentRequestId = ''
+$script:MainDocumentFrameId = ''
+$script:MainDocumentLoaderId = ''
+$script:MainDocumentExpectedUrlKey = ''
 $script:StartedEdgeProfileDirs = New-Object System.Collections.ArrayList
 $script:LearningChildMaxDepth = 5
 $script:LearningRawCacheDir = ''
@@ -382,11 +385,73 @@ function Send-CdpCommandNoWait {
     [void]$Socket.SendAsync($segment, [System.Net.WebSockets.WebSocketMessageType]::Text, $true, [Threading.CancellationToken]::None).GetAwaiter().GetResult()
 }
 
+function Get-NetworkUrlKey {
+    param([string]$Url)
+
+    if ([string]::IsNullOrWhiteSpace($Url)) {
+        return ''
+    }
+
+    try {
+        $uri = [Uri]$Url
+        if (-not $uri.IsAbsoluteUri) {
+            return ($Url -replace '[?#].*$', '').TrimEnd('/').ToLowerInvariant()
+        }
+
+        return "$($uri.Scheme.ToLowerInvariant())://$($uri.Host.ToLowerInvariant())$($uri.AbsolutePath.TrimEnd('/'))"
+    }
+    catch {
+        return ($Url -replace '[?#].*$', '').TrimEnd('/').ToLowerInvariant()
+    }
+}
+
 function Reset-NetworkState {
+    param([string]$PageUrl = '')
+
     $script:MainDocumentStatus = $null
     $script:MainDocumentStatusText = ''
     $script:MainDocumentFailedText = ''
     $script:MainDocumentRequestId = ''
+    $script:MainDocumentFrameId = ''
+    $script:MainDocumentLoaderId = ''
+    $script:MainDocumentExpectedUrlKey = Get-NetworkUrlKey -Url $PageUrl
+}
+
+function Test-MainDocumentNetworkEvent {
+    param($Message)
+
+    if (-not $Message -or -not $Message.params) {
+        return $false
+    }
+
+    $requestId = [string]$Message.params.requestId
+    if (-not [string]::IsNullOrWhiteSpace($script:MainDocumentRequestId) -and $requestId -eq $script:MainDocumentRequestId) {
+        return $true
+    }
+
+    $loaderId = [string]$Message.params.loaderId
+    if (-not [string]::IsNullOrWhiteSpace($script:MainDocumentLoaderId) -and $loaderId -eq $script:MainDocumentLoaderId) {
+        return $true
+    }
+
+    $frameId = [string]$Message.params.frameId
+    if (-not [string]::IsNullOrWhiteSpace($script:MainDocumentFrameId) -and $frameId -eq $script:MainDocumentFrameId) {
+        return $true
+    }
+
+    if ([string]::IsNullOrWhiteSpace($script:MainDocumentExpectedUrlKey)) {
+        return $false
+    }
+
+    $url = ''
+    if ($Message.params.request -and $Message.params.request.url) {
+        $url = [string]$Message.params.request.url
+    }
+    elseif ($Message.params.response -and $Message.params.response.url) {
+        $url = [string]$Message.params.response.url
+    }
+
+    return (Get-NetworkUrlKey -Url $url) -eq $script:MainDocumentExpectedUrlKey
 }
 
 function Update-NetworkStateFromEvent {
@@ -396,13 +461,17 @@ function Update-NetworkStateFromEvent {
         return
     }
 
-    if ($Message.method -eq 'Network.requestWillBeSent' -and $Message.params.type -eq 'Document') {
+    if ($Message.method -eq 'Network.requestWillBeSent' -and $Message.params.type -eq 'Document' -and (Test-MainDocumentNetworkEvent -Message $Message)) {
         $script:MainDocumentRequestId = [string]$Message.params.requestId
+        $script:MainDocumentFrameId = [string]$Message.params.frameId
+        $script:MainDocumentLoaderId = [string]$Message.params.loaderId
         return
     }
 
-    if ($Message.method -eq 'Network.responseReceived' -and $Message.params.type -eq 'Document') {
+    if ($Message.method -eq 'Network.responseReceived' -and $Message.params.type -eq 'Document' -and (Test-MainDocumentNetworkEvent -Message $Message)) {
         $script:MainDocumentRequestId = [string]$Message.params.requestId
+        $script:MainDocumentFrameId = [string]$Message.params.frameId
+        $script:MainDocumentLoaderId = [string]$Message.params.loaderId
         $script:MainDocumentStatus = [int]$Message.params.response.status
         $script:MainDocumentStatusText = [string]$Message.params.response.statusText
         return
@@ -414,7 +483,7 @@ function Update-NetworkStateFromEvent {
         $isDocumentFailure = ([string]$Message.params.type) -eq 'Document'
         $isKnownMainDocument = $script:MainDocumentRequestId -and $requestId -eq $script:MainDocumentRequestId
 
-        if ($isDocumentFailure -or $isKnownMainDocument) {
+        if ($isKnownMainDocument -or ($isDocumentFailure -and (Test-MainDocumentNetworkEvent -Message $Message))) {
             if ($requestId) {
                 $script:MainDocumentRequestId = $requestId
             }
@@ -473,6 +542,12 @@ function Update-NetworkStateFromNavigateResult {
         return
     }
 
+    if (-not [string]::IsNullOrWhiteSpace([string]$Response.result.frameId)) {
+        $script:MainDocumentFrameId = [string]$Response.result.frameId
+    }
+    if (-not [string]::IsNullOrWhiteSpace([string]$Response.result.loaderId)) {
+        $script:MainDocumentLoaderId = [string]$Response.result.loaderId
+    }
     if (-not [string]::IsNullOrWhiteSpace([string]$Response.result.errorText)) {
         $script:MainDocumentFailedText = [string]$Response.result.errorText
     }
@@ -892,18 +967,36 @@ function Wait-LearningPageReady {
 function Assert-PageLoadOk {
     param($Data)
 
+    $hasContentItemHeaderMeta = $Data.PSObject.Properties.Name -contains 'hasContentMeta' -and [bool]$Data.hasContentMeta
+    $publishedTimestamp = 0.0
+    $hasPublishedTimestamp = ($Data.PSObject.Properties.Name -contains 'publishedTimestamp') -and
+        [double]::TryParse([string]$Data.publishedTimestamp, [ref]$publishedTimestamp) -and
+        $publishedTimestamp -gt 0
+    $hasPublishedAt = ($Data.PSObject.Properties.Name -contains 'publishedAt') -and
+        -not [string]::IsNullOrWhiteSpace([string]$Data.publishedAt)
+    $hasUsableLearningDetailDate = $hasContentItemHeaderMeta -and ($hasPublishedTimestamp -or $hasPublishedAt)
+
     if (-not [string]::IsNullOrWhiteSpace($script:MainDocumentFailedText) -and $script:MainDocumentFailedText -ne 'net::ERR_ABORTED') {
-        throw "Network error: $($script:MainDocumentFailedText)"
+        if ($hasUsableLearningDetailDate) {
+            Write-Warning "Abaikan network error karena detail learning punya datetime: $($script:MainDocumentFailedText)"
+        }
+        else {
+            throw "Network error: $($script:MainDocumentFailedText)"
+        }
     }
 
     if ($null -ne $script:MainDocumentStatus -and $script:MainDocumentStatus -ge 400) {
         $statusText = if ($script:MainDocumentStatusText) { " $($script:MainDocumentStatusText)" } else { '' }
-        throw "HTTP $($script:MainDocumentStatus)$statusText"
+        if ($hasUsableLearningDetailDate) {
+            Write-Warning "Abaikan HTTP $($script:MainDocumentStatus)$statusText karena detail learning punya datetime."
+        }
+        else {
+            throw "HTTP $($script:MainDocumentStatus)$statusText"
+        }
     }
 
     $title = [string]$Data.title
     $h1 = [string]$Data.h1
-    $hasContentItemHeaderMeta = $Data.PSObject.Properties.Name -contains 'hasContentMeta' -and [bool]$Data.hasContentMeta
     if (-not $hasContentItemHeaderMeta -and "$title $h1" -match '(?i)\b(404|502|503|504|not found|bad gateway|service unavailable|gateway timeout|ERR_[A-Z_]+|DNS|refused|unreachable|can''t be reached)\b') {
         throw "Halaman terlihat error: title='$title', h1='$h1'"
     }
@@ -1525,7 +1618,7 @@ function Get-LearningPageDataInSession {
 
     Write-Host "Buka Edge: $PageUrl"
     for ($attempt = 1; $attempt -le $MaxLoadAttempts; $attempt++) {
-        Reset-NetworkState
+        Reset-NetworkState -PageUrl $PageUrl
         if ($attempt -gt 1) {
             Write-Warning "Navigasi ulang ke URL error: $PageUrl"
         }
@@ -1618,7 +1711,7 @@ function Get-LearningDetailDataInSession {
 
     Write-Host "Buka detail learning: $PageUrl"
     for ($attempt = 1; $attempt -le $MaxLoadAttempts; $attempt++) {
-        Reset-NetworkState
+        Reset-NetworkState -PageUrl $PageUrl
         if ($attempt -gt 1) {
             Write-Warning "Navigasi ulang ke URL detail learning error: $PageUrl"
         }
@@ -1955,7 +2048,7 @@ function Get-DocumentationPageDataInSession {
 
     Write-Host "Buka Edge documentation: $PageUrl"
     for ($attempt = 1; $attempt -le $MaxLoadAttempts; $attempt++) {
-        Reset-NetworkState
+        Reset-NetworkState -PageUrl $PageUrl
         if ($attempt -gt 1) {
             Write-Warning "Navigasi ulang ke URL documentation error: $PageUrl"
         }
