@@ -4,7 +4,7 @@ param(
     [int]$ParallelDownloads = 6,
     [int]$DownloadRetries = 100000,
     [int]$MaxDuration = 0,
-    [switch]$SkipYoutubeVideo
+    [switch]$SkipYoutube
 )
 
 $ErrorActionPreference = 'Stop'
@@ -1018,17 +1018,44 @@ function Get-YoutubeDurationSeconds {
     return $null
 }
 
-function Get-DownloadTaskDurationSeconds {
+function Test-DownloadDurationAllowed {
     param(
-        [object]$Task,
-        [string]$YtDlpPath
+        [string]$Kind,
+        [string]$MpdPath,
+        [string]$SourceUrl,
+        [string]$DisplayName
     )
 
-    if ($Task.Kind -eq 'youtube') {
-        return Get-YoutubeDurationSeconds -YtDlpPath $YtDlpPath -SourceUrl $Task.SourceUrl
+    if ($MaxDurationSeconds -le 0) {
+        return $true
     }
 
-    return Get-MpdDurationSeconds -MpdPath $Task.MpdPath
+    $durationSeconds = $null
+    if ($Kind -eq 'youtube') {
+        $ytDlp = Get-Command yt-dlp -ErrorAction SilentlyContinue
+        if (-not $ytDlp) {
+            Write-Warning "Cannot read YouTube duration because yt-dlp was not found, keeping entry: $DisplayName"
+            return $true
+        }
+
+        $durationSeconds = Get-YoutubeDurationSeconds -YtDlpPath $ytDlp.Source -SourceUrl $SourceUrl
+    }
+    else {
+        $durationSeconds = Get-MpdDurationSeconds -MpdPath $MpdPath
+    }
+
+    if ($null -eq $durationSeconds) {
+        Write-Warning "Cannot read duration, keeping entry: $DisplayName"
+        return $true
+    }
+
+    if ($durationSeconds -gt $MaxDurationSeconds) {
+        Write-Warning "Skipping video because duration $(Format-DurationText $durationSeconds) exceeds max $(Format-DurationText $MaxDurationSeconds): $DisplayName"
+        return $false
+    }
+
+    Write-Host "Duration OK: $DisplayName $(Format-DurationText $durationSeconds)/$(Format-DurationText $MaxDurationSeconds)"
+    return $true
 }
 
 function Get-VideoSizeText {
@@ -1151,8 +1178,7 @@ function Invoke-ParallelDownloads {
     param(
         [object[]]$Tasks,
         [int]$MaxParallel,
-        [int]$RetryLimit,
-        [int]$MaxDurationSeconds
+        [int]$RetryLimit
     )
 
     if (-not $Tasks -or $Tasks.Count -eq 0) {
@@ -1188,21 +1214,6 @@ function Invoke-ParallelDownloads {
             if ($task.Kind -ne 'youtube' -and -not (Test-Path -LiteralPath $task.MpdPath)) {
                 Write-Warning "MP4 skipped because $(Split-Path -Leaf $task.MpdPath) does not exist."
                 continue
-            }
-
-            if ($MaxDurationSeconds -gt 0 -and [int]$task.RetryCount -eq 0) {
-                $durationSeconds = Get-DownloadTaskDurationSeconds -Task $task -YtDlpPath $ytDlp.Source
-                if ($null -ne $durationSeconds) {
-                    if ($durationSeconds -gt $MaxDurationSeconds) {
-                        Write-Warning "MP4 skipped because duration $(Format-DurationText $durationSeconds) exceeds max $(Format-DurationText $MaxDurationSeconds): $(Split-Path -Leaf $task.Mp4Path)"
-                        continue
-                    }
-
-                    Write-Host "Duration OK: $(Split-Path -Leaf $task.Mp4Path) $(Format-DurationText $durationSeconds)/$(Format-DurationText $MaxDurationSeconds)"
-                }
-                else {
-                    Write-Warning "Cannot read duration, continuing download: $(Split-Path -Leaf $task.Mp4Path)"
-                }
             }
 
             $attempt = [int]$task.RetryCount + 1
@@ -1342,8 +1353,12 @@ foreach ($mhtmlFile in $mhtmlFiles) {
             continue
         }
 
-        if ($SkipYoutubeVideo) {
+        if ($SkipYoutube) {
             Write-Host "Skipping YouTube video download: $youtubeId"
+            continue
+        }
+
+        if (-not (Test-Path -LiteralPath $mp4Path) -and -not (Test-DownloadDurationAllowed -Kind 'youtube' -SourceUrl $youtubeUrl -DisplayName "$youtubeId.mp4")) {
             continue
         }
 
@@ -1420,6 +1435,10 @@ foreach ($mhtmlFile in $mhtmlFiles) {
         if (-not (Test-Path -LiteralPath $mpdPath)) {
             Write-Warning "MP4 skipped because $videoId.mpd does not exist."
         }
+        elseif (-not (Test-Path -LiteralPath $mp4Path) -and -not (Test-DownloadDurationAllowed -Kind 'mpd' -MpdPath $mpdPath -DisplayName "$videoId.mp4")) {
+            Close-OpenEmbedTabs
+            continue
+        }
         else {
             $mp4Key = $mp4Path.ToLowerInvariant()
             if (-not $queuedMp4Paths.ContainsKey($mp4Key)) {
@@ -1443,8 +1462,8 @@ foreach ($mhtmlFile in $mhtmlFiles) {
     }
 }
 
-Invoke-ParallelDownloads -Tasks $epicDownloadTasks -MaxParallel $ParallelDownloads -RetryLimit $DownloadRetries -MaxDurationSeconds $MaxDurationSeconds
-Invoke-ParallelDownloads -Tasks $youtubeDownloadTasks -MaxParallel $ParallelDownloads -RetryLimit $DownloadRetries -MaxDurationSeconds $MaxDurationSeconds
+Invoke-ParallelDownloads -Tasks $epicDownloadTasks -MaxParallel $ParallelDownloads -RetryLimit $DownloadRetries
+Invoke-ParallelDownloads -Tasks $youtubeDownloadTasks -MaxParallel $ParallelDownloads -RetryLimit $DownloadRetries
 
 foreach ($entry in $listEntries) {
     Add-MpdListEntry -MhtmlPath $entry.MhtmlPath -EmbedUrl $entry.EmbedUrl -Mp4Path $entry.Mp4Path
