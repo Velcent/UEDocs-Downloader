@@ -22,7 +22,7 @@ $ListPath = Join-Path $VideoDir 'mpd-list.tsv'
 New-Item -ItemType Directory -Force -Path $VideoDir, $HtmlDir, $MpdDir, $Mp4Dir, $OldMp4Dir | Out-Null
 
 $script:BrowserPort = $null
-$script:BrowserProfileDir = Join-Path $HtmlDir '.browser-profile'
+$script:BrowserProfileDir = Join-Path $Root '.browser-profile'
 $script:OpenEmbedTabs = @()
 
 function Convert-QuotedPrintableText {
@@ -477,6 +477,53 @@ function Get-BrowserPath {
     return $null
 }
 
+function Initialize-BrowserProfile {
+    param([string]$ProfileDir)
+
+    if (Test-Path -LiteralPath $ProfileDir) {
+        return
+    }
+
+    $defaultProfileDir = Join-Path $ProfileDir 'Default'
+    New-Item -ItemType Directory -Force -Path $defaultProfileDir | Out-Null
+
+    $preferencesPath = Join-Path $defaultProfileDir 'Preferences'
+    $localStatePath = Join-Path $ProfileDir 'Local State'
+
+    $preferences = [ordered]@{
+        background_mode = [ordered]@{
+            enabled = $false
+        }
+        browser = [ordered]@{
+            has_seen_welcome_page = $true
+        }
+        performance_tuning = [ordered]@{
+            sleeping_tabs_enabled = $false
+            tab_sleeping_enabled = $false
+            fade_sleeping_tabs_enabled = $false
+            efficiency_mode_enabled = $false
+            sleeping_tabs = [ordered]@{
+                enabled = $false
+                fade_enabled = $false
+            }
+        }
+    }
+
+    $localState = [ordered]@{
+        background_mode = [ordered]@{
+            enabled = $false
+        }
+        browser = [ordered]@{
+            enabled_labs_experiments = @()
+        }
+    }
+
+    $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
+    [System.IO.File]::WriteAllText($preferencesPath, ($preferences | ConvertTo-Json -Depth 20 -Compress), $utf8NoBom)
+    [System.IO.File]::WriteAllText($localStatePath, ($localState | ConvertTo-Json -Depth 20 -Compress), $utf8NoBom)
+    Write-Host "Initialized browser profile: $ProfileDir"
+}
+
 function Get-FreeTcpPort {
     $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 0)
     $listener.Start()
@@ -679,11 +726,15 @@ function Save-EmbedHtmlFromBrowser {
 
     if (-not $script:BrowserPort) {
         $script:BrowserPort = Get-FreeTcpPort
-        New-Item -ItemType Directory -Force -Path $script:BrowserProfileDir | Out-Null
+        Initialize-BrowserProfile -ProfileDir $script:BrowserProfileDir
 
         $arguments = @(
             "--remote-debugging-port=$($script:BrowserPort)",
             "--user-data-dir=$($script:BrowserProfileDir)",
+            '--disable-background-mode',
+            '--disable-background-timer-throttling',
+            '--disable-renderer-backgrounding',
+            '--disable-features=msSleepingTabs,msSleepingTabsAvailable,msFadeSleepingTabs,msEdgeSleepingTabs,EdgeSleepingTabs,TabFreeze,TabDiscarding,AutomaticTabDiscarding,PerformanceDetector',
             '--no-first-run',
             '--new-window',
             $Url

@@ -52,7 +52,7 @@ $BinRoot = Join-Path $AssetsRoot 'bin'
 $AssetsVideoRoot = Join-Path $AssetsRoot 'video'
 $VideoMp4Root = Join-Path $PSScriptRoot 'video\mp4'
 $ScriptRootFull = [System.IO.Path]::GetFullPath($PSScriptRoot)
-$script:BrowserProfileDir = Join-Path $AssetsRoot '.edge-profile'
+$script:BrowserProfileDir = Join-Path $ScriptRootFull '.browser-profile'
 
 function ConvertTo-TsvValue {
     param([AllowNull()][string]$Value)
@@ -1130,6 +1130,42 @@ function Get-EdgePath {
     return $null
 }
 
+function Initialize-BrowserProfile {
+    param([string]$ProfileDir)
+
+    if (Test-Path -LiteralPath $ProfileDir) {
+        return
+    }
+
+    $defaultProfileDir = Join-Path $ProfileDir 'Default'
+    New-Item -ItemType Directory -Force -Path $defaultProfileDir | Out-Null
+
+    $preferences = [ordered]@{
+        background_mode = [ordered]@{ enabled = $false }
+        browser = [ordered]@{ has_seen_welcome_page = $true }
+        performance_tuning = [ordered]@{
+            sleeping_tabs_enabled = $false
+            tab_sleeping_enabled = $false
+            fade_sleeping_tabs_enabled = $false
+            efficiency_mode_enabled = $false
+            sleeping_tabs = [ordered]@{
+                enabled = $false
+                fade_enabled = $false
+            }
+        }
+    }
+
+    $localState = [ordered]@{
+        background_mode = [ordered]@{ enabled = $false }
+        browser = [ordered]@{ enabled_labs_experiments = @() }
+    }
+
+    $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
+    [System.IO.File]::WriteAllText((Join-Path $defaultProfileDir 'Preferences'), ($preferences | ConvertTo-Json -Depth 20 -Compress), $utf8NoBom)
+    [System.IO.File]::WriteAllText((Join-Path $ProfileDir 'Local State'), ($localState | ConvertTo-Json -Depth 20 -Compress), $utf8NoBom)
+    Write-Host "Initialized browser profile: $ProfileDir"
+}
+
 function Get-FreeTcpPort {
     $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 0)
     $listener.Start()
@@ -1170,14 +1206,18 @@ function Ensure-Edge {
 
     foreach ($profileDir in @(
         $script:BrowserProfileDir,
-        (Join-Path $AssetsRoot ".edge-profile-$PID-$(Get-Date -Format 'yyyyMMddHHmmss')")
+        (Join-Path $ScriptRootFull ".browser-profile-$PID-$(Get-Date -Format 'yyyyMMddHHmmss')")
     )) {
         $script:BrowserPort = Get-FreeTcpPort
-        New-Item -ItemType Directory -Force -Path $profileDir | Out-Null
+        Initialize-BrowserProfile -ProfileDir $profileDir
 
         $arguments = @(
             "--remote-debugging-port=$($script:BrowserPort)",
             "--user-data-dir=$profileDir",
+            '--disable-background-mode',
+            '--disable-background-timer-throttling',
+            '--disable-renderer-backgrounding',
+            '--disable-features=msSleepingTabs,msSleepingTabsAvailable,msFadeSleepingTabs,msEdgeSleepingTabs,EdgeSleepingTabs,TabFreeze,TabDiscarding,AutomaticTabDiscarding,PerformanceDetector',
             '--no-first-run',
             '--new-window',
             'about:blank'
