@@ -87,16 +87,16 @@ function Get-EdgePath {
 function Initialize-BrowserProfile {
     param([string]$ProfileDir)
 
-    if (Test-Path -LiteralPath $ProfileDir) {
-        return
-    }
-
     $defaultProfileDir = Join-Path $ProfileDir 'Default'
     New-Item -ItemType Directory -Force -Path $defaultProfileDir | Out-Null
 
     $preferences = [ordered]@{
         background_mode = [ordered]@{ enabled = $false }
         browser = [ordered]@{ has_seen_welcome_page = $true }
+        download = [ordered]@{
+            directory_upgrade = $true
+            prompt_for_download = $false
+        }
         performance_tuning = [ordered]@{
             sleeping_tabs_enabled = $false
             tab_sleeping_enabled = $false
@@ -107,6 +107,7 @@ function Initialize-BrowserProfile {
                 fade_enabled = $false
             }
         }
+        plugins = [ordered]@{ always_open_pdf_externally = $true }
     }
 
     $localState = [ordered]@{
@@ -1551,6 +1552,30 @@ function Test-PdfUrl {
     }
 }
 
+function Test-PdfFileValid {
+    param([string]$Path)
+
+    if ([string]::IsNullOrWhiteSpace($Path) -or -not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        return $false
+    }
+
+    try {
+        $header = New-Object byte[] 5
+        $stream = [System.IO.File]::OpenRead($Path)
+        try {
+            $read = $stream.Read($header, 0, $header.Length)
+        }
+        finally {
+            $stream.Dispose()
+        }
+
+        return ($read -eq 5 -and [System.Text.Encoding]::ASCII.GetString($header) -eq '%PDF-')
+    }
+    catch {
+        return $false
+    }
+}
+
 function Get-CanonicalUrlKey {
     param([string]$PageUrl)
 
@@ -1694,20 +1719,38 @@ function Get-DownloadedResumeMap {
         }
 
         foreach ($row in $rows) {
+            $rowUrl = [string]$row.url
+            $rowFile = [string]$row.file
+            $isPdfRow = Test-PdfUrl -PageUrl $rowUrl
+            $rowFilePath = ''
+            if (-not [string]::IsNullOrWhiteSpace($rowFile)) {
+                try {
+                    $rowFilePath = ConvertTo-LocalPathFromListValue $rowFile
+                }
+                catch {
+                    $rowFilePath = $rowFile
+                }
+            }
+
+            if ($isPdfRow -and (-not (Test-PdfFileValid -Path $rowFilePath))) {
+                Write-Warning "PDF resume invalid, akan download ulang: $rowFile"
+                continue
+            }
+
             if (-not [string]::IsNullOrWhiteSpace([string]$row.url)) {
                 try {
-                    $urlMap[(Get-CanonicalUrlKey ([string]$row.url))] = $true
+                    $urlMap[(Get-CanonicalUrlKey $rowUrl)] = $true
                 }
                 catch {
                 }
             }
 
-            if (-not [string]::IsNullOrWhiteSpace([string]$row.file)) {
+            if (-not [string]::IsNullOrWhiteSpace($rowFile)) {
                 try {
-                    $fileMap[(ConvertTo-LocalPathFromListValue ([string]$row.file)).ToLowerInvariant()] = $true
+                    $fileMap[$rowFilePath.ToLowerInvariant()] = $true
                 }
                 catch {
-                    $fileMap[([string]$row.file).ToLowerInvariant()] = $true
+                    $fileMap[$rowFile.ToLowerInvariant()] = $true
                 }
             }
         }
@@ -2080,65 +2123,86 @@ function Save-PdfFromBrowserSession {
 
     $folder = [System.IO.Path]::GetDirectoryName($filePath)
     New-Item -ItemType Directory -Force -Path $folder | Out-Null
+    $downloadDir = Join-Path $folder (".pdf-download-$PID-{0}" -f ([Guid]::NewGuid().ToString('N')))
+    New-Item -ItemType Directory -Force -Path $downloadDir | Out-Null
 
     Write-Host ""
     Write-Host "Buka Edge PDF: $pageUrl"
 
-    Reset-NetworkState
-    $navigateResponse = Invoke-CdpCommand -Socket $Socket -Method 'Page.navigate' -Params @{ url = $pageUrl }
-    Update-NetworkStateFromNavigateResult -Response $navigateResponse
+    try {
+        [void](Invoke-CdpCommand -Socket $Socket -Method 'Page.setDownloadBehavior' -Params @{
+            behavior = 'allow'
+            downloadPath = $downloadDir
+        })
 
-    $deadline = (Get-Date).AddSeconds($PageLoadTimeoutSeconds)
-    $lastError = ''
-    while ((Get-Date) -lt $deadline) {
-        if (-not [string]::IsNullOrWhiteSpace($script:MainDocumentRequestId)) {
+        Reset-NetworkState
+        $navigateResponse = Invoke-CdpCommand -Socket $Socket -Method 'Page.navigate' -Params @{ url = $pageUrl }
+        Update-NetworkStateFromNavigateResult -Response $navigateResponse
+
+        $deadline = (Get-Date).AddSeconds($PageLoadTimeoutSeconds)
+        $downloadedPath = ''
+        while ((Get-Date) -lt $deadline) {
+            $partialFiles = @(Get-ChildItem -LiteralPath $downloadDir -File -Force -ErrorAction SilentlyContinue | Where-Object {
+                    $_.Name -match '\.(crdownload|tmp)$'
+                })
+            $completeFiles = @(Get-ChildItem -LiteralPath $downloadDir -File -Force -ErrorAction SilentlyContinue | Where-Object {
+                    $_.Name -notmatch '\.(crdownload|tmp)$'
+                } | Sort-Object LastWriteTime -Descending)
+
+            if ($completeFiles.Count -gt 0 -and $partialFiles.Count -eq 0) {
+                $candidate = $completeFiles[0].FullName
+                $sizeBefore = (Get-Item -LiteralPath $candidate).Length
+                Start-Sleep -Milliseconds 500
+                $sizeAfter = (Get-Item -LiteralPath $candidate).Length
+                if ($sizeBefore -eq $sizeAfter -and $sizeAfter -gt 0) {
+                    $downloadedPath = $candidate
+                    break
+                }
+            }
+
             try {
-                $bodyResponse = Invoke-CdpCommand -Socket $Socket -Method 'Network.getResponseBody' -Params @{
-                    requestId = $script:MainDocumentRequestId
-                }
-
-                $body = [string]$bodyResponse.result.body
-                $bytes = if ([bool]$bodyResponse.result.base64Encoded) {
-                    [Convert]::FromBase64String($body)
-                }
-                else {
-                    [System.Text.Encoding]::UTF8.GetBytes($body)
-                }
-
-                if (-not $bytes -or $bytes.Length -le 0) {
-                    throw 'Body PDF kosong.'
-                }
-
-                $tempPath = "$filePath.download"
-                [System.IO.File]::WriteAllBytes($tempPath, $bytes)
-                Move-Item -LiteralPath $tempPath -Destination $filePath -Force
-
-                Write-Host "Simpan PDF: $(ConvertTo-RelativeRootPath $filePath) ($($bytes.Length) bytes)"
-                return (New-MhtmlSaveResult `
-                    -OriginalUrl $pageUrl `
-                    -FinalUrl $pageUrl `
-                    -Title ([string]$Task.Title) `
-                    -FilePath $filePath `
-                    -Saved $true `
-                    -ChildCount ([int]$Task.ChildCount) `
-                    -ParentUrl ([string]$Task.ParentUrl) `
-                    -SourceXml ([string]$Task.SourceXml))
+                [void](Invoke-CdpCommand -Socket $Socket -Method 'Runtime.evaluate' -Params @{ expression = 'location.href'; returnByValue = $true })
             }
             catch {
-                $lastError = $_.Exception.Message
             }
+            Start-Sleep -Milliseconds 500
         }
 
+        if ([string]::IsNullOrWhiteSpace($downloadedPath)) {
+            throw "Timeout menunggu browser download PDF."
+        }
+
+        $header = New-Object byte[] 5
+        $stream = [System.IO.File]::OpenRead($downloadedPath)
         try {
-            [void](Invoke-CdpCommand -Socket $Socket -Method 'Runtime.evaluate' -Params @{ expression = 'location.href'; returnByValue = $true })
+            $read = $stream.Read($header, 0, $header.Length)
         }
-        catch {
-            $lastError = $_.Exception.Message
+        finally {
+            $stream.Dispose()
         }
-        Start-Sleep -Milliseconds 500
-    }
 
-    throw "Gagal download PDF lewat browser: $pageUrl - $lastError"
+        $headerText = [System.Text.Encoding]::ASCII.GetString($header)
+        if ($read -lt 5 -or $headerText -ne '%PDF-') {
+            throw "Hasil download bukan PDF valid: header='$headerText'"
+        }
+
+        Move-Item -LiteralPath $downloadedPath -Destination $filePath -Force
+
+        $bytes = (Get-Item -LiteralPath $filePath).Length
+        Write-Host "Simpan PDF: $(ConvertTo-RelativeRootPath $filePath) ($bytes bytes)"
+        return (New-MhtmlSaveResult `
+            -OriginalUrl $pageUrl `
+            -FinalUrl $pageUrl `
+            -Title ([string]$Task.Title) `
+            -FilePath $filePath `
+            -Saved $true `
+            -ChildCount ([int]$Task.ChildCount) `
+            -ParentUrl ([string]$Task.ParentUrl) `
+            -SourceXml ([string]$Task.SourceXml))
+    }
+    finally {
+        Remove-Item -LiteralPath $downloadDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
 }
 
 function Save-MhtmlPageInSession {
@@ -2561,6 +2625,10 @@ function Import-LocalDownloadedFiles {
 
         $filePath = [System.IO.Path]::GetFullPath([string]$task.FilePath)
         if (-not (Test-Path -LiteralPath $filePath -PathType Leaf)) {
+            continue
+        }
+        if ((Test-PdfUrl -PageUrl ([string]$task.Url)) -and (-not (Test-PdfFileValid -Path $filePath))) {
+            Write-Warning "PDF lokal invalid, tidak diadopsi ke list: $(ConvertTo-RelativeRootPath $filePath)"
             continue
         }
 
