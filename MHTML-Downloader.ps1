@@ -29,7 +29,7 @@ $MaxLoadAttempts = [Math]::Max(1, $MaxLoadAttempts)
 $ParallelPages = [Math]::Min(30, [Math]::Max(1, $ParallelPages))
 $BlockCodeParallelism = [Math]::Min(100, [Math]::Max(1, $BlockCodeParallelism))
 
-$MinimumMhtmlBytes = 150KB
+$MinimumMhtmlBytes = 650KB
 $MhtmlRoot = [System.IO.Path]::GetFullPath($MhtmlRoot)
 $script:BrowserPort = if ($WorkerMode) { $WorkerBrowserPort } else { $null }
 $script:BrowserProfileDir = Join-Path $PSScriptRoot '.browser-profile'

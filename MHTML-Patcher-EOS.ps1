@@ -1,4 +1,4 @@
-Get-ChildItem -LiteralPath .\mhtml -Filter *.mhtml -Recurse -File | ForEach-Object {
+Get-ChildItem -LiteralPath .\mhtml\EOS -Filter *.mhtml -Recurse -File | ForEach-Object {
     $path = $_.FullName
     $content = Get-Content -LiteralPath $path -Raw -ErrorAction Stop
     $content = $content -replace "=`r`n(?!`r`n)", ""
