@@ -1,7 +1,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Position = 0)]
-    [string]$TargetDir = (Join-Path $PSScriptRoot 'mhtml'),
+    [string]$TargetDir = '',
 
     [Alias('ThrottleLimit')]
     [int]$Parallel = 0,
@@ -11,11 +11,27 @@ param(
     [switch]$VerboseFiles
 )
 
+$scriptRoot = Get-Variable -Name PSScriptRoot -ValueOnly -ErrorAction SilentlyContinue
+
+if ([string]::IsNullOrWhiteSpace($scriptRoot)) {
+    $scriptPath = $MyInvocation.MyCommand.Path
+
+    if (-not [string]::IsNullOrWhiteSpace($scriptPath)) {
+        $scriptRoot = Split-Path -Parent $scriptPath
+    }
+}
+
+if ([string]::IsNullOrWhiteSpace($scriptRoot)) {
+    $scriptRoot = (Get-Location).Path
+}
+
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-if (-not [System.IO.Path]::IsPathRooted($TargetDir)) {
-    $TargetDir = Join-Path $PSScriptRoot $TargetDir
+if ([string]::IsNullOrWhiteSpace($TargetDir)) {
+    $TargetDir = Join-Path $scriptRoot 'mhtml'
+} elseif (-not [System.IO.Path]::IsPathRooted($TargetDir)) {
+    $TargetDir = Join-Path $scriptRoot $TargetDir
 }
 
 $TargetDir = [System.IO.Path]::GetFullPath($TargetDir)
