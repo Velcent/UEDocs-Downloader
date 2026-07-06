@@ -4,10 +4,9 @@ Get-ChildItem -LiteralPath .\mhtml\EOS -Filter *.mhtml -Recurse -File | ForEach-
     $content = $content -replace "=`r`n(?!`r`n)", ""
     $content = $content -replace "<!---->", ""
     $content = $content -replace "<iframe src", "<iframe allowfullscreen src"
-    $content = $content -replace '
-    (?sx)
-    <aside.*?</aside>
-    |<eos-navigation.*?</eos-navigation>
-    |<epicgames-footer.*?</epicgames-footer>', ''
+    $content = $content -replace '(?sx)
+    <aside\b.*?</aside>
+    |<eos-navigation\b.*?</eos-navigation>
+    |<epicgames-footer\b.*?</epicgames-footer>', ''
     Set-Content -LiteralPath $path -Value $content -ErrorAction Stop
 }
