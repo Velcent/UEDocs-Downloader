@@ -1213,7 +1213,7 @@ function Get-MhtmlSnippetPrepareExpression {
     const injected = injectSnippetSource(snippet, source, type, { expectedLineCount, buttonLabel });
     const filled = sourceLooksUseful(source, type);
     const lineCountOk = sourceLineCountMatches(expectedLineCount, sourceLineCount) ||
-      (type === 'blueprint' && expectedLineCount > 0 && sourceLineCount < expectedLineCount && filled) ||
+      (type === 'blueprint' && expectedLineCount > 0 && filled) ||
       (type === 'code' && expectedLineCount > 0 && sourceLineCount < expectedLineCount && expandResult.ok && filled) ||
       (type === 'code' && expectedLineCount > 0 && sourceLineCount < expectedLineCount && !expandResult.attempted && filled);
     return {
@@ -1269,7 +1269,7 @@ function Get-MhtmlSnippetPrepareExpression {
     const injected = injectSnippetSource(root, source, type, { expectedLineCount, buttonLabel });
     const filled = sourceLooksUseful(source, type);
     const lineCountOk = sourceLineCountMatches(expectedLineCount, sourceLineCount) ||
-      (type === 'blueprint' && expectedLineCount > 0 && sourceLineCount < expectedLineCount && filled) ||
+      (type === 'blueprint' && expectedLineCount > 0 && filled) ||
       (type === 'code' && expectedLineCount > 0 && sourceLineCount < expectedLineCount && expandResult.ok && filled) ||
       (type === 'code' && expectedLineCount > 0 && sourceLineCount < expectedLineCount && !expandResult.attempted && filled);
     return {
