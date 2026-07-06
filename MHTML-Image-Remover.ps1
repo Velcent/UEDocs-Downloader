@@ -100,7 +100,11 @@ $workerScript = {
         $result = [regex]::Replace($content, $partPattern, {
             param($match)
 
-            if ($match.Groups['headers'].Value -match '(?im)^Content-Type:\s*image/') {
+            $headers = $match.Groups['headers'].Value
+            $isImagePart = $headers -match '(?im)^Content-Type:\s*image/'
+            $isHttpLocation = $headers -match '(?im)^Content-Location:\s*<?https?://'
+
+            if ($isImagePart -and $isHttpLocation) {
                 $state.Removed++
                 return ''
             }
@@ -115,7 +119,7 @@ $workerScript = {
 
         return [pscustomobject]@{
             Removed = $state.Removed
-            Status = if ($state.Removed -gt 0) { "Images removed: $($state.Removed)" } else { 'Tidak ada image part' }
+            Status = if ($state.Removed -gt 0) { "HTTP images removed: $($state.Removed)" } else { 'Tidak ada HTTP image part' }
         }
     }
 
@@ -296,6 +300,6 @@ Write-Host ''
 Write-Host "Selesai."
 Write-Host "File diproses      : $fileCount"
 Write-Host "File berubah       : $changedFiles"
-Write-Host "Image part dihapus : $totalRemoved"
+Write-Host "HTTP image dihapus : $totalRemoved"
 Write-Host "Gagal              : $failedFiles"
 Write-Host "Durasi             : $($timer.Elapsed.ToString('hh\:mm\:ss'))"
