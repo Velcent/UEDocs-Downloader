@@ -4,7 +4,7 @@ param(
     [double]$PageIdleSeconds = 0.1,
     [int]$PageLoadTimeoutSeconds = 60,
     [int]$MaxLoadAttempts = 100000,
-    [int]$ParallelPages = 1,
+    [int]$ParallelPages = 4,
     [int]$BlockCodeParallelism = 10,
     [int]$MaxPages = 0,
     [switch]$Overwrite,
@@ -977,11 +977,24 @@ function Get-MhtmlSnippetPrepareExpression {
       return false;
     }
   };
+  const actionControlSelector = 'button, [role="button"], [aria-expanded="false"]';
+  const hasNavigatingHref = (el) => {
+    const link = el?.closest?.('a[href]');
+    if (!link) return false;
+    const href = (link.getAttribute('href') || '').trim();
+    return !!href && href !== '#' && !/^javascript:/i.test(href);
+  };
+  const safeActionControl = (el) => {
+    if (!el) return false;
+    if (hasNavigatingHref(el)) return false;
+    if (el.closest?.('block-callout') && !el.closest?.('block-code-snippet')) return false;
+    return true;
+  };
   const findCopyButton = (snippet) => {
     const actionRoots = Array.from(snippet.querySelectorAll('.block-code-snippet-actions, [class*="snippet-actions" i]'));
     const roots = actionRoots.length ? actionRoots : [snippet];
-    const candidates = roots.flatMap(root => Array.from(root.querySelectorAll('button, [role="button"], a')));
-    const scored = candidates.filter(visible).map(scoreCopyButton).filter(item => item.score > 0);
+    const candidates = roots.flatMap(root => Array.from(root.querySelectorAll(actionControlSelector)));
+    const scored = candidates.filter(safeActionControl).filter(visible).map(scoreCopyButton).filter(item => item.score > 0);
     scored.sort((a, b) => b.score - a.score);
     return scored[0] || null;
   };
@@ -989,12 +1002,13 @@ function Get-MhtmlSnippetPrepareExpression {
     const actionRoots = Array.from(root.querySelectorAll?.('.block-code-snippet-actions, [class*="snippet-actions" i], [class*="code-snippet" i]') || []);
     const roots = [root].concat(actionRoots);
     const seen = new Set();
-    const candidates = roots.flatMap(item => Array.from(item.querySelectorAll?.('button, [role="button"], a, [aria-expanded="false"]') || []))
+    const candidates = roots.flatMap(item => Array.from(item.querySelectorAll?.(actionControlSelector) || []))
       .filter(button => {
         if (seen.has(button)) return false;
         seen.add(button);
         return true;
       })
+      .filter(safeActionControl)
       .filter(visible)
       .map(button => ({
         button,
@@ -1064,6 +1078,7 @@ function Get-MhtmlSnippetPrepareExpression {
     return { attempted: true, ok: sourceLineCountMatches(expectedLineCount, bestLineCount), label: expand.label, source: bestSource, sourceLineCount: bestLineCount };
   };
   const sourceRootForLooseCopyButton = (button) => {
+    if (button.closest?.('block-callout')) return null;
     let node = button.parentElement;
     for (let depth = 0; node && depth < 8; depth++, node = node.parentElement) {
       if (node.closest?.('block-code-snippet')) return null;
@@ -1078,8 +1093,9 @@ function Get-MhtmlSnippetPrepareExpression {
     return null;
   };
   const findLooseCopyTargets = () => {
-    const buttons = Array.from(document.querySelectorAll('button, [role="button"], a'))
+    const buttons = Array.from(document.querySelectorAll(actionControlSelector))
       .filter(button => !button.closest?.('block-code-snippet') && !button.closest?.('pre.block-code-snippet-plain'))
+      .filter(safeActionControl)
       .filter(visible)
       .map(scoreCopyButton)
       .filter(item => item.score > 0 && (/copy/i.test(item.label) || expectedLineCountFromLabel(item.label) > 0));
