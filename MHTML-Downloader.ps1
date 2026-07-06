@@ -1186,7 +1186,8 @@ function Get-MhtmlSnippetPrepareExpression {
     const filled = sourceLooksUseful(source, type);
     const lineCountOk = sourceLineCountMatches(expectedLineCount, sourceLineCount) ||
       (type === 'blueprint' && expectedLineCount > 0 && sourceLineCount < expectedLineCount && filled) ||
-      (type === 'code' && expectedLineCount > 0 && sourceLineCount < expectedLineCount && expandResult.ok && filled);
+      (type === 'code' && expectedLineCount > 0 && sourceLineCount < expectedLineCount && expandResult.ok && filled) ||
+      (type === 'code' && expectedLineCount > 0 && sourceLineCount < expectedLineCount && !expandResult.attempted && filled);
     return {
       index,
       type,
@@ -1241,7 +1242,8 @@ function Get-MhtmlSnippetPrepareExpression {
     const filled = sourceLooksUseful(source, type);
     const lineCountOk = sourceLineCountMatches(expectedLineCount, sourceLineCount) ||
       (type === 'blueprint' && expectedLineCount > 0 && sourceLineCount < expectedLineCount && filled) ||
-      (type === 'code' && expectedLineCount > 0 && sourceLineCount < expectedLineCount && expandResult.ok && filled);
+      (type === 'code' && expectedLineCount > 0 && sourceLineCount < expectedLineCount && expandResult.ok && filled) ||
+      (type === 'code' && expectedLineCount > 0 && sourceLineCount < expectedLineCount && !expandResult.attempted && filled);
     return {
       index: offset + index,
       type,
