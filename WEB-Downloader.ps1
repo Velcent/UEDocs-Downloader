@@ -110,11 +110,12 @@ function Ensure-Browser {
             "--remote-debugging-port=$($script:BrowserPort)",
             "--user-data-dir=$profileDir",
             '--no-first-run',
+            '--start-maximized',
             '--new-window',
             'about:blank'
         )
 
-        Start-Process -FilePath $browserPath -ArgumentList $arguments | Out-Null
+        Start-Process -FilePath $browserPath -ArgumentList $arguments -WindowStyle Maximized | Out-Null
 
         try {
             Wait-DevTools -Port $script:BrowserPort

@@ -169,6 +169,12 @@ function Initialize-BrowserProfile {
     $preferences = [ordered]@{
         background_mode = [ordered]@{ enabled = $false }
         browser = [ordered]@{ has_seen_welcome_page = $true }
+        edge = [ordered]@{
+            sleeping_tabs = [ordered]@{
+                enabled = $false
+                fade_tabs = $false
+            }
+        }
         performance_tuning = [ordered]@{
             sleeping_tabs_enabled = $false
             tab_sleeping_enabled = $false
@@ -245,11 +251,12 @@ function Ensure-Edge {
             '--disable-renderer-backgrounding',
             '--disable-features=msSleepingTabs,msSleepingTabsAvailable,msFadeSleepingTabs,msEdgeSleepingTabs,EdgeSleepingTabs,TabFreeze,TabDiscarding,AutomaticTabDiscarding,PerformanceDetector',
             '--no-first-run',
+            '--start-maximized',
             '--new-window',
             'about:blank'
         )
 
-        Start-Process -FilePath $edgePath -ArgumentList $arguments -WindowStyle Hidden | Out-Null
+        Start-Process -FilePath $edgePath -ArgumentList $arguments -WindowStyle Maximized | Out-Null
         [void]$script:StartedEdgeProfileDirs.Add($profileDir)
 
         try {

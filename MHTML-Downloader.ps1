@@ -87,6 +87,10 @@ function Get-EdgePath {
 function Initialize-BrowserProfile {
     param([string]$ProfileDir)
 
+    if (Test-Path -LiteralPath $ProfileDir) {
+        return
+    }
+
     $defaultProfileDir = Join-Path $ProfileDir 'Default'
     New-Item -ItemType Directory -Force -Path $defaultProfileDir | Out-Null
 
@@ -96,6 +100,12 @@ function Initialize-BrowserProfile {
         download = [ordered]@{
             directory_upgrade = $true
             prompt_for_download = $false
+        }
+        edge = [ordered]@{
+            sleeping_tabs = [ordered]@{
+                enabled = $false
+                fade_tabs = $false
+            }
         }
         performance_tuning = [ordered]@{
             sleeping_tabs_enabled = $false
@@ -174,11 +184,12 @@ function Ensure-Edge {
             '--disable-renderer-backgrounding',
             '--disable-features=msSleepingTabs,msSleepingTabsAvailable,msFadeSleepingTabs,msEdgeSleepingTabs,EdgeSleepingTabs,TabFreeze,TabDiscarding,AutomaticTabDiscarding,PerformanceDetector',
             '--no-first-run',
+            '--start-maximized',
             '--new-window',
             'about:blank'
         )
 
-        Start-Process -FilePath $edgePath -ArgumentList $arguments -WindowStyle Hidden | Out-Null
+        Start-Process -FilePath $edgePath -ArgumentList $arguments -WindowStyle Maximized | Out-Null
 
         try {
             Wait-DevTools -Port $script:BrowserPort
