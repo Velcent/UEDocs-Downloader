@@ -109,6 +109,7 @@ function Ensure-Browser {
         $arguments = @(
             "--remote-debugging-port=$($script:BrowserPort)",
             "--user-data-dir=$profileDir",
+            '--disable-extensions',
             '--no-first-run',
             '--start-maximized',
             '--new-window',
