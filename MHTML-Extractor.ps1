@@ -806,6 +806,15 @@ function Add-AssetReference {
     }) | Out-Null
 }
 
+function Test-LocalVideoAssetLink {
+    param([string]$Link)
+
+    return (
+        -not [string]::IsNullOrWhiteSpace($Link) -and
+        $Link -match '(?i)^https://media\.local/assets/video/.+\.mp4(?:$|[?#])'
+    )
+}
+
 function Get-HttpsBackgroundUrlsFromCss {
     param(
         [string]$CssText,
@@ -860,7 +869,7 @@ function Get-AssetReferencesFromHtml {
                 foreach ($name in @('dq', 'sq', 'bare')) {
                     if ($attr.Groups[$name].Success) {
                         $link = Resolve-AssetLink -RawUrl $attr.Groups[$name].Value -BaseUrl $BaseUrl -AllowRelative
-                        if ($link) {
+                        if (Test-LocalVideoAssetLink -Link $link) {
                             Add-AssetReference -Results $results -Seen $seen -Link $link -FetchMode 'local-video' -ContentType 'video/mp4'
                         }
                         break
@@ -894,7 +903,7 @@ function Get-AssetReferencesFromHtml {
                     foreach ($name in @('dq', 'sq', 'bare')) {
                         if ($attr.Groups[$name].Success) {
                             $link = Resolve-AssetLink -RawUrl $attr.Groups[$name].Value -BaseUrl $BaseUrl -AllowRelative
-                            if ($link) {
+                            if (Test-LocalVideoAssetLink -Link $link) {
                                 Add-AssetReference -Results $results -Seen $seen -Link $link -FetchMode 'local-video' -ContentType 'video/mp4'
                             }
                             break
@@ -924,14 +933,7 @@ function Get-AssetReferencesFromHtml {
                 foreach ($name in @('dq', 'sq', 'bare')) {
                     if ($attr.Groups[$name].Success) {
                         $link = Resolve-AssetLink -RawUrl $attr.Groups[$name].Value -BaseUrl $BaseUrl -AllowRelative
-                        if (
-                            $link -and
-                            (
-                                $classValue -match '(^|\s)video-link(\s|$)' -or
-                                $link -match '(?i)^https://media\.local/(?:assets/video|video/mp4)/.+\.mp4(?:$|[?#])' -or
-                                $link -match '(?i)(?:^|/)[^/]+\.mp4(?:$|[?#])'
-                            )
-                        ) {
+                        if (Test-LocalVideoAssetLink -Link $link) {
                             Add-AssetReference -Results $results -Seen $seen -Link $link -FetchMode 'local-video' -ContentType 'video/mp4'
                         }
                         break
