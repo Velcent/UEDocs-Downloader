@@ -91,6 +91,12 @@ $DocumentationTargets = @(
         Title = 'Fortnite Documentation'
         RootUrl = 'https://dev.epicgames.com/documentation/fortnite'
         OutputPath = (Join-Path $MhtmlRoot 'Fortnite.xml')
+    },
+    [pscustomobject]@{
+        Key = 'EOS'
+        Title = 'Epic Developer Resources Documentation'
+        RootUrl = 'https://dev.epicgames.com/docs'
+        OutputPath = (Join-Path $MhtmlRoot 'EOS.xml')
     }
 )
 
@@ -711,24 +717,72 @@ function Get-DocumentationSnapshotExpression {
       return url;
     }
   };
-  const readItem = (li) => {
+  const urlKey = (href) => (href || '').replace(/[?#].*$/, '').replace(/\/$/, '').toLowerCase();
+  const readContentsItem = (li) => {
     const row = directChild(li, '.contents-table-el') || li.querySelector(':scope > .contents-table-el, :scope > div');
     const anchor = row?.querySelector('a[href]') || li.querySelector(':scope > a[href]');
     const nested = directChild(li, 'ul') || li.querySelector(':scope > ul');
     const title = normalize(anchor?.textContent || row?.textContent || '');
     const url = cleanUrl(anchor?.getAttribute('href') || '');
-    const children = nested ? readList(nested) : [];
+    const children = nested ? readContentsList(nested) : [];
     if (!title && !url && children.length === 0) return null;
     return { title: title || url, url, children };
   };
-  const readList = (ul) => Array.from(ul?.children || [])
+  const readContentsList = (ul) => Array.from(ul?.children || [])
     .filter((child) => child.matches('li'))
-    .map(readItem)
+    .map(readContentsItem)
     .filter(Boolean);
+  const getNavigationRow = (li) => directChild(li, 'div') || directChild(li, 'p') || li;
+  const getNavigationAnchor = (li) => {
+    const row = getNavigationRow(li);
+    return row?.querySelector('a[href]') || li.querySelector(':scope > a[href]');
+  };
+  const getNavigationExpander = (li) => {
+    const row = getNavigationRow(li);
+    return row?.querySelector('span') || null;
+  };
+  const getDirectNavigationList = (li) => directChild(li, 'ul') || null;
+  const isNavigationExpanderVisible = (span) => {
+    if (!span) return false;
+    const style = getComputedStyle(span);
+    if (style.display === 'none' || style.visibility === 'hidden') return false;
+    const rect = span.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0;
+  };
+  const isNavigationCollapsed = (li) => {
+    const span = getNavigationExpander(li);
+    if (!isNavigationExpanderVisible(span)) return false;
+    const nested = getDirectNavigationList(li);
+    return !nested || nested.querySelectorAll(':scope > li[data-testid="navigation-item"], :scope > li').length === 0;
+  };
+  const countNavigationExpanders = (navigationTree) => navigationTree
+    ? Array.from(navigationTree.querySelectorAll('li[data-testid="navigation-item"]')).filter(isNavigationCollapsed).length
+    : 0;
+  const readNavigationItem = (li) => {
+    const row = getNavigationRow(li);
+    const anchor = getNavigationAnchor(li);
+    const nested = getDirectNavigationList(li);
+    const title = normalize(anchor?.textContent || row?.textContent || '');
+    const url = cleanUrl(anchor?.getAttribute('href') || '');
+    const children = nested ? readNavigationList(nested) : [];
+    if (!title && !url && children.length === 0) return null;
+    return { title: title || url, url, children };
+  };
+  const readNavigationList = (ul) => Array.from(ul?.children || [])
+    .filter((child) => child.matches('li[data-testid="navigation-item"], li'))
+    .map(readNavigationItem)
+    .filter(Boolean);
+  const readNavigationTree = (navigationTree) => {
+    const list = navigationTree?.querySelector('ul');
+    const pageKey = urlKey(cleanUrl(location.href));
+    return (list ? readNavigationList(list) : [])
+      .filter((item, index) => !(index === 0 && urlKey(item.url) === pageKey));
+  };
 
   const toc = document.querySelector('table-of-contents');
   const contentsTable = toc?.querySelector('ul.contents-table') || null;
   const buttons = toc ? Array.from(toc.querySelectorAll('button.btn-expander, button[aria-label]')) : [];
+  const navigationTree = document.querySelector('aside.navigation-tree');
   const loadingSelectors = [
     'spinner',
     '.spinner',
@@ -744,8 +798,11 @@ function Get-DocumentationSnapshotExpression {
 
   const h1 = document.querySelector('h1');
   const rootTitle = normalize(h1?.textContent || document.title || location.href);
-  const items = contentsTable ? readList(contentsTable) : [];
-  const expandButtonCount = buttons.filter(isExpandButton).length;
+  const contentsItems = contentsTable ? readContentsList(contentsTable) : [];
+  const navigationItems = navigationTree ? readNavigationTree(navigationTree) : [];
+  const items = contentsItems.length > 0 ? contentsItems : navigationItems;
+  const navigationExpandButtonCount = countNavigationExpanders(navigationTree);
+  const expandButtonCount = buttons.filter(isExpandButton).length + navigationExpandButtonCount;
   const collapseButtonCount = buttons.filter(isCollapseButton).length;
 
   return JSON.stringify({
@@ -755,9 +812,12 @@ function Get-DocumentationSnapshotExpression {
     h1: rootTitle,
     hasTableOfContents: !!toc,
     hasContentsTable: !!contentsTable,
+    hasNavigationTree: !!navigationTree,
+    hasNavigationList: !!navigationTree?.querySelector('ul'),
     itemCount: items.length,
     expandButtonCount,
     collapseButtonCount,
+    navigationExpandButtonCount,
     loadingCount,
     isLoading: document.readyState !== 'complete' || loadingCount > 0,
     items
@@ -882,12 +942,37 @@ function Get-DocumentationExpandExpression {
     const label = normalize(button.getAttribute('aria-label') || button.getAttribute('title') || button.textContent || '');
     return /^expand\b/i.test(label) || /\bexpand\b/i.test(label);
   };
-  const toc = document.querySelector('table-of-contents');
-  if (!toc) {
-    return JSON.stringify({ clicked: 0, expandButtonCount: 0, hasTableOfContents: false, hasContentsTable: false });
-  }
+  const directChild = (el, selector) => Array.from(el?.children || []).find((child) => child.matches(selector)) || null;
+  const getNavigationRow = (li) => directChild(li, 'div') || directChild(li, 'p') || li;
+  const getNavigationExpander = (li) => {
+    const row = getNavigationRow(li);
+    return row?.querySelector('span') || null;
+  };
+  const getDirectNavigationList = (li) => directChild(li, 'ul') || null;
+  const isNavigationExpanderVisible = (span) => {
+    if (!span) return false;
+    const style = getComputedStyle(span);
+    if (style.display === 'none' || style.visibility === 'hidden') return false;
+    const rect = span.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0;
+  };
+  const isNavigationCollapsed = (li) => {
+    const span = getNavigationExpander(li);
+    if (!isNavigationExpanderVisible(span)) return false;
+    const nested = getDirectNavigationList(li);
+    return !nested || nested.querySelectorAll(':scope > li[data-testid="navigation-item"], :scope > li').length === 0;
+  };
+  const getNavigationExpanders = (navigationTree) => navigationTree
+    ? Array.from(navigationTree.querySelectorAll('li[data-testid="navigation-item"]'))
+      .filter(isNavigationCollapsed)
+      .map(getNavigationExpander)
+      .filter(Boolean)
+    : [];
 
-  const buttons = Array.from(toc.querySelectorAll('button.btn-expander, button[aria-label]')).filter(isExpandButton);
+  const toc = document.querySelector('table-of-contents');
+  const navigationTree = document.querySelector('aside.navigation-tree');
+
+  const buttons = toc ? Array.from(toc.querySelectorAll('button.btn-expander, button[aria-label]')).filter(isExpandButton) : [];
   let clicked = 0;
   for (const button of buttons.slice(0, $MaxClicks)) {
     try {
@@ -898,13 +983,27 @@ function Get-DocumentationExpandExpression {
     }
   }
 
-  const remaining = Array.from(toc.querySelectorAll('button.btn-expander, button[aria-label]')).filter(isExpandButton).length;
-  const contentsTable = toc.querySelector('ul.contents-table');
+  const remainingClickBudget = Math.max(0, $MaxClicks - clicked);
+  const navigationExpanders = getNavigationExpanders(navigationTree).slice(0, remainingClickBudget);
+  for (const expander of navigationExpanders) {
+    try {
+      expander.scrollIntoView({ block: 'center', inline: 'nearest' });
+      expander.click();
+      clicked++;
+    } catch (_) {
+    }
+  }
+
+  const remainingToc = toc ? Array.from(toc.querySelectorAll('button.btn-expander, button[aria-label]')).filter(isExpandButton).length : 0;
+  const remainingNavigation = getNavigationExpanders(navigationTree).length;
+  const contentsTable = toc?.querySelector('ul.contents-table') || null;
   return JSON.stringify({
     clicked,
-    expandButtonCount: Math.max(remaining - clicked, 0),
-    hasTableOfContents: true,
-    hasContentsTable: !!contentsTable
+    expandButtonCount: remainingToc + remainingNavigation,
+    hasTableOfContents: !!toc,
+    hasContentsTable: !!contentsTable,
+    hasNavigationTree: !!navigationTree,
+    hasNavigationList: !!navigationTree?.querySelector('ul')
   });
 })()
 "@
@@ -2026,7 +2125,9 @@ function Wait-DocumentationPageReady {
         $data = $json | ConvertFrom-Json
         $lastData = $data
 
-        $hasPageData = $data.hasTableOfContents -and $data.hasContentsTable -and $data.itemCount -gt 0
+        $hasContentsTableData = [bool]$data.hasTableOfContents -and [bool]$data.hasContentsTable
+        $hasNavigationTreeData = [bool]$data.hasNavigationTree -and [bool]$data.hasNavigationList
+        $hasPageData = ($hasContentsTableData -or $hasNavigationTreeData) -and $data.itemCount -gt 0
         if (-not $data.isLoading -and $hasPageData -and [int]$data.expandButtonCount -eq 0) {
             if (-not $stableSince) {
                 $stableSince = Get-Date
@@ -2045,7 +2146,8 @@ function Wait-DocumentationPageReady {
     $h1 = if ($lastData) { [string]$lastData.h1 } else { '' }
     $count = if ($lastData) { [int]$lastData.itemCount } else { 0 }
     $expandCount = if ($lastData) { [int]$lastData.expandButtonCount } else { 0 }
-    throw "Timeout load documentation attempt #${Attempt}: $PageUrl title='$title' h1='$h1' item_count=$count expand_count=$expandCount"
+    $hasNavigationTree = if ($lastData) { [bool]$lastData.hasNavigationTree } else { $false }
+    throw "Timeout load documentation attempt #${Attempt}: $PageUrl title='$title' h1='$h1' item_count=$count expand_count=$expandCount navigation_tree=$hasNavigationTree"
 }
 
 function Get-DocumentationPageDataInSession {
