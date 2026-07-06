@@ -29,7 +29,7 @@ $MaxLoadAttempts = [Math]::Max(1, $MaxLoadAttempts)
 $ParallelPages = [Math]::Min(30, [Math]::Max(1, $ParallelPages))
 $BlockCodeParallelism = [Math]::Min(100, [Math]::Max(1, $BlockCodeParallelism))
 
-$MinimumMhtmlBytes = 650KB
+$MinimumMhtmlBytes = 150KB
 $MhtmlRoot = [System.IO.Path]::GetFullPath($MhtmlRoot)
 $script:BrowserPort = if ($WorkerMode) { $WorkerBrowserPort } else { $null }
 $script:BrowserProfileDir = Join-Path $PSScriptRoot '.browser-profile'
@@ -856,6 +856,168 @@ function Get-MhtmlSwitchSelectExpression {
 "@
 }
 
+function Get-MhtmlTabDiscoveryExpression {
+    return @'
+(async () => {
+  const normalize = (value) => (value || '').replace(/\s+/g, ' ').trim();
+  const visible = (el) => {
+    if (!el) return false;
+    const style = getComputedStyle(el);
+    const rect = el.getBoundingClientRect();
+    return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
+  };
+  const labelOf = (el) => normalize(el?.innerText || el?.textContent || el?.getAttribute('aria-label') || el?.getAttribute('title') || '');
+  const getPanelId = (button, buttonIndex) => {
+    const explicit = button?.getAttribute?.('aria-controls');
+    if (explicit) return explicit;
+    const id = button?.id || '';
+    const match = id.match(/^simple-tab-(.+)$/);
+    if (match) return 'simple-tabpanel-' + match[1];
+    return 'simple-tabpanel-' + buttonIndex;
+  };
+  const getButtons = (wrapper) => {
+    const buttons = Array.from(wrapper.querySelectorAll('button.MuiButtonBase-root, button[role="tab"], [role="tab"]'));
+    return buttons
+      .filter((button, index) => buttons.indexOf(button) === index)
+      .filter(visible)
+      .filter((button, index) => button.getAttribute('role') === 'tab' || button.hasAttribute('aria-controls') || !!document.getElementById(getPanelId(button, index)));
+  };
+  const wrappers = Array.from(document.querySelectorAll('div.tabs-wrapper'));
+  const groups = [];
+  for (let wrapperIndex = 0; wrapperIndex < wrappers.length; wrapperIndex++) {
+    const labels = [];
+    const seen = new Set();
+    for (const button of getButtons(wrappers[wrapperIndex])) {
+      const label = labelOf(button);
+      if (!label || /loading/i.test(label)) continue;
+      const key = label.toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      labels.push(label);
+    }
+    if (labels.length > 0) {
+      groups.push({ index: wrapperIndex, options: labels });
+    }
+  }
+  return JSON.stringify({ hasTabs: wrappers.length > 0 || groups.length > 0, groups });
+})()
+'@
+}
+
+function Get-MhtmlTabSelectExpression {
+    param([string[]]$Options)
+
+    $json = ConvertTo-Json @($Options) -Compress
+    return (@'
+(async () => {
+  const requested = __MHTML_TAB_OPTIONS__;
+  const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+  const normalize = (value) => (value || '').replace(/\s+/g, ' ').trim();
+  const visible = (el) => {
+    if (!el) return false;
+    const style = getComputedStyle(el);
+    const rect = el.getBoundingClientRect();
+    return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0 && el.getAttribute('hidden') === null;
+  };
+  const labelOf = (el) => normalize(el?.innerText || el?.textContent || el?.getAttribute('aria-label') || el?.getAttribute('title') || '');
+  const getPanelId = (button, buttonIndex) => {
+    const explicit = button?.getAttribute?.('aria-controls');
+    if (explicit) return explicit;
+    const id = button?.id || '';
+    const match = id.match(/^simple-tab-(.+)$/);
+    if (match) return 'simple-tabpanel-' + match[1];
+    return 'simple-tabpanel-' + buttonIndex;
+  };
+  const getButtons = (wrapper) => {
+    const buttons = Array.from(wrapper.querySelectorAll('button.MuiButtonBase-root, button[role="tab"], [role="tab"]'));
+    return buttons
+      .filter((button, index) => buttons.indexOf(button) === index)
+      .filter(visible)
+      .filter((button, index) => button.getAttribute('role') === 'tab' || button.hasAttribute('aria-controls') || !!document.getElementById(getPanelId(button, index)));
+  };
+  const panelSignature = (panel) => {
+    if (!panel) return '';
+    return normalize(panel.innerText || panel.textContent || '').slice(0, 8000) + '|' + (panel.innerHTML || '').length;
+  };
+  const activePanelSignature = () => {
+    const panels = Array.from(document.querySelectorAll('div[id^="simple-tabpanel-"]'));
+    const visiblePanel = panels.find(visible) || panels.find(panel => panel.getAttribute('hidden') === null) || panels[0];
+    return panelSignature(visiblePanel);
+  };
+  const clickButton = (button) => {
+    button.scrollIntoView({ block: 'center', inline: 'nearest' });
+    button.focus?.();
+    button.dispatchEvent(new MouseEvent('pointerdown', { bubbles: true, cancelable: true, view: window }));
+    button.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, view: window }));
+    button.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true, view: window }));
+    button.click();
+  };
+  const waitForTab = async (button, panelId, beforeSignature, wasSelected) => {
+    let lastSignature = '';
+    let stableCount = 0;
+    for (let attempt = 0; attempt < 40; attempt++) {
+      const panel = panelId ? document.getElementById(panelId) : null;
+      const selected = button.getAttribute('aria-selected') === 'true' || button.classList.contains('Mui-selected');
+      const panelVisible = panel ? visible(panel) : false;
+      const signature = panelSignature(panel) || activePanelSignature();
+      if (signature === lastSignature) {
+        stableCount++;
+      }
+      else {
+        stableCount = 0;
+        lastSignature = signature;
+      }
+      if ((selected || panelVisible || wasSelected) && (wasSelected || signature !== beforeSignature || attempt >= 4) && stableCount >= 1) {
+        return { ok: true, panelId, selected, panelVisible, changed: signature !== beforeSignature };
+      }
+      await delay(150);
+    }
+    const panel = panelId ? document.getElementById(panelId) : null;
+    return {
+      ok: button.getAttribute('aria-selected') === 'true' || button.classList.contains('Mui-selected') || (panel ? visible(panel) : false),
+      panelId,
+      selected: button.getAttribute('aria-selected') === 'true' || button.classList.contains('Mui-selected'),
+      panelVisible: panel ? visible(panel) : false,
+      changed: activePanelSignature() !== beforeSignature
+    };
+  };
+
+  const wrappers = Array.from(document.querySelectorAll('div.tabs-wrapper'));
+  const selected = [];
+  for (let wrapperIndex = 0; wrapperIndex < requested.length; wrapperIndex++) {
+    const label = normalize(requested[wrapperIndex]);
+    const wrapper = wrappers[wrapperIndex];
+    if (!label || !wrapper) {
+      selected.push({ label, selected: false, panelId: '' });
+      continue;
+    }
+
+    const buttons = getButtons(wrapper);
+    const wanted = label.toLowerCase();
+    const button = buttons.find(item => labelOf(item).toLowerCase() === wanted) ||
+      buttons.find(item => labelOf(item).toLowerCase().includes(wanted));
+    if (!button) {
+      selected.push({ label, selected: false, panelId: '' });
+      continue;
+    }
+
+    const buttonIndex = buttons.indexOf(button);
+    const panelId = getPanelId(button, buttonIndex);
+    const beforeSignature = activePanelSignature();
+    const wasSelected = button.getAttribute('aria-selected') === 'true' || button.classList.contains('Mui-selected');
+    try {
+      clickButton(button);
+    }
+    catch {}
+    const waitResult = await waitForTab(button, panelId, beforeSignature, wasSelected);
+    selected.push({ label, selected: !!waitResult.ok, panelId, changed: !!waitResult.changed });
+    await delay(250);
+  }
+  return JSON.stringify({ selected });
+})()
+'@).Replace('__MHTML_TAB_OPTIONS__', $json)
+}
+
 function Get-MhtmlSnippetPrepareExpression {
     param([int]$Parallelism = 10)
 
@@ -1332,6 +1494,20 @@ function Get-SwitchOptionCombinations {
     return @($combinations)
 }
 
+function Get-CombinationOptions {
+    param($Combination)
+
+    if (-not $Combination) {
+        return @()
+    }
+
+    if ($Combination.PSObject.Properties['Options']) {
+        return @($Combination.Options | ForEach-Object { [string]$_ })
+    }
+
+    return @($Combination | ForEach-Object { [string]$_ })
+}
+
 function Get-MhtmlVariantFilePath {
     param(
         [string]$BaseFilePath,
@@ -1526,6 +1702,34 @@ function Test-LearningXmlSource {
 
     $baseName = [System.IO.Path]::GetFileNameWithoutExtension($SourceXml)
     return $baseName -in @('LearnMH', 'LearnUE', 'LearnFN')
+}
+
+function Test-EosXmlSource {
+    param([string]$SourceXml)
+
+    if ([string]::IsNullOrWhiteSpace($SourceXml)) {
+        return $false
+    }
+
+    return ([System.IO.Path]::GetFileName($SourceXml) -ieq 'EOS.xml')
+}
+
+function Test-EosTabVariantTask {
+    param($Task)
+
+    if (-not $Task) {
+        return $false
+    }
+
+    if (Test-EosXmlSource -SourceXml ([string]$Task.SourceXml)) {
+        return $true
+    }
+
+    if ([string]::IsNullOrWhiteSpace([string]$Task.SourceXml)) {
+        return ([string]$Task.Url) -match '(?i)^https://dev\.epicgames\.com/docs/api-ref/'
+    }
+
+    return $false
 }
 
 function Get-IndexedSegment {
@@ -2308,18 +2512,26 @@ function Save-MhtmlPageInSession {
                 Write-Host "Variasi block-switch-control: $($switchCombinations.Count) kombinasi"
             }
 
+            $tabGroups = @()
+            if (Test-EosTabVariantTask -Task $Task) {
+                $tabJson = Invoke-PageEval -Socket $Socket -Expression (Get-MhtmlTabDiscoveryExpression) -AwaitPromise
+                $tabData = $tabJson | ConvertFrom-Json
+                if ($tabData -and $tabData.groups) {
+                    $tabGroups = @($tabData.groups)
+                }
+            }
+            $tabCombinations = @(Get-SwitchOptionCombinations -Groups $tabGroups)
+            if ($tabCombinations.Count -gt 1 -or ($tabCombinations.Count -eq 1 -and @($tabCombinations[0].Options).Count -gt 0)) {
+                Write-Host "Variasi div.tabs-wrapper: $($tabCombinations.Count) kombinasi"
+            }
+
             $title = if ($data -and -not [string]::IsNullOrWhiteSpace([string]$data.h1)) { [string]$data.h1 } else { [string]$Task.Title }
             $finalUrl = if ($data -and -not [string]::IsNullOrWhiteSpace([string]$data.href)) { [string]$data.href } else { $pageUrl }
 
-            foreach ($combination in $switchCombinations) {
-                $options = if ($combination.PSObject.Properties['Options']) {
-                    @($combination.Options | ForEach-Object { [string]$_ })
-                }
-                else {
-                    @($combination | ForEach-Object { [string]$_ })
-                }
-                if ($options.Count -gt 0) {
-                    $selectJson = Invoke-PageEval -Socket $Socket -Expression (Get-MhtmlSwitchSelectExpression -Options $options) -AwaitPromise
+            foreach ($switchCombination in $switchCombinations) {
+                $switchOptions = @(Get-CombinationOptions -Combination $switchCombination)
+                if ($switchOptions.Count -gt 0) {
+                    $selectJson = Invoke-PageEval -Socket $Socket -Expression (Get-MhtmlSwitchSelectExpression -Options $switchOptions) -AwaitPromise
                     $selectData = $selectJson | ConvertFrom-Json
                     $failedSelections = @($selectData.selected | Where-Object { -not $_.selected })
                     if ($failedSelections.Count -gt 0) {
@@ -2327,57 +2539,70 @@ function Save-MhtmlPageInSession {
                     }
                 }
 
-                $snippetJson = Invoke-PageEval -Socket $Socket -Expression (Get-MhtmlSnippetPrepareExpression -Parallelism $BlockCodeParallelism) -AwaitPromise
-                $snippetData = $snippetJson | ConvertFrom-Json
-                if ($snippetData -and [int]$snippetData.snippetCount -gt 0) {
-                    $filledCount = @($snippetData.results | Where-Object { $_.filled }).Count
-                    $injectedCount = @($snippetData.results | Where-Object { $_.injected }).Count
-                    $typeSummary = @($snippetData.results | Group-Object type | ForEach-Object { "$($_.Name): $($_.Count)" }) -join ', '
-                    $lineCountChecked = @($snippetData.results | Where-Object { $_.expectedLineCount -gt 0 })
-                    $lineCountMatched = @($lineCountChecked | Where-Object { $_.lineCountOk }).Count
-                    $lineCountMismatch = @($lineCountChecked | Where-Object { -not $_.lineCountOk })
-                    $lineSummary = if ($lineCountChecked.Count -gt 0) { "; line sesuai tombol: $lineCountMatched/$($lineCountChecked.Count)" } else { '' }
-                    Write-Host "Snippet source textarea terisi: $filledCount/$($snippetData.snippetCount); source tertanam: $injectedCount/$($snippetData.snippetCount) ($typeSummary)$lineSummary"
-                    if ($lineCountMismatch.Count -gt 0) {
-                        $mismatchSummary = @($lineCountMismatch | Group-Object type | ForEach-Object { "$($_.Name): $($_.Count)" }) -join ', '
-                        Write-Warning "Snippet source jumlah baris tidak sesuai tombol Copy full snippet: $($lineCountMismatch.Count) ($mismatchSummary)"
-                        $mismatchDetails = @($lineCountMismatch | Select-Object -First 5 | ForEach-Object {
-                                $expandText = if ($_.PSObject.Properties['expandAttempted'] -and $_.expandAttempted) { " expand=$($_.expandOk) '$($_.expandLabel)'" } else { " expand=not-found" }
-                                "#$($_.index) $($_.type) expected=$($_.expectedLineCount) actual=$($_.sourceLineCount)${expandText}: $($_.buttonLabel)"
-                            }) -join ' | '
-                        if (-not [string]::IsNullOrWhiteSpace($mismatchDetails)) {
-                            Write-Warning "Detail snippet line mismatch: $mismatchDetails"
+                foreach ($tabCombination in $tabCombinations) {
+                    $tabOptions = @(Get-CombinationOptions -Combination $tabCombination)
+                    if ($tabOptions.Count -gt 0) {
+                        $tabSelectJson = Invoke-PageEval -Socket $Socket -Expression (Get-MhtmlTabSelectExpression -Options $tabOptions) -AwaitPromise
+                        $tabSelectData = $tabSelectJson | ConvertFrom-Json
+                        $failedTabs = @($tabSelectData.selected | Where-Object { -not $_.selected })
+                        if ($failedTabs.Count -gt 0) {
+                            Write-Warning "Sebagian tab tidak bisa dipilih: $((@($failedTabs | ForEach-Object { $_.label }) -join ', '))"
                         }
-                        throw "Snippet source jumlah baris tidak sesuai tombol Copy full snippet: $($lineCountMismatch.Count) ($mismatchSummary)"
                     }
-                }
 
-                $filePath = Get-MhtmlVariantFilePath -BaseFilePath $baseFilePath -Options $options
-                $folder = [System.IO.Path]::GetDirectoryName($filePath)
-                New-Item -ItemType Directory -Force -Path $folder | Out-Null
+                    $variantOptions = @($switchOptions) + @($tabOptions)
+                    $snippetJson = Invoke-PageEval -Socket $Socket -Expression (Get-MhtmlSnippetPrepareExpression -Parallelism $BlockCodeParallelism) -AwaitPromise
+                    $snippetData = $snippetJson | ConvertFrom-Json
+                    if ($snippetData -and [int]$snippetData.snippetCount -gt 0) {
+                        $filledCount = @($snippetData.results | Where-Object { $_.filled }).Count
+                        $injectedCount = @($snippetData.results | Where-Object { $_.injected }).Count
+                        $typeSummary = @($snippetData.results | Group-Object type | ForEach-Object { "$($_.Name): $($_.Count)" }) -join ', '
+                        $lineCountChecked = @($snippetData.results | Where-Object { $_.expectedLineCount -gt 0 })
+                        $lineCountMatched = @($lineCountChecked | Where-Object { $_.lineCountOk }).Count
+                        $lineCountMismatch = @($lineCountChecked | Where-Object { -not $_.lineCountOk })
+                        $lineSummary = if ($lineCountChecked.Count -gt 0) { "; line sesuai tombol: $lineCountMatched/$($lineCountChecked.Count)" } else { '' }
+                        Write-Host "Snippet source textarea terisi: $filledCount/$($snippetData.snippetCount); source tertanam: $injectedCount/$($snippetData.snippetCount) ($typeSummary)$lineSummary"
+                        if ($lineCountMismatch.Count -gt 0) {
+                            $mismatchSummary = @($lineCountMismatch | Group-Object type | ForEach-Object { "$($_.Name): $($_.Count)" }) -join ', '
+                            Write-Warning "Snippet source jumlah baris tidak sesuai tombol Copy full snippet: $($lineCountMismatch.Count) ($mismatchSummary)"
+                            $mismatchDetails = @($lineCountMismatch | Select-Object -First 5 | ForEach-Object {
+                                    $expandText = if ($_.PSObject.Properties['expandAttempted'] -and $_.expandAttempted) { " expand=$($_.expandOk) '$($_.expandLabel)'" } else { " expand=not-found" }
+                                    "#$($_.index) $($_.type) expected=$($_.expectedLineCount) actual=$($_.sourceLineCount)${expandText}: $($_.buttonLabel)"
+                                }) -join ' | '
+                            if (-not [string]::IsNullOrWhiteSpace($mismatchDetails)) {
+                                Write-Warning "Detail snippet line mismatch: $mismatchDetails"
+                            }
+                            throw "Snippet source jumlah baris tidak sesuai tombol Copy full snippet: $($lineCountMismatch.Count) ($mismatchSummary)"
+                        }
+                    }
 
-                if (-not $LoadImages) {
-                    [void](Invoke-PageEval -Socket $Socket -Expression (Get-MhtmlCaptureBlockerExpression))
-                }
-                $snapshot = Invoke-CdpCommand -Socket $Socket -Method 'Page.captureSnapshot' -Params @{ format = 'mhtml' }
-                $snapshotData = [string]$snapshot.result.data
-                $snapshotBytes = [System.Text.Encoding]::UTF8.GetByteCount($snapshotData)
-                if ($snapshotBytes -lt $MinimumMhtmlBytes) {
-                    throw "MHTML terlalu kecil: $snapshotBytes bytes (< $MinimumMhtmlBytes bytes)"
-                }
+                    $filePath = Get-MhtmlVariantFilePath -BaseFilePath $baseFilePath -Options $variantOptions
+                    $folder = [System.IO.Path]::GetDirectoryName($filePath)
+                    New-Item -ItemType Directory -Force -Path $folder | Out-Null
 
-                [System.IO.File]::WriteAllText($filePath, $snapshotData, [System.Text.UTF8Encoding]::new($false))
-                $saved = $true
-                [void]$results.Add((New-MhtmlSaveResult `
-                    -OriginalUrl $pageUrl `
-                    -FinalUrl $finalUrl `
-                    -Title $title `
-                    -FilePath $filePath `
-                    -Saved $true `
-                    -ChildCount ([int]$Task.ChildCount) `
-                    -ParentUrl ([string]$Task.ParentUrl) `
-                    -SourceXml ([string]$Task.SourceXml)))
-                Write-Host "Simpan MHTML: $(ConvertTo-RelativeRootPath $filePath) ($snapshotBytes bytes)"
+                    if (-not $LoadImages) {
+                        [void](Invoke-PageEval -Socket $Socket -Expression (Get-MhtmlCaptureBlockerExpression))
+                    }
+                    $snapshot = Invoke-CdpCommand -Socket $Socket -Method 'Page.captureSnapshot' -Params @{ format = 'mhtml' }
+                    $snapshotData = [string]$snapshot.result.data
+                    $snapshotBytes = [System.Text.Encoding]::UTF8.GetByteCount($snapshotData)
+                    if ($snapshotBytes -lt $MinimumMhtmlBytes) {
+                        throw "MHTML terlalu kecil: $snapshotBytes bytes (< $MinimumMhtmlBytes bytes)"
+                    }
+
+                    [System.IO.File]::WriteAllText($filePath, $snapshotData, [System.Text.UTF8Encoding]::new($false))
+                    $saved = $true
+                    [void]$results.Add((New-MhtmlSaveResult `
+                        -OriginalUrl $pageUrl `
+                        -FinalUrl $finalUrl `
+                        -Title $title `
+                        -FilePath $filePath `
+                        -Saved $true `
+                        -ChildCount ([int]$Task.ChildCount) `
+                        -ParentUrl ([string]$Task.ParentUrl) `
+                        -SourceXml ([string]$Task.SourceXml)))
+                    Write-Host "Simpan MHTML: $(ConvertTo-RelativeRootPath $filePath) ($snapshotBytes bytes)"
+                }
             }
             break
         }
