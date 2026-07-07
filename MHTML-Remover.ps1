@@ -1,12 +1,20 @@
 [CmdletBinding()]
 param(
     [string]$InputPath = '',
-    [int]$MaxSizeKB = 650,
+    [int]$MaxSizeKB,
     [switch]$WhatIf
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+
+if (-not $PSBoundParameters.ContainsKey('MaxSizeKB')) {
+    throw "Parameter -MaxSizeKB wajib diisi. Contoh: .\MHTML-Remover.bat -MaxSizeKB 650 -WhatIf"
+}
+
+if ($MaxSizeKB -le 0) {
+    throw "Parameter -MaxSizeKB harus lebih besar dari 0."
+}
 
 if (-not $InputPath) {
     $InputPath = Join-Path $PSScriptRoot 'mhtml'

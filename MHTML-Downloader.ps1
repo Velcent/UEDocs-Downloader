@@ -4,7 +4,7 @@ param(
     [double]$PageIdleSeconds = 0.1,
     [int]$PageLoadTimeoutSeconds = 60,
     [int]$MaxLoadAttempts = 100000,
-    [int]$ParallelPages = 4,
+    [int]$ParallelPages = 10,
     [int]$BlockCodeParallelism = 10,
     [int]$MaxPages = 0,
     [switch]$Overwrite,
