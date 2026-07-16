@@ -12,6 +12,26 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 $Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+$script:SkippedMissingFiles = 0
+$script:SkippedUnreadableFiles = 0
+$script:SkippedWarningLimit = 10
+
+function Write-SkippedFileWarning {
+    param(
+        [string]$Reason,
+        [string]$Path
+    )
+
+    $skippedTotal = $script:SkippedMissingFiles + $script:SkippedUnreadableFiles
+    if ($skippedTotal -le $script:SkippedWarningLimit) {
+        Write-Warning ("SKIP {0}: {1}" -f $Reason, $Path)
+        return
+    }
+
+    if ($skippedTotal -eq ($script:SkippedWarningLimit + 1)) {
+        Write-Warning 'Additional skipped file warnings suppressed.'
+    }
+}
 
 if (-not $MhtmlRoot) {
     $defaultMhtmlRoots = @(
@@ -40,6 +60,11 @@ if (-not $AssetBinRoot) {
 
 if (-not $OutputPath) {
     $OutputPath = Join-Path $PSScriptRoot 'assets\mhtml-search.tsv'
+}
+
+$outputDirectory = Split-Path -Parent $OutputPath
+if ($outputDirectory -and -not (Test-Path -LiteralPath $outputDirectory)) {
+    New-Item -ItemType Directory -Path $outputDirectory -Force | Out-Null
 }
 
 function ConvertTo-TsvValue {
@@ -104,6 +129,12 @@ function Find-UrlInText {
     $matchedTerms = New-Object System.Collections.Generic.List[string]
     $seen = @{}
 
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        $script:SkippedMissingFiles++
+        Write-SkippedFileWarning -Reason 'missing' -Path $Path
+        return $matchedTerms.ToArray()
+    }
+
     $reader = $null
     try {
         $reader = [System.IO.StreamReader]::new($Path)
@@ -127,6 +158,22 @@ function Find-UrlInText {
                 break
             }
         }
+    }
+    catch [System.IO.FileNotFoundException] {
+        $script:SkippedMissingFiles++
+        Write-SkippedFileWarning -Reason 'missing' -Path $Path
+    }
+    catch [System.IO.DirectoryNotFoundException] {
+        $script:SkippedMissingFiles++
+        Write-SkippedFileWarning -Reason 'missing' -Path $Path
+    }
+    catch [System.UnauthorizedAccessException] {
+        $script:SkippedUnreadableFiles++
+        Write-SkippedFileWarning -Reason 'unreadable' -Path $Path
+    }
+    catch [System.IO.IOException] {
+        $script:SkippedUnreadableFiles++
+        Write-SkippedFileWarning -Reason $_.Exception.Message -Path $Path
     }
     finally {
         if ($reader) {
@@ -254,4 +301,6 @@ Write-Host "Search  : $($searchTerms.Count)"
 Write-Host "Scanned : $total"
 Write-Host "Matched : $($results.Count)"
 Write-Host "Deleted : $deletedCount"
+Write-Host "Skipped missing   : $script:SkippedMissingFiles"
+Write-Host "Skipped unreadable: $script:SkippedUnreadableFiles"
 Write-Host "Output  : $OutputPath"
