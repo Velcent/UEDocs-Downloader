@@ -1,5 +1,5 @@
 param(
-    [string]$Url = 'https://dev.epicgames.com/documentation/unreal-engine/BlueprintAPI',
+    [string]$Url = 'https://dev.epicgames.com/documentation/unreal-engine/BlueprintAPI?application_version=5.8',
     [string]$OutputRoot = (Join-Path $PSScriptRoot 'mhtml\BlueprintAPI'),
     [int]$BrowserPollSeconds = 1,
     [int]$PageIdleSeconds = .1,
@@ -195,9 +195,12 @@ function Ensure-Edge {
             "--user-data-dir=$profileDir",
             '--disable-background-mode',
             '--disable-background-timer-throttling',
+            '--disable-backgrounding-occluded-windows',
+            '--disable-extensions',
             '--disable-renderer-backgrounding',
             '--disable-features=msSleepingTabs,msSleepingTabsAvailable,msFadeSleepingTabs,msEdgeSleepingTabs,EdgeSleepingTabs,TabFreeze,TabDiscarding,AutomaticTabDiscarding,PerformanceDetector',
             '--no-first-run',
+            '--start-maximized',
             '--new-window',
             'about:blank'
         )
@@ -372,7 +375,24 @@ function Assert-PageLoadOk {
         throw "Halaman terlihat error challenge: h1='$h1', size=$htmlLength bytes"
     }
 
-    if ("$title $h1" -match '(?i)\b(404|502|503|504|not found|bad gateway|service unavailable|gateway timeout|ERR_[A-Z_]+|DNS|internet|connection|refused|unreachable|timed out|can''t be reached)\b') {
+    $errorPattern = '(?i)\b(?:' +
+        '404|502|503|504' +
+        '|not\s+found' +
+        '|bad\s+gateway' +
+        '|service\s+(?:temporarily\s+)?unavailable' +
+        '|gateway\s+time[-\s]?out' +
+        '|ERR_[A-Z_]+' +
+        '|DNS_(?:PROBE|RESOLUTION|LOOKUP)[A-Z_]*' +
+        '|(?:no|lost)\s+internet' +
+        '|internet\s+(?:disconnected|not\s+available)' +
+        '|connection\s+(?:refused|reset|closed|failed|timed\s+out|error)' +
+        '|refused\s+to\s+connect' +
+        '|unreachable' +
+        '|took\s+too\s+long\s+to\s+respond' +
+        '|can(?:not|''t)\s+(?:be\s+reached|reach\s+this\s+(?:page|site))' +
+        ')\b'
+
+    if ("$title $h1" -match $errorPattern) {
         throw "Halaman terlihat error: title='$title', h1='$h1'"
     }
 }

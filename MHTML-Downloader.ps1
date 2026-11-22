@@ -41,8 +41,8 @@ $script:MainDocumentRequestId = ''
 $script:MainDocumentFrameId = ''
 $script:KnownUrlMapCache = @{}
 $script:XmlSourceFilesForLinkIndex = @()
-$script:UnrealApplicationVersionFallbacks = @('5.7', '5.6', '5.5', '5.4', '5.3')
-$script:MetaHumanApplicationVersionFallbacks = @('5.7', '5.6', '5.0-5.5')
+$script:UnrealApplicationVersionFallbacks = @('5.8', '5.7', '5.6', '5.5', '5.4', '5.3')
+$script:MetaHumanApplicationVersionFallbacks = @('5.8', '5.7', '5.6', '5.0-5.5')
 
 if ($WorkerMode) {
     if ($WorkerBrowserPort -le 0) {
@@ -181,6 +181,7 @@ function Ensure-Edge {
             "--user-data-dir=$profileDir",
             '--disable-background-mode',
             '--disable-background-timer-throttling',
+            '--disable-backgrounding-occluded-windows',
             '--disable-extensions',
             '--disable-renderer-backgrounding',
             '--disable-features=msSleepingTabs,msSleepingTabsAvailable,msFadeSleepingTabs,msEdgeSleepingTabs,EdgeSleepingTabs,TabFreeze,TabDiscarding,AutomaticTabDiscarding,PerformanceDetector',
@@ -511,7 +512,7 @@ function Get-PageUrlCandidates {
     $fallbackVersions = if ($PageUrl -match '(?i)://[^/]+/documentation/metahuman(?:/|$)') {
         @($script:MetaHumanApplicationVersionFallbacks)
     }
-    else {
+    elseif ($PageUrl -match '(?i)://[^/]+/documentation/unreal-engine(?:/|$)') {
         @($script:UnrealApplicationVersionFallbacks)
     }
 
@@ -2606,7 +2607,7 @@ function Save-MhtmlPageInSession {
         }
         catch {
             $lastErrorMessage = $_.Exception.Message
-            if ($lastErrorMessage -like 'Final URL menuju root dokumentasi versi:*') {
+            if ($lastErrorMessage -like 'Final URL menuju root dokumentasi versi:*' -or $lastErrorMessage -like 'Final URL salah:*') {
                 Write-Warning $lastErrorMessage
                 $candidateIndex++
                 if ($candidateIndex -lt $pageUrlCandidates.Count) {
