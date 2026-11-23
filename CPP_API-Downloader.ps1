@@ -383,7 +383,7 @@ function Assert-PageLoadOk {
 
     $allowPattern = '^(?i)(?:' +
         'On Connection Error' +
-        '|Get Last Multi-User Connection Error' +
+        '|.*User Connection Error' +
         ')$'
 
     $errorPattern = '(?i)\b(?:' +
