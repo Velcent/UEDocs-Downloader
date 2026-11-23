@@ -411,7 +411,7 @@ function Assert-PageLoadOk {
 # ==================== CLOUDFLARE CHALLENGE SOLVER ====================
 function Get-ChallengeConfig {
     return [pscustomobject]@{
-        Enabled             = $false
+        Enabled             = $true
         Url                 = 'https://dev.epicgames.com/documentation/404'
         ReloadMax           = 60
         PageWaitSeconds     = 8

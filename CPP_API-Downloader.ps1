@@ -2,7 +2,7 @@
     [string]$Url = 'https://dev.epicgames.com/documentation/unreal-engine/API?application_version=5.8',
     [string]$OutputRoot = (Join-Path $PSScriptRoot 'mhtml\API'),
     [int]$BrowserPollSeconds = 1,
-    [int]$PageIdleSeconds = .1,
+    [float]$PageIdleSeconds = .1,
     [int]$PageLoadTimeoutSeconds = 3000,
     [int]$MaxLoadAttempts = 100000,
     [int]$ParallelPages = 6,
@@ -210,6 +210,11 @@ function Ensure-Edge {
         try {
             Wait-DevTools -Port $script:BrowserPort
             $script:BrowserProfileDir = $profileDir
+            $firstTab = Wait-FirstPageTarget -TimeoutSeconds 15
+            if (-not $firstTab) { $firstTab = Open-DevToolsUrl 'about:blank' }
+            Save-ChallengeTargetId -TargetId ([string]$firstTab.id)
+            Set-ChallengeTabMarker -TargetId ([string]$firstTab.id)
+            Write-Host "Tab challenge siap: $($firstTab.id)"
             return
         }
         catch {
@@ -362,18 +367,24 @@ function Assert-PageLoadOk {
         throw "Network error: $($script:MainDocumentFailedText)"
     }
 
-    if ($null -ne $script:MainDocumentStatus -and $script:MainDocumentStatus -ge 400) {
-        $statusText = if ($script:MainDocumentStatusText) { " $($script:MainDocumentStatusText)" } else { '' }
-        throw "HTTP $($script:MainDocumentStatus)$statusText"
-    }
-
     $title = [string]$Data.title
     $h1 = [string]$Data.h1
     $htmlLength = if ($Data.PSObject.Properties['htmlLength']) { [int]$Data.htmlLength } else { 0 }
 
     if ($h1 -eq 'One more step' -and $htmlLength -lt 102400) {
+        [void](Resolve-CloudflareChallenge -DetectedAt ([DateTimeOffset]::UtcNow.ToUnixTimeSeconds()))
         throw "Halaman terlihat error challenge: h1='$h1', size=$htmlLength bytes"
     }
+
+    if ($null -ne $script:MainDocumentStatus -and $script:MainDocumentStatus -ge 400) {
+        $statusText = if ($script:MainDocumentStatusText) { " $($script:MainDocumentStatusText)" } else { '' }
+        throw "HTTP $($script:MainDocumentStatus)$statusText"
+    }
+
+    $allowPattern = '^(?i)(?:' +
+        'On Connection Error' +
+        '|Get Last Multi-User Connection Error' +
+        ')$'
 
     $errorPattern = '(?i)\b(?:' +
         '404|502|503|504' +
@@ -392,10 +403,588 @@ function Assert-PageLoadOk {
         '|can(?:not|''t)\s+(?:be\s+reached|reach\s+this\s+(?:page|site))' +
         ')\b'
 
-    if ("$title $h1" -match $errorPattern) {
+    if ("$h1" -notmatch $allowPattern -and "$title $h1" -match $errorPattern) {
         throw "Halaman terlihat error: title='$title', h1='$h1'"
     }
 }
+
+# ==================== CLOUDFLARE CHALLENGE SOLVER ====================
+function Get-ChallengeConfig {
+    return [pscustomobject]@{
+        Enabled             = $true
+        Url                 = 'https://dev.epicgames.com/documentation/404'
+        ReloadMax           = 60
+        PageWaitSeconds     = 8
+        SolveTimeout        = 240
+        CooldownSeconds     = 30
+        MaxClickTotal       = 12
+        ClickGapSeconds     = 2.5
+        AutoClickEnabled    = $false   # OFF
+        WarmupEnabled       = $true   # OFF dulu (mode pasif). Nyalakan kalau widget tidur.
+        FocusEmulationEnabled = $false # OFF (sinyal tidak konsisten)
+    }
+}
+
+function Get-ChallengePaths {
+    return [pscustomobject]@{
+        Tab   = Join-Path $WorkerIpcDir '.challenge-tab.json'
+        State = Join-Path $WorkerIpcDir '.challenge-state.json'
+        Lock  = Join-Path $WorkerIpcDir '.challenge.lock'
+    }
+}
+
+function Get-DevToolsTargetList {
+    if (-not $script:BrowserPort) { return @() }
+    try { return @(Invoke-RestMethod -Uri "http://127.0.0.1:$($script:BrowserPort)/json/list" -ErrorAction Stop) }
+    catch { return @() }
+}
+
+function Read-ChallengeState {
+    $default = [pscustomobject]@{ solvedAt = [int64]0; failedAt = [int64]0 }
+    $path = (Get-ChallengePaths).State
+    if (-not (Test-Path -LiteralPath $path)) { return $default }
+    try {
+        $s = Get-Content -LiteralPath $path -Raw -ErrorAction Stop | ConvertFrom-Json
+        return [pscustomobject]@{ solvedAt = [int64]$s.solvedAt; failedAt = [int64]$s.failedAt }
+    } catch { return $default }
+}
+
+function Write-ChallengeState {
+    param([int64]$SolvedAt = -1, [int64]$FailedAt = -1)
+    $path = (Get-ChallengePaths).State
+    $state = Read-ChallengeState
+    if ($SolvedAt -ge 0) { $state.solvedAt = $SolvedAt }
+    if ($FailedAt -ge 0) { $state.failedAt = $FailedAt }
+    try {
+        $tmp = "$path.$PID.tmp"
+        $state | ConvertTo-Json -Compress | Set-Content -LiteralPath $tmp -Encoding UTF8
+        Move-Item -LiteralPath $tmp -Destination $path -Force
+    } catch { }
+}
+
+function Get-ChallengeLockInfo {
+    $path = (Get-ChallengePaths).Lock
+    if (-not (Test-Path -LiteralPath $path)) { return $null }
+    try { return (Get-Content -LiteralPath $path -Raw -ErrorAction Stop | ConvertFrom-Json) }
+    catch { return $null }
+}
+
+function Enter-ChallengeLock {
+    param([int]$WaitSeconds = 0, [int]$StaleSeconds = 360)
+    $path = (Get-ChallengePaths).Lock
+    $deadline = (Get-Date).AddSeconds($WaitSeconds)
+    $staleRetries = 0
+    while ($true) {
+        try {
+            $fs = [System.IO.File]::Open($path, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::Read)
+            $info = @{ pid = $PID; startedAt = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds() } | ConvertTo-Json -Compress
+            $bytes = [System.Text.Encoding]::UTF8.GetBytes($info)
+            $fs.Write($bytes, 0, $bytes.Length); $fs.Flush()
+            return $fs
+        }
+        catch {
+            $stale = $false
+            $item = Get-Item -LiteralPath $path -ErrorAction SilentlyContinue
+            if ($item) {
+                $age = ((Get-Date) - $item.LastWriteTime).TotalSeconds
+                $info = Get-ChallengeLockInfo
+                $ownerPid = if ($info -and $info.pid) { [int]$info.pid } else { 0 }
+                $ownerAlive = $false
+                if ($ownerPid -gt 0) { $ownerAlive = [bool](Get-Process -Id $ownerPid -ErrorAction SilentlyContinue) }
+                if ($age -gt $StaleSeconds -or ($ownerPid -gt 0 -and -not $ownerAlive)) { $stale = $true }
+            }
+            if ($stale -and $staleRetries -lt 3) {
+                $staleRetries++
+                Write-Warning 'Challenge: lock basi dibersihkan.'
+                Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue
+                continue   # langsung coba ambil lagi setelah dibersihkan
+            }
+            if ((Get-Date) -ge $deadline) { return $null }
+            Start-Sleep -Milliseconds 500
+        }
+    }
+}
+
+function Exit-ChallengeLock {
+    param($Stream)
+    if ($Stream) { try { $Stream.Dispose() } catch { } }
+    Remove-Item -LiteralPath (Get-ChallengePaths).Lock -Force -ErrorAction SilentlyContinue
+}
+
+function Save-ChallengeTargetId {
+    param([string]$TargetId)
+    if ([string]::IsNullOrWhiteSpace($TargetId)) { return }
+    try {
+        @{ port = $script:BrowserPort; targetId = $TargetId } | ConvertTo-Json -Compress |
+            Set-Content -LiteralPath (Get-ChallengePaths).Tab -Encoding UTF8
+    } catch { }
+}
+
+function Get-ChallengeTargetId {
+    $targets = Get-DevToolsTargetList
+    $tabPath = (Get-ChallengePaths).Tab
+    $known = ''
+    if (Test-Path -LiteralPath $tabPath) {
+        try { $known = [string]((Get-Content -LiteralPath $tabPath -Raw | ConvertFrom-Json).targetId) } catch { }
+    }
+    if ($known -and @($targets | Where-Object { $_.id -eq $known -and $_.type -eq 'page' }).Count -gt 0) { return $known }
+    $marked = @($targets | Where-Object { $_.type -eq 'page' -and [string]$_.url -like 'about:blank#cpp-challenge*' })
+    if ($marked.Count -gt 0) { Save-ChallengeTargetId -TargetId $marked[0].id; return [string]$marked[0].id }
+    $blank = @($targets | Where-Object { $_.type -eq 'page' -and ([string]$_.url -eq 'about:blank' -or [string]::IsNullOrWhiteSpace([string]$_.url)) } | Select-Object -Last 1)
+    if ($blank.Count -gt 0) { Save-ChallengeTargetId -TargetId $blank[0].id; return [string]$blank[0].id }
+    $page = Open-DevToolsUrl 'about:blank'
+    Save-ChallengeTargetId -TargetId $page.id
+    return [string]$page.id
+}
+
+function Wait-FirstPageTarget {
+    param([int]$TimeoutSeconds = 15)
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    while ((Get-Date) -lt $deadline) {
+        $pages = @(Get-DevToolsTargetList | Where-Object { $_.type -eq 'page' })
+        if ($pages.Count -gt 0) {
+            $blank = @($pages | Where-Object { [string]$_.url -like 'about:blank*' -or [string]::IsNullOrWhiteSpace([string]$_.url) })
+            if ($blank.Count -gt 0) { return $blank[0] }
+            return $pages[0]
+        }
+        Start-Sleep -Milliseconds 300
+    }
+    return $null
+}
+
+function Set-ChallengeTabMarker {
+    param([string]$TargetId)
+    if ([string]::IsNullOrWhiteSpace($TargetId)) { return }
+    $socket = [System.Net.WebSockets.ClientWebSocket]::new()
+    try {
+        [void]$socket.ConnectAsync([Uri]"ws://127.0.0.1:$($script:BrowserPort)/devtools/page/$TargetId", [Threading.CancellationToken]::None).GetAwaiter().GetResult()
+        [void](Invoke-CdpCommand -Socket $socket -Method 'Page.navigate' -Params @{ url = 'about:blank#cpp-challenge' })
+    }
+    catch { Write-Warning "Gagal menandai tab challenge: $($_.Exception.Message)" }
+    finally { $socket.Dispose() }
+}
+
+function Get-ChallengeClickPointViaFrameTree {
+    param([System.Net.WebSockets.ClientWebSocket]$Socket)
+    try {
+        $treeResp = Invoke-CdpCommand -Socket $Socket -Method 'Page.getFrameTree'
+        $pending = New-Object System.Collections.ArrayList
+        [void]$pending.Add($treeResp.result.frameTree)
+        while ($pending.Count -gt 0) {
+            $node = $pending[0]
+            $pending.RemoveAt(0)
+            if (-not $node) { continue }
+            $frameUrl = [string]$node.frame.url
+            if ($frameUrl -match '(?i)challenges\.cloudflare\.com|cdn-cgi/challenge-platform|turnstile') {
+                try {
+                    $owner = Invoke-CdpCommand -Socket $Socket -Method 'DOM.getFrameOwner' -Params @{ frameId = [string]$node.frame.id }
+                    $backendNodeId = [int64]$owner.result.backendNodeId
+                    if ($backendNodeId -gt 0) {
+                        try { [void](Invoke-CdpCommand -Socket $Socket -Method 'DOM.scrollIntoViewIfNeeded' -Params @{ backendNodeId = $backendNodeId }) } catch { }
+                        $box = Invoke-CdpCommand -Socket $Socket -Method 'DOM.getBoxModel' -Params @{ backendNodeId = $backendNodeId }
+                        $quad = @($box.result.model.content)
+                        $width = [double]$box.result.model.width
+                        $height = [double]$box.result.model.height
+                        if ($quad.Count -ge 8 -and $width -gt 0 -and $height -gt 0) {
+                            $offset = [Math]::Min(32, [Math]::Max(20, $width * 0.1))
+                            return [pscustomobject]@{
+                                x = [double]$quad[0] + $offset
+                                y = [double]$quad[1] + $height / 2
+                                source = 'iframe-cdp'
+                                src = $frameUrl
+                            }
+                        }
+                    }
+                } catch { }
+            }
+            foreach ($child in @($node.childFrames)) { [void]$pending.Add($child) }
+        }
+    } catch { }
+    return $null
+}
+
+function New-ChallengeTabSession {
+    $targetId = Get-ChallengeTargetId
+    if ([string]::IsNullOrWhiteSpace($targetId)) { throw 'Tab challenge tidak ditemukan.' }
+    $socket = [System.Net.WebSockets.ClientWebSocket]::new()
+    [void]$socket.ConnectAsync([Uri]"ws://127.0.0.1:$($script:BrowserPort)/devtools/page/$targetId", [Threading.CancellationToken]::None).GetAwaiter().GetResult()
+    try {
+        [void](Invoke-CdpCommand -Socket $socket -Method 'Page.enable')
+        [void](Invoke-CdpCommand -Socket $socket -Method 'Runtime.enable')
+        [void](Invoke-CdpCommand -Socket $socket -Method 'DOM.enable')
+        $cfg = Get-ChallengeConfig
+        if ($cfg.FocusEmulationEnabled) {
+            [void](Invoke-CdpCommand -Socket $socket -Method 'Emulation.setFocusEmulationEnabled' -Params @{ enabled = $true })
+        }
+        try { [void](Invoke-CdpCommand -Socket $socket -Method 'Page.setWebLifecycleState' -Params @{ state = 'active' }) } catch { }
+        return [pscustomobject]@{ TargetId = $targetId; Socket = $socket }
+    }
+    catch { $socket.Dispose(); throw }
+}
+
+function Get-ChallengeProbeExpression {
+    return @'
+(() => {
+    const norm = (v) => (v || '').replace(/\s+/g, ' ').trim();
+    const visible = (el) => {
+        if (!el) return false;
+        const s = getComputedStyle(el);
+        if (s.display === 'none' || s.visibility === 'hidden' || Number(s.opacity) === 0) return false;
+        const r = el.getBoundingClientRect();
+        return r.width > 0 && r.height > 0;
+    };
+    const walk = (root, out, depth) => {
+        if (!root || depth > 12 || !root.querySelectorAll) return;
+        for (const el of root.querySelectorAll('*')) {
+            out.push(el);
+            if (el.shadowRoot) walk(el.shadowRoot, out, depth + 1);
+        }
+    };
+    const all = [];
+    walk(document, all, 0);
+    const bodyText = norm(document.body ? document.body.innerText : '');
+    const h1 = document.querySelector('h1');
+    const h1Text = norm(h1 ? h1.textContent : '');
+    const looksLikeChallenge = /one more step|just a moment|verify you are human|checking your browser|needs to review the security|enable javascript and cookies|security check to continue/i.test(document.title + ' ' + bodyText);
+    const verificationSuccessful = /verification successful/i.test(document.title + ' ' + bodyText);
+    const challengeSelector = '#challenge-form,#challenge-stage,#challenge-running,.cf-turnstile,[data-sitekey]';
+    const hasChallengeForm = !!document.querySelector(challengeSelector) ||
+        all.some((el) => el.matches && el.matches(challengeSelector));
+    const tokens = all.filter((el) => el.tagName === 'INPUT' &&
+        (/^cf-chl-widget-.*_response$/.test(el.id || '') || el.name === 'cf-turnstile-response'));
+    const token = tokens.map((el) => String(el.value || '')).find((v) => v.length > 0) || '';
+    let point = null;
+    const cb = all.find((el) => el.tagName === 'INPUT' && (el.type || '').toLowerCase() === 'checkbox' && visible(el));
+    if (cb) {
+        const r = cb.getBoundingClientRect();
+        point = { x: r.x + r.width / 2, y: r.y + r.height / 2, source: 'checkbox' };
+    }
+    if (!point) {
+        const frames = all.filter((el) => el.tagName === 'IFRAME' && visible(el));
+        const cf = frames.find((el) => /challenges\.cloudflare\.com|cdn-cgi\/challenge-platform|turnstile/i.test(el.src || ''));
+        const target = cf || (looksLikeChallenge ? frames[0] : null);
+        if (target) {
+            const r = target.getBoundingClientRect();
+            point = { x: r.x + Math.min(32, Math.max(20, r.width * 0.1)), y: r.y + r.height / 2, source: 'iframe', src: target.src || '' };
+        }
+    }
+    return JSON.stringify({
+        href: location.href,
+        readyState: document.readyState,
+        title: document.title || '',
+        h1: h1Text,
+        htmlLength: ((document.documentElement && document.documentElement.outerHTML) || '').length,
+        hasChallengeForm,
+        looksLikeChallenge,
+        verificationSuccessful,
+        token,
+        click: point
+    });
+})()
+'@
+}
+
+function Get-TurnstileWidgetState {
+    param([System.Net.WebSockets.ClientWebSocket]$Socket)
+    try {
+        $tree = Invoke-CdpCommand -Socket $Socket -Method 'Page.getFrameTree'
+        $pending = New-Object System.Collections.ArrayList
+        [void]$pending.Add($tree.result.frameTree)
+        while ($pending.Count -gt 0) {
+            $node = $pending[0]; $pending.RemoveAt(0)
+            if (-not $node) { continue }
+            $frameUrl = [string]$node.frame.url
+            if ($frameUrl -match '(?i)challenges\.cloudflare\.com|cdn-cgi/challenge-platform|turnstile') {
+                try {
+                    $owner = Invoke-CdpCommand -Socket $Socket -Method 'DOM.getFrameOwner' -Params @{ frameId = [string]$node.frame.id }
+                    $bnid = [int64]$owner.result.backendNodeId
+                    if ($bnid -gt 0) {
+                        try { [void](Invoke-CdpCommand -Socket $Socket -Method 'DOM.scrollIntoViewIfNeeded' -Params @{ backendNodeId = $bnid }) } catch { }
+                        $box = Invoke-CdpCommand -Socket $Socket -Method 'DOM.getBoxModel' -Params @{ backendNodeId = $bnid }
+                        $quad = @($box.result.model.content)
+                        $w = [double]$box.result.model.width
+                        $h = [double]$box.result.model.height
+                        if ($quad.Count -ge 8 -and $w -gt 0 -and $h -gt 0) {
+                            $ox = [double]$quad[0]; $oy = [double]$quad[1]
+                            # Cari checkbox ASLI di dalam iframe (bukan label).
+                            $inner = $null
+                            try {
+                                $world = Invoke-CdpCommand -Socket $Socket -Method 'Page.createIsolatedWorld' -Params @{ frameId = [string]$node.frame.id; worldName = 'bp_probe' }
+                                $ctx = [int]$world.result.executionContextId
+                                $expr = @'
+(() => {
+    const vis = (el) => {
+        if (!el) return null;
+        const r = el.getBoundingClientRect();
+        return (r.width > 0 && r.height > 0) ? { x: r.x, y: r.y, w: r.width, h: r.height } : null;
+    };
+    const cbs = [...document.querySelectorAll('input[type=checkbox], [role=checkbox]')];
+    for (const el of cbs) { const r = vis(el); if (r) return JSON.stringify(r); }
+    return '';
+})()
+'@
+                                $resp = Invoke-CdpCommand -Socket $Socket -Method 'Runtime.evaluate' -Params @{ expression = $expr; contextId = $ctx; returnByValue = $true }
+                                $val = [string]$resp.result.result.value
+                                if ($val) { $inner = $val | ConvertFrom-Json }
+                            } catch { }
+                            $hasCheckbox = $false; $cx = 0.0; $cy = 0.0; $source = ''
+                            if ($inner) {
+                                $hasCheckbox = $true
+                                $cx = $ox + [double]$inner.x + [double]$inner.w / 2
+                                $cy = $oy + [double]$inner.y + [double]$inner.h / 2
+                                $source = 'checkbox-iframe'
+                            }
+                            elseif ($w -ge 250 -and $h -ge 50) {
+                                # Widget penuh = checkbox sudah render walau input tak terbaca.
+                                $hasCheckbox = $true
+                                $cx = $ox + [Math]::Min(32, [Math]::Max(20, $w * 0.1))
+                                $cy = $oy + $h / 2
+                                $source = 'widget-size'
+                            }
+                            # else: widget masih label kecil -> HasCheckbox false, warmup saja.
+                            return [pscustomobject]@{
+                                FrameX = $ox; FrameY = $oy; FrameW = $w; FrameH = $h
+                                HasCheckbox = $hasCheckbox
+                                ClickX = $cx; ClickY = $cy
+                                Source = $source
+                            }
+                        }
+                    }
+                } catch { }
+            }
+            foreach ($child in @($node.childFrames)) { [void]$pending.Add($child) }
+        }
+    } catch { }
+    return $null
+}
+
+function Invoke-TrustedMouseClick {
+    param([System.Net.WebSockets.ClientWebSocket]$Socket, [double]$X, [double]$Y)
+    [void](Invoke-CdpCommand -Socket $Socket -Method 'Input.dispatchMouseEvent' -Params @{ type = 'mouseMoved'; x = $X; y = $Y; button = 'none'; buttons = 0 })
+    Start-Sleep -Milliseconds (Get-Random -Minimum 60 -Maximum 160)
+    [void](Invoke-CdpCommand -Socket $Socket -Method 'Input.dispatchMouseEvent' -Params @{ type = 'mousePressed'; x = $X; y = $Y; button = 'left'; buttons = 1; clickCount = 1 })
+    Start-Sleep -Milliseconds (Get-Random -Minimum 50 -Maximum 130)
+    [void](Invoke-CdpCommand -Socket $Socket -Method 'Input.dispatchMouseEvent' -Params @{ type = 'mouseReleased'; x = $X; y = $Y; button = 'left'; buttons = 0; clickCount = 1 })
+}
+
+function Invoke-ChallengeMouseWarmup {
+    param([System.Net.WebSockets.ClientWebSocket]$Socket, [double]$X = 0, [double]$Y = 0)
+    $targetX = if ($X -gt 0) { $X } else { 480 + (Get-Random -Minimum -60 -Maximum 60) }
+    $targetY = if ($Y -gt 0) { $Y } else { 320 + (Get-Random -Minimum -40 -Maximum 40) }
+    $startX = $targetX + (Get-Random -Minimum 140 -Maximum 320)
+    $startY = $targetY + (Get-Random -Minimum 60 -Maximum 160)
+    $steps = Get-Random -Minimum 5 -Maximum 10
+    for ($i = 1; $i -le $steps; $i++) {
+        $t = $i / $steps
+        $x = $startX + ($targetX - $startX) * $t + (Get-Random -Minimum -5 -Maximum 6)
+        $y = $startY + ($targetY - $startY) * $t + (Get-Random -Minimum -4 -Maximum 5)
+        [void](Invoke-CdpCommand -Socket $Socket -Method 'Input.dispatchMouseEvent' -Params @{
+            type = 'mouseMoved'; x = $x; y = $y; button = 'none'; buttons = 0
+        })
+        Start-Sleep -Milliseconds (Get-Random -Minimum 30 -Maximum 110)
+    }
+}
+
+function Get-ClearanceCookieValue {
+    param([System.Net.WebSockets.ClientWebSocket]$Socket, [string]$ProbeUrl)
+    try {
+        $resp = Invoke-CdpCommand -Socket $Socket -Method 'Network.getCookies' -Params @{ urls = @($ProbeUrl) }
+        $cookie = @($resp.result.cookies | Where-Object { $_.name -eq 'cf_clearance' }) | Select-Object -First 1
+        if ($cookie) { return [string]$cookie.value }
+    } catch { }
+    return ''
+}
+
+function Invoke-CloudflareChallengeLoop {
+    param([System.Net.WebSockets.ClientWebSocket]$Socket, $Config)
+
+    $expression   = Get-ChallengeProbeExpression
+    $cookieBefore = Get-ClearanceCookieValue -Socket $Socket -ProbeUrl $Config.Url
+    $deadline     = (Get-Date).AddSeconds($Config.SolveTimeout)
+
+    $sawChallenge = $false
+    $cleanStreak  = 0
+    $clickCount   = 0
+    $lastClickAt  = [datetime]::MinValue
+    $lastWarmupAt = [datetime]::MinValue
+    $lastFrontAt  = [datetime]::MinValue
+    $reloadCount  = 0
+    $tokenLogged  = $false
+    $navigated    = $false
+    $loadDeadline = [datetime]::MinValue
+
+    while ((Get-Date) -lt $deadline) {
+        if (-not $navigated) {
+            # [void](Invoke-CdpCommand -Socket $Socket -Method 'Page.bringToFront')
+            Write-Host "Challenge: buka $($Config.Url)"
+            [void](Invoke-CdpCommand -Socket $Socket -Method 'Page.navigate' -Params @{ url = $Config.Url })
+            $navigated    = $true
+            $lastFrontAt  = Get-Date
+            $loadDeadline = (Get-Date).AddSeconds($Config.PageWaitSeconds)
+        }
+        elseif (-not $sawChallenge -and (Get-Date) -ge $loadDeadline) {
+            if ($reloadCount -ge $Config.ReloadMax) {
+                Write-Warning "Challenge: reload max, h1 'One more step' tidak muncul juga."
+                break
+            }
+            $reloadCount++
+            $cleanStreak = 0
+            Write-Host "Challenge: reload ke-$reloadCount (h1 'One more step' belum muncul)"
+            [void](Invoke-CdpCommand -Socket $Socket -Method 'Page.reload' -Params @{ ignoreCache = $true })
+            $loadDeadline = (Get-Date).AddSeconds($Config.PageWaitSeconds)
+        }
+
+        Start-Sleep -Milliseconds 800
+
+        try { $probe = (Invoke-PageEval -Socket $Socket -Expression $expression) | ConvertFrom-Json }
+        catch { continue }
+
+        if ([bool]$probe.verificationSuccessful) {
+            Write-Host 'Challenge: "Verification successful" muncul -> selesai.'
+            return $true
+        }
+
+        $h1 = [string]$probe.h1
+        $isChallenge = ($h1 -match '(?i)one more step') -or
+            [bool]$probe.looksLikeChallenge -or
+            [bool]$probe.hasChallengeForm -or
+            ($null -ne $probe.click)
+
+        if ($isChallenge) {
+            if (-not $sawChallenge) {
+                Write-Host "Challenge: h1 '$h1' muncul -> STOP reload, mode pasif (klik/warmup/focus-emulation OFF)."
+            }
+            $sawChallenge = $true
+            $cleanStreak  = 0
+
+            $cookieNow = Get-ClearanceCookieValue -Socket $Socket -ProbeUrl $Config.Url
+            if ($cookieNow -and $cookieNow -ne $cookieBefore) {
+                Write-Host 'Challenge: cf_clearance baru terbit -> selesai.'
+                return $true
+            }
+
+            if (-not [string]::IsNullOrWhiteSpace([string]$probe.token)) {
+                if (-not $tokenLogged) { Write-Host 'Challenge: token Turnstile terisi, tunggu submit...'; $tokenLogged = $true }
+                continue
+            }
+
+            # Jaga tab tetap terlihat TANPA input sintetis.
+            if (((Get-Date) - $lastFrontAt).TotalSeconds -ge 2) {
+                # [void](Invoke-CdpCommand -Socket $Socket -Method 'Page.bringToFront')
+                $lastFrontAt = Get-Date
+            }
+
+            # Warmup opsional, arah MENJAUH dari widget (di atasnya), bukan di atas iframe.
+            if ($Config.WarmupEnabled -and ((Get-Date) - $lastWarmupAt).TotalSeconds -ge 1.5) {
+                $widget = $null
+                if (Get-Command Get-TurnstileWidgetState -ErrorAction SilentlyContinue) {
+                    $widget = Get-TurnstileWidgetState -Socket $Socket
+                }
+                $tx = 480 + (Get-Random -Minimum -60 -Maximum 60)
+                $ty = 120 + (Get-Random -Minimum -30 -Maximum 30)
+                if ($widget) {
+                    $tx = $widget.FrameX + $widget.FrameW / 2
+                    $ty = [Math]::Max(40, $widget.FrameY - 120)
+                }
+                Invoke-ChallengeMouseWarmup -Socket $Socket -X $tx -Y $ty
+                $lastWarmupAt = Get-Date
+            }
+
+            if ($Config.AutoClickEnabled) {
+                $widget = $null
+                if (Get-Command Get-TurnstileWidgetState -ErrorAction SilentlyContinue) {
+                    $widget = Get-TurnstileWidgetState -Socket $Socket
+                }
+                $clickX = $null; $clickY = $null; $clickSource = ''
+                if ($widget -and $widget.HasCheckbox) {
+                    $clickX = $widget.ClickX; $clickY = $widget.ClickY; $clickSource = $widget.Source
+                }
+                elseif ($probe.click -and [string]$probe.click.source -eq 'checkbox') {
+                    $clickX = [double]$probe.click.x; $clickY = [double]$probe.click.y; $clickSource = 'checkbox'
+                }
+                if ($null -ne $clickX -and $clickCount -lt $Config.MaxClickTotal -and
+                    ((Get-Date) - $lastClickAt).TotalSeconds -ge $Config.ClickGapSeconds) {
+                    Invoke-TrustedMouseClick -Socket $Socket -X ($clickX + (Get-Random -Minimum -2 -Maximum 3)) -Y ($clickY + (Get-Random -Minimum -2 -Maximum 3))
+                    $clickCount++
+                    $lastClickAt = Get-Date
+                    Write-Host ("Challenge: left-click ({0}) ke-{1}" -f $clickSource, $clickCount)
+                }
+            }
+            continue
+        }
+
+        if ($sawChallenge) {
+            # h1 hilang setelah verifikasi -> selesai (TANPA syarat htmlLength).
+            if ([string]$probe.readyState -ne 'complete') { continue }
+            $cleanStreak++
+            if ($cleanStreak -ge 2) {
+                Write-Host "Challenge: h1 'One more step' hilang (h1='$h1') -> selesai."
+                return $true
+            }
+            continue
+        }
+
+        if ([string]$probe.readyState -eq 'complete') {
+            if (Get-ClearanceCookieValue -Socket $Socket -ProbeUrl $Config.Url) {
+                Write-Host 'Challenge: halaman normal & clearance ada -> sudah terverifikasi.'
+                return $true
+            }
+            $cleanStreak++
+            if ($cleanStreak -ge 3) { $loadDeadline = [datetime]::MinValue }
+        }
+    }
+    return $false
+}
+
+function Resolve-CloudflareChallenge {
+    param([int64]$DetectedAt = 0)
+    $cfg = Get-ChallengeConfig
+    if (-not $cfg.Enabled -or -not $script:BrowserPort) { return $false }
+    if ($DetectedAt -le 0) { $DetectedAt = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds() }
+    $state = Read-ChallengeState
+    if ($state.solvedAt -gt $DetectedAt) {
+        Write-Host 'Challenge: sudah diselesaikan worker lain, skip.'
+        return $true
+    }
+    $now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+    if ($state.failedAt -gt 0 -and ($now - $state.failedAt) -lt $cfg.CooldownSeconds) { return $false }
+
+    # Non-blocking: kalau sedang diverifikasi proses lain, langsung skip.
+    $lock = Enter-ChallengeLock -WaitSeconds 0 -StaleSeconds ($cfg.SolveTimeout + 120)
+    if (-not $lock) {
+        $lockInfo = Get-ChallengeLockInfo
+        $ownerPid = if ($lockInfo -and $lockInfo.pid) { [int]$lockInfo.pid } else { 0 }
+        if ($ownerPid -gt 0) {
+            Write-Host "Challenge: sedang diverifikasi PID $ownerPid -> skip, retry nanti."
+        }
+        return $false
+    }
+
+    $session = $null
+    try {
+        $state = Read-ChallengeState
+        if ($state.solvedAt -gt $DetectedAt) { Write-Host 'Challenge: keburu beres dari worker lain.'; return $true }
+        $session = New-ChallengeTabSession
+        $ok = Invoke-CloudflareChallengeLoop -Socket $session.Socket -Config $cfg
+        $stamp = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+        if ($ok) {
+            Write-ChallengeState -SolvedAt $stamp -FailedAt 0
+            Write-Host 'Challenge: beres, lanjut download.'
+        }
+        else {
+            Write-ChallengeState -FailedAt $stamp
+            Write-Warning "Challenge: belum lolos. Bisa centang manual di tab yang disorot: $($cfg.Url)"
+        }
+        return $ok
+    }
+    catch { Write-Warning "Challenge solver error: $($_.Exception.Message)"; return $false }
+    finally {
+        if ($session -and $session.Socket) { $session.Socket.Dispose() }
+        Exit-ChallengeLock -Stream $lock
+        Reset-NetworkState
+    }
+}
+# ================== AKHIR CLOUDFLARE CHALLENGE SOLVER ==================
 
 function Get-CPPSnapshotExpression {
     return @'
@@ -1847,7 +2436,7 @@ function Start-PageWorkerJob {
             [int]$Id,
             [string]$IpcDir,
             [int]$BrowserPollSeconds,
-            [int]$PageIdleSeconds,
+            [float]$PageIdleSeconds,
             [int]$PageLoadTimeoutSeconds,
             [int]$MaxLoadAttempts,
             [bool]$OverwriteFlag
