@@ -409,98 +409,9 @@ function Assert-PageLoadOk {
 }
 
 # ==================== CLOUDFLARE CHALLENGE SOLVER ====================
-if (-not ('Win32.NativeInput' -as [type])) {
-    Add-Type -Namespace Win32 -Name NativeInput -MemberDefinition @'
-[StructLayout(LayoutKind.Sequential)] public struct POINT { public int X; public int Y; }
-[StructLayout(LayoutKind.Sequential)] public struct MOUSEINPUT { public int dx; public int dy; public uint mouseData; public uint dwFlags; public uint time; public IntPtr dwExtraInfo; }
-[StructLayout(LayoutKind.Sequential)] public struct KEYBDINPUT { public ushort wVk; public ushort wScan; public uint dwFlags; public uint time; public IntPtr dwExtraInfo; }
-[StructLayout(LayoutKind.Explicit)] public struct INPUTUNION { [FieldOffset(0)] public MOUSEINPUT mi; [FieldOffset(0)] public KEYBDINPUT ki; }
-[StructLayout(LayoutKind.Sequential)] public struct INPUT { public uint type; public INPUTUNION U; }
-[DllImport("user32.dll", SetLastError=true)] public static extern uint SendInput(uint nInputs, INPUT[] pInputs, int cbSize);
-[DllImport("user32.dll")] public static extern int GetSystemMetrics(int nIndex);
-[DllImport("user32.dll")] public static extern bool GetCursorPos(out POINT lpPoint);
-[DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
-[DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
-[DllImport("user32.dll")] public static extern IntPtr FindWindowEx(IntPtr parent, IntPtr after, string cls, string title);
-[DllImport("user32.dll")] public static extern bool ClientToScreen(IntPtr hWnd, ref POINT lpPoint);
-[DllImport("user32.dll")] public static extern uint GetDpiForWindow(IntPtr hWnd);
-'@
-}
-$script:InputSize = [System.Runtime.InteropServices.Marshal]::SizeOf([type][Win32.NativeInput+INPUT])
-
-function Send-RealMouseMove {
-    param([int]$X, [int]$Y)
-    $vsX = [Win32.NativeInput]::GetSystemMetrics(76); $vsY = [Win32.NativeInput]::GetSystemMetrics(77)
-    $vsW = [Win32.NativeInput]::GetSystemMetrics(78); $vsH = [Win32.NativeInput]::GetSystemMetrics(79)
-    $inp = New-Object Win32.NativeInput+INPUT
-    $inp.type = 0
-    $inp.U.mi.dx = [int](($X - $vsX) * 65535.0 / [Math]::Max(1, $vsW - 1))
-    $inp.U.mi.dy = [int](($Y - $vsY) * 65535.0 / [Math]::Max(1, $vsH - 1))
-    $inp.U.mi.dwFlags = 0x0001 -bor 0x8000   # MOVE | ABSOLUTE
-    [void][Win32.NativeInput]::SendInput(1, @($inp), $script:InputSize)
-}
-
-function Send-RealMousePath {
-    param([int]$ToX, [int]$ToY)
-    $cur = New-Object Win32.NativeInput+POINT
-    [void][Win32.NativeInput]::GetCursorPos([ref]$cur)
-    $steps = Get-Random -Minimum 12 -Maximum 26
-    for ($i = 1; $i -le $steps; $i++) {
-        $t = $i / $steps
-        $ease = $t * $t * (3 - 2 * $t)   # smoothstep, bukan linier
-        $x = $cur.X + ($ToX - $cur.X) * $ease + (Get-Random -Minimum -3 -Maximum 4)
-        $y = $cur.Y + ($ToY - $cur.Y) * $ease + (Get-Random -Minimum -2 -Maximum 3)
-        Send-RealMouseMove -X [int]$x -Y [int]$y
-        Start-Sleep -Milliseconds (Get-Random -Minimum 8 -Maximum 30)
-    }
-}
-
-function Send-RealKey {
-    param([ushort]$Vk, [bool]$Ctrl = $false)
-    $list = New-Object System.Collections.Generic.List[Win32.NativeInput+INPUT]
-    $mk = { param($vk, $up) $i = New-Object Win32.NativeInput+INPUT; $i.type = 1; $i.U.ki.wVk = $vk; if ($up) { $i.U.ki.dwFlags = 2 }; $i }
-    if ($Ctrl) { $list.Add((& $mk 0x11 $false)) }
-    $list.Add((& $mk $Vk $false)); $list.Add((& $mk $Vk $true))
-    if ($Ctrl) { $list.Add((& $mk 0x11 $true)) }
-    [void][Win32.NativeInput]::SendInput([uint]$list.Count, $list.ToArray(), $script:InputSize)
-}
-
-function Send-RealReload { Send-RealKey -Vk 0x74 }   # F5 asli (ada user-activation)
-
-function Get-ScriptEdgeWindowHandle {
-    $profile = $script:BrowserProfileDir
-    $proc = Get-CimInstance Win32_Process -Filter "Name='msedge.exe'" |
-        Where-Object { $_.CommandLine -like "*--user-data-dir=$profile*" -and $_.CommandLine -like '*--remote-debugging-port*' } |
-        Select-Object -First 1
-    if (-not $proc) { return [IntPtr]::Zero }
-    $p = Get-Process -Id $proc.ProcessId -ErrorAction SilentlyContinue
-    if ($p) { return $p.MainWindowHandle }
-    return [IntPtr]::Zero
-}
-
-function Set-EdgeForeground {
-    $hwnd = Get-ScriptEdgeWindowHandle
-    if ($hwnd -ne [IntPtr]::Zero) {
-        [void][Win32.NativeInput]::ShowWindow($hwnd, 9)   # SW_RESTORE
-        [void][Win32.NativeInput]::SetForegroundWindow($hwnd)
-    }
-}
-
-function Get-ViewportScreenOrigin {
-    $hwnd = Get-ScriptEdgeWindowHandle
-    if ($hwnd -eq [IntPtr]::Zero) { return $null }
-    $render = [Win32.NativeInput]::FindWindowEx($hwnd, [IntPtr]::Zero, 'Chrome_RenderWidgetHostHWND', $null)
-    if ($render -eq [IntPtr]::Zero) { return $null }
-    $pt = New-Object Win32.NativeInput+POINT
-    [void][Win32.NativeInput]::ClientToScreen($render, [ref]$pt)
-    $dpi = [Win32.NativeInput]::GetDpiForWindow($render)
-    $scale = if ($dpi -gt 0) { $dpi / 96.0 } else { 1.0 }
-    return [pscustomobject]@{ X = $pt.X; Y = $pt.Y; Scale = $scale }
-}
-
 function Get-ChallengeConfig {
     return [pscustomobject]@{
-        Enabled             = $true
+        Enabled             = $false
         Url                 = 'https://dev.epicgames.com/documentation/404'
         ReloadMax           = 60
         PageWaitSeconds     = 8
@@ -508,9 +419,9 @@ function Get-ChallengeConfig {
         CooldownSeconds     = 30
         MaxClickTotal       = 12
         ClickGapSeconds     = 2.5
-        AutoClickEnabled    = $false
-        WarmupEnabled       = $true
-        FocusEmulationEnabled = $false
+        AutoClickEnabled    = $false   # OFF
+        WarmupEnabled       = $true   # OFF dulu (mode pasif). Nyalakan kalau widget tidur.
+        FocusEmulationEnabled = $false # OFF (sinyal tidak konsisten)
     }
 }
 
@@ -904,7 +815,7 @@ function Invoke-CloudflareChallengeLoop {
 
     while ((Get-Date) -lt $deadline) {
         if (-not $navigated) {
-            [void](Invoke-CdpCommand -Socket $Socket -Method 'Page.bringToFront')
+            # [void](Invoke-CdpCommand -Socket $Socket -Method 'Page.bringToFront')
             Write-Host "Challenge: buka $($Config.Url)"
             [void](Invoke-CdpCommand -Socket $Socket -Method 'Page.navigate' -Params @{ url = $Config.Url })
             $navigated    = $true
@@ -919,9 +830,7 @@ function Invoke-CloudflareChallengeLoop {
             $reloadCount++
             $cleanStreak = 0
             Write-Host "Challenge: reload ke-$reloadCount (h1 'One more step' belum muncul)"
-            # [void](Invoke-CdpCommand -Socket $Socket -Method 'Page.reload' -Params @{ ignoreCache = $true })
-            Set-EdgeForeground
-            Send-RealReload
+            [void](Invoke-CdpCommand -Socket $Socket -Method 'Page.reload' -Params @{ ignoreCache = $true })
             $loadDeadline = (Get-Date).AddSeconds($Config.PageWaitSeconds)
         }
 
@@ -967,24 +876,17 @@ function Invoke-CloudflareChallengeLoop {
 
             # Warmup opsional, arah MENJAUH dari widget (di atasnya), bukan di atas iframe.
             if ($Config.WarmupEnabled -and ((Get-Date) - $lastWarmupAt).TotalSeconds -ge 1.5) {
-                # $widget = $null
-                # if (Get-Command Get-TurnstileWidgetState -ErrorAction SilentlyContinue) {
-                #     $widget = Get-TurnstileWidgetState -Socket $Socket
-                # }
-                # $tx = 480 + (Get-Random -Minimum -60 -Maximum 60)
-                # $ty = 120 + (Get-Random -Minimum -30 -Maximum 30)
-                # if ($widget) {
-                #     $tx = $widget.FrameX + $widget.FrameW / 2
-                #     $ty = [Math]::Max(40, $widget.FrameY - 120)
-                # }
-                # Invoke-ChallengeMouseWarmup -Socket $Socket -X $tx -Y $ty
-                $origin = Get-ViewportScreenOrigin
-                if ($origin) {
-                    Set-EdgeForeground
-                    $cssX = 480 + (Get-Random -Minimum -60 -Maximum 60)
-                    $cssY = 120 + (Get-Random -Minimum -30 -Maximum 30)
-                    Send-RealMousePath -ToX [int]($origin.X + $cssX * $origin.Scale) -ToY [int]($origin.Y + $cssY * $origin.Scale)
+                $widget = $null
+                if (Get-Command Get-TurnstileWidgetState -ErrorAction SilentlyContinue) {
+                    $widget = Get-TurnstileWidgetState -Socket $Socket
                 }
+                $tx = 480 + (Get-Random -Minimum -60 -Maximum 60)
+                $ty = 120 + (Get-Random -Minimum -30 -Maximum 30)
+                if ($widget) {
+                    $tx = $widget.FrameX + $widget.FrameW / 2
+                    $ty = [Math]::Max(40, $widget.FrameY - 120)
+                }
+                Invoke-ChallengeMouseWarmup -Socket $Socket -X $tx -Y $ty
                 $lastWarmupAt = Get-Date
             }
 
