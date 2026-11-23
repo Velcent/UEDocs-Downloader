@@ -381,6 +381,11 @@ function Assert-PageLoadOk {
         throw "HTTP $($script:MainDocumentStatus)$statusText"
     }
 
+    $allowPattern = '^(?i)(?:' +
+        'On Connection Error' +
+        '|Get Last Multi-User Connection Error' +
+        ')$'
+
     $errorPattern = '(?i)\b(?:' +
         '404|502|503|504' +
         '|not\s+found' +
@@ -398,23 +403,114 @@ function Assert-PageLoadOk {
         '|can(?:not|''t)\s+(?:be\s+reached|reach\s+this\s+(?:page|site))' +
         ')\b'
 
-    if ("$title $h1" -match $errorPattern) {
+    if ("$h1" -notmatch $allowPattern -and "$title $h1" -match $errorPattern) {
         throw "Halaman terlihat error: title='$title', h1='$h1'"
     }
 }
 
 # ==================== CLOUDFLARE CHALLENGE SOLVER ====================
+if (-not ('Win32.NativeInput' -as [type])) {
+    Add-Type -Namespace Win32 -Name NativeInput -MemberDefinition @'
+[StructLayout(LayoutKind.Sequential)] public struct POINT { public int X; public int Y; }
+[StructLayout(LayoutKind.Sequential)] public struct MOUSEINPUT { public int dx; public int dy; public uint mouseData; public uint dwFlags; public uint time; public IntPtr dwExtraInfo; }
+[StructLayout(LayoutKind.Sequential)] public struct KEYBDINPUT { public ushort wVk; public ushort wScan; public uint dwFlags; public uint time; public IntPtr dwExtraInfo; }
+[StructLayout(LayoutKind.Explicit)] public struct INPUTUNION { [FieldOffset(0)] public MOUSEINPUT mi; [FieldOffset(0)] public KEYBDINPUT ki; }
+[StructLayout(LayoutKind.Sequential)] public struct INPUT { public uint type; public INPUTUNION U; }
+[DllImport("user32.dll", SetLastError=true)] public static extern uint SendInput(uint nInputs, INPUT[] pInputs, int cbSize);
+[DllImport("user32.dll")] public static extern int GetSystemMetrics(int nIndex);
+[DllImport("user32.dll")] public static extern bool GetCursorPos(out POINT lpPoint);
+[DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
+[DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+[DllImport("user32.dll")] public static extern IntPtr FindWindowEx(IntPtr parent, IntPtr after, string cls, string title);
+[DllImport("user32.dll")] public static extern bool ClientToScreen(IntPtr hWnd, ref POINT lpPoint);
+[DllImport("user32.dll")] public static extern uint GetDpiForWindow(IntPtr hWnd);
+'@
+}
+$script:InputSize = [System.Runtime.InteropServices.Marshal]::SizeOf([type][Win32.NativeInput+INPUT])
+
+function Send-RealMouseMove {
+    param([int]$X, [int]$Y)
+    $vsX = [Win32.NativeInput]::GetSystemMetrics(76); $vsY = [Win32.NativeInput]::GetSystemMetrics(77)
+    $vsW = [Win32.NativeInput]::GetSystemMetrics(78); $vsH = [Win32.NativeInput]::GetSystemMetrics(79)
+    $inp = New-Object Win32.NativeInput+INPUT
+    $inp.type = 0
+    $inp.U.mi.dx = [int](($X - $vsX) * 65535.0 / [Math]::Max(1, $vsW - 1))
+    $inp.U.mi.dy = [int](($Y - $vsY) * 65535.0 / [Math]::Max(1, $vsH - 1))
+    $inp.U.mi.dwFlags = 0x0001 -bor 0x8000   # MOVE | ABSOLUTE
+    [void][Win32.NativeInput]::SendInput(1, @($inp), $script:InputSize)
+}
+
+function Send-RealMousePath {
+    param([int]$ToX, [int]$ToY)
+    $cur = New-Object Win32.NativeInput+POINT
+    [void][Win32.NativeInput]::GetCursorPos([ref]$cur)
+    $steps = Get-Random -Minimum 12 -Maximum 26
+    for ($i = 1; $i -le $steps; $i++) {
+        $t = $i / $steps
+        $ease = $t * $t * (3 - 2 * $t)   # smoothstep, bukan linier
+        $x = $cur.X + ($ToX - $cur.X) * $ease + (Get-Random -Minimum -3 -Maximum 4)
+        $y = $cur.Y + ($ToY - $cur.Y) * $ease + (Get-Random -Minimum -2 -Maximum 3)
+        Send-RealMouseMove -X [int]$x -Y [int]$y
+        Start-Sleep -Milliseconds (Get-Random -Minimum 8 -Maximum 30)
+    }
+}
+
+function Send-RealKey {
+    param([ushort]$Vk, [bool]$Ctrl = $false)
+    $list = New-Object System.Collections.Generic.List[Win32.NativeInput+INPUT]
+    $mk = { param($vk, $up) $i = New-Object Win32.NativeInput+INPUT; $i.type = 1; $i.U.ki.wVk = $vk; if ($up) { $i.U.ki.dwFlags = 2 }; $i }
+    if ($Ctrl) { $list.Add((& $mk 0x11 $false)) }
+    $list.Add((& $mk $Vk $false)); $list.Add((& $mk $Vk $true))
+    if ($Ctrl) { $list.Add((& $mk 0x11 $true)) }
+    [void][Win32.NativeInput]::SendInput([uint]$list.Count, $list.ToArray(), $script:InputSize)
+}
+
+function Send-RealReload { Send-RealKey -Vk 0x74 }   # F5 asli (ada user-activation)
+
+function Get-ScriptEdgeWindowHandle {
+    $profile = $script:BrowserProfileDir
+    $proc = Get-CimInstance Win32_Process -Filter "Name='msedge.exe'" |
+        Where-Object { $_.CommandLine -like "*--user-data-dir=$profile*" -and $_.CommandLine -like '*--remote-debugging-port*' } |
+        Select-Object -First 1
+    if (-not $proc) { return [IntPtr]::Zero }
+    $p = Get-Process -Id $proc.ProcessId -ErrorAction SilentlyContinue
+    if ($p) { return $p.MainWindowHandle }
+    return [IntPtr]::Zero
+}
+
+function Set-EdgeForeground {
+    $hwnd = Get-ScriptEdgeWindowHandle
+    if ($hwnd -ne [IntPtr]::Zero) {
+        [void][Win32.NativeInput]::ShowWindow($hwnd, 9)   # SW_RESTORE
+        [void][Win32.NativeInput]::SetForegroundWindow($hwnd)
+    }
+}
+
+function Get-ViewportScreenOrigin {
+    $hwnd = Get-ScriptEdgeWindowHandle
+    if ($hwnd -eq [IntPtr]::Zero) { return $null }
+    $render = [Win32.NativeInput]::FindWindowEx($hwnd, [IntPtr]::Zero, 'Chrome_RenderWidgetHostHWND', $null)
+    if ($render -eq [IntPtr]::Zero) { return $null }
+    $pt = New-Object Win32.NativeInput+POINT
+    [void][Win32.NativeInput]::ClientToScreen($render, [ref]$pt)
+    $dpi = [Win32.NativeInput]::GetDpiForWindow($render)
+    $scale = if ($dpi -gt 0) { $dpi / 96.0 } else { 1.0 }
+    return [pscustomobject]@{ X = $pt.X; Y = $pt.Y; Scale = $scale }
+}
+
 function Get-ChallengeConfig {
     return [pscustomobject]@{
-        Enabled         = $true
-        Url             = 'https://dev.epicgames.com/documentation/404'
-        ReloadMax       = 30
-        PageWaitSeconds = 3
-        SolveTimeout    = 240
-        CooldownSeconds = 30
-        LockWaitSeconds = 300
-        MaxClickPerLoad = 12
-        ClickGapSeconds = 2.5
+        Enabled             = $true
+        Url                 = 'https://dev.epicgames.com/documentation/404'
+        ReloadMax           = 60
+        PageWaitSeconds     = 8
+        SolveTimeout        = 240
+        CooldownSeconds     = 30
+        MaxClickTotal       = 12
+        ClickGapSeconds     = 2.5
+        AutoClickEnabled    = $false
+        WarmupEnabled       = $true
+        FocusEmulationEnabled = $false
     }
 }
 
@@ -605,8 +701,10 @@ function New-ChallengeTabSession {
         [void](Invoke-CdpCommand -Socket $socket -Method 'Page.enable')
         [void](Invoke-CdpCommand -Socket $socket -Method 'Runtime.enable')
         [void](Invoke-CdpCommand -Socket $socket -Method 'DOM.enable')
-        # Halaman selalu dianggap fokus walau tab worker lain di depan.
-        [void](Invoke-CdpCommand -Socket $socket -Method 'Emulation.setFocusEmulationEnabled' -Params @{ enabled = $true })
+        $cfg = Get-ChallengeConfig
+        if ($cfg.FocusEmulationEnabled) {
+            [void](Invoke-CdpCommand -Socket $socket -Method 'Emulation.setFocusEmulationEnabled' -Params @{ enabled = $true })
+        }
         try { [void](Invoke-CdpCommand -Socket $socket -Method 'Page.setWebLifecycleState' -Params @{ state = 'active' }) } catch { }
         return [pscustomobject]@{ TargetId = $targetId; Socket = $socket }
     }
@@ -637,6 +735,7 @@ function Get-ChallengeProbeExpression {
     const h1 = document.querySelector('h1');
     const h1Text = norm(h1 ? h1.textContent : '');
     const looksLikeChallenge = /one more step|just a moment|verify you are human|checking your browser|needs to review the security|enable javascript and cookies|security check to continue/i.test(document.title + ' ' + bodyText);
+    const verificationSuccessful = /verification successful/i.test(document.title + ' ' + bodyText);
     const challengeSelector = '#challenge-form,#challenge-stage,#challenge-running,.cf-turnstile,[data-sitekey]';
     const hasChallengeForm = !!document.querySelector(challengeSelector) ||
         all.some((el) => el.matches && el.matches(challengeSelector));
@@ -666,6 +765,7 @@ function Get-ChallengeProbeExpression {
         htmlLength: ((document.documentElement && document.documentElement.outerHTML) || '').length,
         hasChallengeForm,
         looksLikeChallenge,
+        verificationSuccessful,
         token,
         click: point
     });
@@ -796,6 +896,7 @@ function Invoke-CloudflareChallengeLoop {
     $clickCount   = 0
     $lastClickAt  = [datetime]::MinValue
     $lastWarmupAt = [datetime]::MinValue
+    $lastFrontAt  = [datetime]::MinValue
     $reloadCount  = 0
     $tokenLogged  = $false
     $navigated    = $false
@@ -807,18 +908,20 @@ function Invoke-CloudflareChallengeLoop {
             Write-Host "Challenge: buka $($Config.Url)"
             [void](Invoke-CdpCommand -Socket $Socket -Method 'Page.navigate' -Params @{ url = $Config.Url })
             $navigated    = $true
+            $lastFrontAt  = Get-Date
             $loadDeadline = (Get-Date).AddSeconds($Config.PageWaitSeconds)
         }
         elseif (-not $sawChallenge -and (Get-Date) -ge $loadDeadline) {
-            # Reload HANYA sebelum h1 'One more step' muncul.
             if ($reloadCount -ge $Config.ReloadMax) {
-                Write-Warning "Challenge: reload max ($($Config.ReloadMax)), h1 'One more step' tidak muncul juga."
+                Write-Warning "Challenge: reload max, h1 'One more step' tidak muncul juga."
                 break
             }
             $reloadCount++
             $cleanStreak = 0
             Write-Host "Challenge: reload ke-$reloadCount (h1 'One more step' belum muncul)"
-            [void](Invoke-CdpCommand -Socket $Socket -Method 'Page.reload' -Params @{ ignoreCache = $true })
+            # [void](Invoke-CdpCommand -Socket $Socket -Method 'Page.reload' -Params @{ ignoreCache = $true })
+            Set-EdgeForeground
+            Send-RealReload
             $loadDeadline = (Get-Date).AddSeconds($Config.PageWaitSeconds)
         }
 
@@ -826,6 +929,11 @@ function Invoke-CloudflareChallengeLoop {
 
         try { $probe = (Invoke-PageEval -Socket $Socket -Expression $expression) | ConvertFrom-Json }
         catch { continue }
+
+        if ([bool]$probe.verificationSuccessful) {
+            Write-Host 'Challenge: "Verification successful" muncul -> selesai.'
+            return $true
+        }
 
         $h1 = [string]$probe.h1
         $isChallenge = ($h1 -match '(?i)one more step') -or
@@ -835,7 +943,7 @@ function Invoke-CloudflareChallengeLoop {
 
         if ($isChallenge) {
             if (-not $sawChallenge) {
-                Write-Host "Challenge: h1 '$h1' muncul -> STOP reload, warmup mouse dulu."
+                Write-Host "Challenge: h1 '$h1' muncul -> STOP reload, mode pasif (klik/warmup/focus-emulation OFF)."
             }
             $sawChallenge = $true
             $cleanStreak  = 0
@@ -851,42 +959,69 @@ function Invoke-CloudflareChallengeLoop {
                 continue
             }
 
-            $widget = Get-TurnstileWidgetState -Socket $Socket
+            # Jaga tab tetap terlihat TANPA input sintetis.
+            if (((Get-Date) - $lastFrontAt).TotalSeconds -ge 2) {
+                # [void](Invoke-CdpCommand -Socket $Socket -Method 'Page.bringToFront')
+                $lastFrontAt = Get-Date
+            }
 
-            # 1) Warmup: mouse move SAJA, walau checkbox belum ada.
-            if (((Get-Date) - $lastWarmupAt).TotalSeconds -ge 1.2) {
-                [void](Invoke-CdpCommand -Socket $Socket -Method 'Page.bringToFront')
-                if ($widget) {
-                    Invoke-ChallengeMouseWarmup -Socket $Socket -X ($widget.FrameX + $widget.FrameW / 2) -Y ($widget.FrameY + $widget.FrameH / 2)
-                }
-                else {
-                    Invoke-ChallengeMouseWarmup -Socket $Socket
+            # Warmup opsional, arah MENJAUH dari widget (di atasnya), bukan di atas iframe.
+            if ($Config.WarmupEnabled -and ((Get-Date) - $lastWarmupAt).TotalSeconds -ge 1.5) {
+                # $widget = $null
+                # if (Get-Command Get-TurnstileWidgetState -ErrorAction SilentlyContinue) {
+                #     $widget = Get-TurnstileWidgetState -Socket $Socket
+                # }
+                # $tx = 480 + (Get-Random -Minimum -60 -Maximum 60)
+                # $ty = 120 + (Get-Random -Minimum -30 -Maximum 30)
+                # if ($widget) {
+                #     $tx = $widget.FrameX + $widget.FrameW / 2
+                #     $ty = [Math]::Max(40, $widget.FrameY - 120)
+                # }
+                # Invoke-ChallengeMouseWarmup -Socket $Socket -X $tx -Y $ty
+                $origin = Get-ViewportScreenOrigin
+                if ($origin) {
+                    Set-EdgeForeground
+                    $cssX = 480 + (Get-Random -Minimum -60 -Maximum 60)
+                    $cssY = 120 + (Get-Random -Minimum -30 -Maximum 30)
+                    Send-RealMousePath -ToX [int]($origin.X + $cssX * $origin.Scale) -ToY [int]($origin.Y + $cssY * $origin.Scale)
                 }
                 $lastWarmupAt = Get-Date
             }
 
-            # 2) Auto left-click HANYA kalau checkbox sudah render.
-            $clickX = $null; $clickY = $null; $clickSource = ''
-            if ($widget -and $widget.HasCheckbox) {
-                $clickX = $widget.ClickX; $clickY = $widget.ClickY; $clickSource = $widget.Source
-            }
-            elseif ($probe.click -and [string]$probe.click.source -eq 'checkbox') {
-                $clickX = [double]$probe.click.x; $clickY = [double]$probe.click.y; $clickSource = 'checkbox'
-            }
-
-            if ($null -ne $clickX -and $clickCount -lt $Config.MaxClickTotal -and
-                ((Get-Date) - $lastClickAt).TotalSeconds -ge $Config.ClickGapSeconds) {
-                $x = $clickX + (Get-Random -Minimum -2 -Maximum 3)
-                $y = $clickY + (Get-Random -Minimum -2 -Maximum 3)
-                Invoke-TrustedMouseClick -Socket $Socket -X $x -Y $y
-                $clickCount++
-                $lastClickAt = Get-Date
-                Write-Host ("Challenge: checkbox ada -> left-click ({0}) di {1},{2} (ke-{3})" -f $clickSource, [int]$x, [int]$y, $clickCount)
+            if ($Config.AutoClickEnabled) {
+                $widget = $null
+                if (Get-Command Get-TurnstileWidgetState -ErrorAction SilentlyContinue) {
+                    $widget = Get-TurnstileWidgetState -Socket $Socket
+                }
+                $clickX = $null; $clickY = $null; $clickSource = ''
+                if ($widget -and $widget.HasCheckbox) {
+                    $clickX = $widget.ClickX; $clickY = $widget.ClickY; $clickSource = $widget.Source
+                }
+                elseif ($probe.click -and [string]$probe.click.source -eq 'checkbox') {
+                    $clickX = [double]$probe.click.x; $clickY = [double]$probe.click.y; $clickSource = 'checkbox'
+                }
+                if ($null -ne $clickX -and $clickCount -lt $Config.MaxClickTotal -and
+                    ((Get-Date) - $lastClickAt).TotalSeconds -ge $Config.ClickGapSeconds) {
+                    Invoke-TrustedMouseClick -Socket $Socket -X ($clickX + (Get-Random -Minimum -2 -Maximum 3)) -Y ($clickY + (Get-Random -Minimum -2 -Maximum 3))
+                    $clickCount++
+                    $lastClickAt = Get-Date
+                    Write-Host ("Challenge: left-click ({0}) ke-{1}" -f $clickSource, $clickCount)
+                }
             }
             continue
         }
 
-        # Challenge belum muncul sama sekali.
+        if ($sawChallenge) {
+            # h1 hilang setelah verifikasi -> selesai (TANPA syarat htmlLength).
+            if ([string]$probe.readyState -ne 'complete') { continue }
+            $cleanStreak++
+            if ($cleanStreak -ge 2) {
+                Write-Host "Challenge: h1 'One more step' hilang (h1='$h1') -> selesai."
+                return $true
+            }
+            continue
+        }
+
         if ([string]$probe.readyState -eq 'complete') {
             if (Get-ClearanceCookieValue -Socket $Socket -ProbeUrl $Config.Url) {
                 Write-Host 'Challenge: halaman normal & clearance ada -> sudah terverifikasi.'
