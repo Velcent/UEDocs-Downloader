@@ -4,9 +4,11 @@ param(
     [int]$ParallelDownloads = 6,
     [int]$DownloadRetries = 100000,
     [int]$MaxDuration = 0,
-    [switch]$SkipYoutube
+    [switch]$SkipYoutube = $true,
+    [switch]$DownloadYoutube
 )
 
+if ($DownloadYoutube) { $SkipYoutube = $false }
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 
@@ -1069,6 +1071,29 @@ function Get-VideoSizeText {
     return Format-FileSize $file.Length
 }
 
+function New-EmptyMp4Placeholder {
+    param([string]$Mp4Path)
+
+    if (Test-Path -LiteralPath $Mp4Path) {
+        return $false
+    }
+
+    try {
+        $directory = Split-Path -Parent $Mp4Path
+        if (-not (Test-Path -LiteralPath $directory)) {
+            New-Item -ItemType Directory -Force -Path $directory | Out-Null
+        }
+
+        [System.IO.File]::WriteAllBytes($Mp4Path, [byte[]]@())
+        Write-Host "Created empty MP4: $(Split-Path -Leaf $Mp4Path)"
+        return $true
+    }
+    catch {
+        Write-Warning "Cannot create empty MP4: $Mp4Path. $($_.Exception.Message)"
+        return $false
+    }
+}
+
 function Restore-Mp4FromOld {
     param([string]$Mp4Path)
 
@@ -1354,7 +1379,19 @@ foreach ($mhtmlFile in $mhtmlFiles) {
         }
 
         if ($SkipYoutube) {
-            Write-Host "Skipping YouTube video download: $youtubeId"
+            if (Test-Path -LiteralPath $mp4Path) {
+                Write-Host "Skipping YouTube download, MP4 already available: $youtubeId"
+            }
+            else {
+                Write-Host "Skipping YouTube download: $youtubeId"
+                [void](New-EmptyMp4Placeholder -Mp4Path $mp4Path)
+            }
+
+            $listEntries += [pscustomobject]@{
+                MhtmlPath = $mhtmlFile.FullName
+                EmbedUrl  = $youtubeUrl
+                Mp4Path   = $mp4Path
+            }
             continue
         }
 
