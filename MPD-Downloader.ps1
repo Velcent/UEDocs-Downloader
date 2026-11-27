@@ -1,6 +1,6 @@
 param(
     [string]$Root = $PSScriptRoot,
-    [int]$BrowserPollSeconds = 0.5,
+    [float]$BrowserPollSeconds = 0.5,
     [int]$ParallelDownloads = 6,
     [int]$DownloadRetries = 100000,
     [int]$MaxDuration = 0,
@@ -616,7 +616,20 @@ function Add-OpenEmbedTab {
     }
 }
 
+$script:KeeperTabId = $null
+
+function Open-KeeperTab {
+    if ($script:KeeperTabId -or -not $script:BrowserPort) { return }
+    $uri = "http://127.0.0.1:$($script:BrowserPort)/json/new?about:blank"
+    try {
+        try   { $tab = Invoke-RestMethod -Method Put -Uri $uri -TimeoutSec 5 }
+        catch { $tab = Invoke-RestMethod -Uri $uri -TimeoutSec 5 }
+        $script:KeeperTabId = $tab.id
+    } catch { }
+}
+
 function Close-OpenEmbedTabs {
+    Open-KeeperTab
     foreach ($tab in $script:OpenEmbedTabs) {
         Close-DevToolsPage -Port $tab.Port -TargetId $tab.TargetId
     }
@@ -738,6 +751,8 @@ function Save-EmbedHtmlFromBrowser {
             "--user-data-dir=$($script:BrowserProfileDir)",
             '--disable-background-mode',
             '--disable-background-timer-throttling',
+            '--disable-backgrounding-occluded-windows',
+            '--disable-extensions',
             '--disable-renderer-backgrounding',
             '--disable-features=msSleepingTabs,msSleepingTabsAvailable,msFadeSleepingTabs,msEdgeSleepingTabs,EdgeSleepingTabs,TabFreeze,TabDiscarding,AutomaticTabDiscarding,PerformanceDetector',
             '--no-first-run',
