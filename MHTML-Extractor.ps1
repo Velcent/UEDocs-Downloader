@@ -1218,6 +1218,8 @@ function Ensure-Edge {
             "--user-data-dir=$profileDir",
             '--disable-background-mode',
             '--disable-background-timer-throttling',
+            '--disable-backgrounding-occluded-windows',
+            '--disable-extensions',
             '--disable-renderer-backgrounding',
             '--disable-features=msSleepingTabs,msSleepingTabsAvailable,msFadeSleepingTabs,msEdgeSleepingTabs,EdgeSleepingTabs,TabFreeze,TabDiscarding,AutomaticTabDiscarding,PerformanceDetector',
             '--no-first-run',

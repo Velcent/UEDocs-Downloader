@@ -40,6 +40,40 @@ $script:MainDocumentStatusText = ''
 $script:MainDocumentFailedText = ''
 $script:MainDocumentRequestId = ''
 
+function Get-ApplicationVersionFromUrl {
+    param([string]$PageUrl)
+    try {
+        $match = [regex]::Match(([Uri]$PageUrl).Query, '(?i)[?&]application_version=([^&]*)')
+        if ($match.Success) {
+            return [Uri]::UnescapeDataString($match.Groups[1].Value)
+        }
+    }
+    catch { }
+    return ''
+    }
+    function Add-ApplicationVersionToUrl {
+    param([string]$PageUrl)
+    if ([string]::IsNullOrWhiteSpace($script:ApplicationVersion) -or [string]::IsNullOrWhiteSpace($PageUrl)) {
+        return $PageUrl
+    }
+    try {
+        $uri = [Uri]$PageUrl
+        if ($uri.Scheme -notin @('http', 'https')) { return $PageUrl }
+        $builder = [UriBuilder]$uri
+        $parts = @($builder.Query.TrimStart('?') -split '&' | Where-Object { $_ -and $_ -notmatch '(?i)^application_version=' })
+        $parts += 'application_version=' + [Uri]::EscapeDataString($script:ApplicationVersion)
+        $builder.Query = ($parts -join '&')
+        return $builder.Uri.AbsoluteUri
+    }
+    catch {
+        return $PageUrl
+    }
+    }
+    $script:ApplicationVersion = Get-ApplicationVersionFromUrl -PageUrl $Url
+    if ($script:ApplicationVersion -and -not $WorkerMode) {
+    Write-Host "application_version aktif: $($script:ApplicationVersion) (dipakai untuk semua navigasi download)"
+}
+
 function Update-ListBackup {
     if (-not (Test-Path -LiteralPath $ListPath)) {
         return
@@ -1529,8 +1563,10 @@ function Save-CPPPageAsMhtmlInSession {
         [string]$FileBaseName = ''
     )
 
+    $navigateUrl = Add-ApplicationVersionToUrl -PageUrl $PageUrl
+
     Write-Host ""
-    Write-Host "Buka Edge: $PageUrl"
+    Write-Host "Buka Edge: $navigateUrl"
 
     $data = $null
     $filePath = ''
@@ -1538,12 +1574,12 @@ function Save-CPPPageAsMhtmlInSession {
     for ($attempt = 1; $attempt -le $MaxLoadAttempts; $attempt++) {
         Reset-NetworkState
         if ($attempt -eq 1) {
-            $navigateResponse = Invoke-CdpCommand -Socket $Socket -Method 'Page.navigate' -Params @{ url = $PageUrl }
+            $navigateResponse = Invoke-CdpCommand -Socket $Socket -Method 'Page.navigate' -Params @{ url = $navigateUrl }
             Update-NetworkStateFromNavigateResult -Response $navigateResponse
         }
         else {
-            Write-Warning "Navigasi ulang ke URL error karena metadata belum lengkap: $PageUrl"
-            $navigateResponse = Invoke-CdpCommand -Socket $Socket -Method 'Page.navigate' -Params @{ url = $PageUrl }
+            Write-Warning "Navigasi ulang ke URL error karena metadata belum lengkap: $navigateUrl"
+            $navigateResponse = Invoke-CdpCommand -Socket $Socket -Method 'Page.navigate' -Params @{ url = $navigateUrl }
             Update-NetworkStateFromNavigateResult -Response $navigateResponse
         }
 
@@ -2432,6 +2468,7 @@ function Start-PageWorkerJob {
     return Start-Job -InitializationScript $initialization -ScriptBlock {
         param(
             [string]$ScriptPath,
+            [string]$RootUrl,
             [int]$BrowserPort,
             [int]$Id,
             [string]$IpcDir,
@@ -2443,6 +2480,7 @@ function Start-PageWorkerJob {
         )
 
         & $ScriptPath `
+            -Url $RootUrl `
             -WorkerMode `
             -WorkerBrowserPort $BrowserPort `
             -WorkerId $Id `
@@ -2454,6 +2492,7 @@ function Start-PageWorkerJob {
             -Overwrite:$OverwriteFlag
     } -ArgumentList @(
         $scriptPath,
+        $Url,
         $script:BrowserPort,
         $Id,
         $IpcDir,
